@@ -120,6 +120,8 @@ Kato 容器会把浏览器 CDP 映射到本机：
 http://127.0.0.1:9222/json
 ```
 
+容器内 Chromium 默认通过 Xvfb 以有头模式运行，减少 headless 浏览器特征。只有显式设置 `XHS_CHROMIUM_HEADLESS=1` 时才会退回 headless。
+
 `npm run auth:cdp` 不会启动宿主机浏览器；它会请求 Kato 容器打开登录页，并等待容器内 Chromium 的 CDP 端口就绪。你在看板“浏览器接管”Tab 里扫码/完成验证后，登录态会保存到 `mcp/xiaohongshu/data/cookies.json`。
 
 常用参数：

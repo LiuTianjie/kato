@@ -13,6 +13,7 @@ const CDP_PORT = Number(process.env.XHS_CDP_PORT || 9223);
 const INTERNAL_CDP_PORT = Number(process.env.XHS_INTERNAL_CDP_PORT || CDP_PORT + 1);
 const PROFILE_DIR = process.env.XHS_PROFILE_DIR || "/app/data/profile";
 const COOKIES_PATH = process.env.COOKIES_PATH || "/app/data/cookies.json";
+const CHROMIUM_HEADLESS = process.env.XHS_CHROMIUM_HEADLESS === "1";
 const XHS_HOME_URL = "https://www.xiaohongshu.com/explore";
 const XHS_CREATOR_URL = "https://creator.xiaohongshu.com";
 
@@ -131,15 +132,14 @@ async function launchContext() {
   browserProcess = spawn(
     BROWSER_BIN,
     [
-      "--headless=new",
+      ...(CHROMIUM_HEADLESS ? ["--headless=new"] : []),
       "--no-sandbox",
       "--disable-dev-shm-usage",
-      "--disable-gpu",
       "--disable-notifications",
-      "--disable-features=Translate,AutomationControlled",
       "--no-first-run",
       "--no-default-browser-check",
       "--disable-sync",
+      "--password-store=basic",
       "--window-size=1440,980",
       `--remote-debugging-address=${CDP_HOST}`,
       `--remote-debugging-port=${INTERNAL_CDP_PORT}`,

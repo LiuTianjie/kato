@@ -15,7 +15,7 @@ services:
     environment:
       - PORT=4173
       - XHS_SERVICE_PORT=18060
-      - XHS_BROWSER_BIN=/usr/bin/chromium
+      - XHS_BROWSER_BIN=/usr/local/bin/kato-chromium
       - XHS_CDP_HOST=0.0.0.0
       - XHS_CDP_PORT=9223
       - XHS_INTERNAL_CDP_PORT=9224

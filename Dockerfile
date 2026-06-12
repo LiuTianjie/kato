@@ -10,7 +10,7 @@ FROM node:22-bookworm-slim
 
 ENV NODE_ENV=production \
     PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
-    XHS_BROWSER_BIN=/usr/bin/chromium \
+    XHS_BROWSER_BIN=/usr/local/bin/kato-chromium \
     XHS_CDP_HOST=0.0.0.0 \
     XHS_CDP_PORT=9223 \
     XHS_INTERNAL_CDP_PORT=9224 \
@@ -26,6 +26,8 @@ RUN apt-get update \
     fonts-wqy-zenhei \
     locales \
     tini \
+    xauth \
+    xvfb \
   && sed -i 's/# zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen \
   && locale-gen \
   && rm -rf /var/lib/apt/lists/*
@@ -43,8 +45,9 @@ COPY public ./public
 COPY xhs.config.example.json ./
 COPY mcp/xiaohongshu/service ./mcp/xiaohongshu/service
 COPY scripts/start-kato.sh ./scripts/start-kato.sh
+COPY scripts/kato-chromium.sh /usr/local/bin/kato-chromium
 
-RUN chmod +x ./scripts/start-kato.sh \
+RUN chmod +x ./scripts/start-kato.sh /usr/local/bin/kato-chromium \
   && mkdir -p /app/data /app/output /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images
 
 EXPOSE 4173 18060 9223
