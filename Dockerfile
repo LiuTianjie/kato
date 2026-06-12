@@ -23,8 +23,7 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     ca-certificates \
     chromium \
-    curl \
-    fonts-noto-cjk \
+    fonts-wqy-zenhei \
     locales \
     tini \
   && sed -i 's/# zh_CN.UTF-8 UTF-8/zh_CN.UTF-8 UTF-8/' /etc/locale.gen \
@@ -51,7 +50,7 @@ RUN chmod +x ./scripts/start-kato.sh \
 EXPOSE 4173 18060 9223
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD curl -fsS "http://127.0.0.1:${PORT}/api/dashboard" >/dev/null || exit 1
+  CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 4173) + '/api/dashboard').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["./scripts/start-kato.sh"]
