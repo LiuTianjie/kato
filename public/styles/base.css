@@ -1,0 +1,289 @@
+:root {
+  color-scheme: light;
+  --ink: #121417;
+  --ink-2: #252a31;
+  --muted: #56606e;
+  --subtle: #7f8998;
+  --line: rgba(25, 31, 40, 0.14);
+  --line-strong: rgba(25, 31, 40, 0.24);
+  --paper: #eef1f5;
+  --paper-deep: #e4e8ee;
+  --panel: rgba(255, 255, 255, 0.9);
+  --panel-solid: #ffffff;
+  --panel-2: rgba(246, 248, 251, 0.88);
+  --panel-3: #edf1f6;
+  --rail: #11151c;
+  --rail-2: #171c25;
+  --rail-line: rgba(255, 255, 255, 0.1);
+  --rail-muted: rgba(235, 241, 249, 0.62);
+  --rail-ink: #f7f9fc;
+  --red: #d6454f;
+  --red-deep: #9e2530;
+  --red-soft: #fff0f1;
+  --green: #16866c;
+  --green-soft: #e8f7f2;
+  --amber: #a46a12;
+  --amber-soft: #fff6e3;
+  --blue: #2769d7;
+  --blue-soft: #eaf2ff;
+  --cyan: #2a91a8;
+  --shadow: 0 1px 1px rgba(17, 21, 28, 0.04), 0 18px 50px rgba(17, 21, 28, 0.12);
+  --shadow-soft: 0 1px 1px rgba(17, 21, 28, 0.05), 0 10px 30px rgba(17, 21, 28, 0.1);
+  --shadow-tight: 0 1px 2px rgba(17, 21, 28, 0.08);
+  --focus: 0 0 0 3px rgba(39, 105, 215, 0.16);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-height: 100%;
+  background: var(--paper);
+}
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  color: var(--ink);
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.86) 0%, rgba(255, 255, 255, 0) 35%),
+    linear-gradient(180deg, #f8fafc 0%, var(--paper) 46%, var(--paper-deep) 100%);
+  font-family: "Avenir Next", "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: geometricPrecision;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    linear-gradient(90deg, rgba(18, 20, 23, 0.035) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(18, 20, 23, 0.028) 1px, transparent 1px);
+  background-size: 42px 42px;
+  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.9), transparent 72%);
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.54;
+  transform: none;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+h1 {
+  color: var(--rail-ink);
+  font-size: 16px;
+  font-weight: 850;
+  letter-spacing: 0;
+}
+
+h2 {
+  color: var(--ink);
+  font-size: 34px;
+  font-weight: 850;
+  line-height: 1.04;
+  letter-spacing: 0;
+}
+
+h3 {
+  color: var(--ink);
+  font-size: 16px;
+  font-weight: 850;
+  letter-spacing: 0;
+}
+
+input,
+textarea,
+select {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.88);
+  color: var(--ink);
+  padding: 8px 10px;
+  outline: none;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72), var(--shadow-tight);
+  transition: border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
+}
+
+select {
+  appearance: none;
+  min-height: 36px;
+  padding-right: 32px;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position:
+    calc(100% - 17px) 50%,
+    calc(100% - 11px) 50%;
+  background-size:
+    6px 6px,
+    6px 6px;
+  background-repeat: no-repeat;
+}
+
+textarea {
+  resize: vertical;
+}
+
+input:hover,
+textarea:hover,
+select:hover {
+  border-color: var(--line-strong);
+}
+
+input:focus,
+textarea:focus,
+select:focus {
+  border-color: rgba(39, 105, 215, 0.48);
+  background-color: #fff;
+  box-shadow: 0 0 0 3px rgba(39, 105, 215, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.82);
+}
+
+.primary,
+.secondary,
+.danger,
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 36px;
+  padding: 8px 13px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  font-weight: 850;
+  line-height: 1.2;
+  white-space: nowrap;
+  transition:
+    background 0.16s ease,
+    border-color 0.16s ease,
+    box-shadow 0.16s ease,
+    color 0.16s ease,
+    transform 0.16s ease;
+}
+
+.primary {
+  color: #fff;
+  background: linear-gradient(180deg, #e24f59 0%, var(--red) 100%);
+  border-color: rgba(158, 37, 48, 0.18);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.24) inset, 0 12px 24px rgba(214, 69, 79, 0.22);
+}
+
+.primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, #ed5861 0%, #c93440 100%);
+  transform: translateY(-1px);
+}
+
+.secondary {
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.76);
+  border-color: var(--line);
+  box-shadow: var(--shadow-tight);
+}
+
+.secondary:hover:not(:disabled) {
+  background: #fff;
+  border-color: var(--line-strong);
+  transform: translateY(-1px);
+}
+
+.danger {
+  color: #fff;
+  background: linear-gradient(180deg, #b82e3a 0%, var(--red-deep) 100%);
+  box-shadow: 0 12px 22px rgba(158, 37, 48, 0.16);
+}
+
+.danger.ghost {
+  color: var(--red-deep);
+  background: rgba(255, 240, 241, 0.9);
+  border-color: rgba(214, 69, 79, 0.22);
+  box-shadow: none;
+}
+
+.danger.ghost:hover:not(:disabled) {
+  background: #ffe7e9;
+  border-color: rgba(214, 69, 79, 0.36);
+}
+
+.icon-button {
+  width: 34px;
+  min-height: 34px;
+  padding: 0;
+  color: var(--rail-ink);
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--rail-line);
+}
+
+.icon-button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.14);
+  transform: rotate(18deg);
+}
+
+.small {
+  min-height: 30px;
+  padding: 5px 10px;
+  font-size: 12px;
+}
+
+.full {
+  width: 100%;
+}
+
+.hidden {
+  display: none;
+}
+
+.spinner {
+  width: 15px;
+  height: 15px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.75s linear infinite;
+}
+
+.small-spinner {
+  width: 13px;
+  height: 13px;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

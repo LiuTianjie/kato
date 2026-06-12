@@ -1,0 +1,13 @@
+node_modules
+dist
+data
+output
+.env
+.env.*
+xhs.config.local.json
+mcp/xiaohongshu/source
+mcp/xiaohongshu/data
+mcp/xiaohongshu/images
+.git
+.DS_Store
+*.log

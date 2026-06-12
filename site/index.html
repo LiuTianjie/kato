@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Kato - 小红书运营自动化工作台</title>
+    <meta
+      name="description"
+      content="Kato 是一个本地优先的小红书运营工作台，把 dashboard、容器内 Chromium、CDP 登录、REST API 和 MCP 兼容层打包进一个镜像。"
+    />
+    <link rel="icon" type="image/png" href="./icon.png" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="nav">
+      <a class="brand" href="#top" aria-label="Kato 首页">
+        <img src="./icon.png" alt="" />
+        <span>Kato</span>
+      </a>
+      <nav aria-label="页面导航">
+        <a href="#start">快速开始</a>
+        <a href="#api">标准接口</a>
+        <a href="https://github.com/LiuTianjie/kato">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">小红书运营 · 本地优先 · 人工确认</p>
+          <h1>让增长更可控。</h1>
+          <p class="lead">
+            Kato 提供本地 dashboard、容器内 Chromium、CDP 实时连接、稳定 REST API 和可选 MCP
+            兼容层。自动化负责排队和准备，人负责最后确认。
+          </p>
+          <div class="hero-actions">
+            <a class="button primary" href="#start">本地运行</a>
+            <a class="button secondary" href="#api">查看接口</a>
+          </div>
+        </div>
+        <div class="terminal" aria-label="快速启动命令">
+          <div class="terminal-bar">
+            <span></span><span></span><span></span>
+          </div>
+          <pre><code>docker compose up -d --build
+open http://localhost:4173
+
+# CDP 只绑定本机
+http://127.0.0.1:9222/json</code></pre>
+        </div>
+      </section>
+
+      <section class="strip" aria-label="核心能力">
+        <div>
+          <strong>一个镜像</strong>
+          <span>Dashboard、XHS browser service、Chromium 和 MCP 兼容层一起启动。</span>
+        </div>
+        <div>
+          <strong>人工确认</strong>
+          <span>评论发布和点赞必须显式确认，并通过幂等键避免重复执行。</span>
+        </div>
+        <div>
+          <strong>Agent 友好</strong>
+          <span>标准 REST 契约给业务系统，MCP 兼容层给 agent 客户端。</span>
+        </div>
+      </section>
+
+      <section class="section grid-two" id="start">
+        <div>
+          <p class="eyebrow">快速开始</p>
+          <h2>一条命令启动完整工作台。</h2>
+          <p>
+            容器会在 4173 启动 Kato Console，在 18060 启动 XHS browser service。浏览器运行在容器里，
+            CDP 只映射到本机，适合扫码、二次验证和人工接管。
+          </p>
+        </div>
+        <div class="code-card">
+          <pre><code>git clone git@github.com:LiuTianjie/kato.git
+cd kato
+cp .env.example .env
+docker compose up -d --build</code></pre>
+        </div>
+      </section>
+
+      <section class="section cards">
+        <article>
+          <span class="marker"></span>
+          <h3>互动队列</h3>
+          <p>按关键词搜索帖子，先进入队列筛选，再生成评论草稿和执行发布。</p>
+        </article>
+        <article>
+          <span class="marker"></span>
+          <h3>浏览器接管</h3>
+          <p>登录、扫码、验证都在同一个容器浏览器里完成，自动化复用同一份登录态。</p>
+        </article>
+        <article>
+          <span class="marker"></span>
+          <h3>笔记库</h3>
+          <p>维护自己的小红书笔记，评论草稿会围绕你的真实内容和账号定位生成。</p>
+        </article>
+      </section>
+
+      <section class="section grid-two" id="api">
+        <div>
+          <p class="eyebrow">标准接口</p>
+          <h2>给 agent 和内部系统用的稳定本地 API。</h2>
+          <p>
+            公共业务接口统一挂在 <code>/api/v1/xhs/*</code>。请求使用
+            <code>XHS_API_TOKEN</code> 鉴权，响应统一为成功或错误 envelope。
+          </p>
+        </div>
+        <div class="code-card">
+          <pre><code>curl -X POST http://localhost:4173/api/v1/xhs/posts/search \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $XHS_API_TOKEN" \
+  -d '{"keywords":["AI工具"],"limit":10}'</code></pre>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

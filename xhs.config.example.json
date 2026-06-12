@@ -1,0 +1,11 @@
+{
+  "provider": "http",
+  "mcp": {
+    "url": "http://localhost:18060/mcp",
+    "tools": {
+      "searchPosts": "search_feeds",
+      "getPost": "get_feed_detail",
+      "publishComment": "post_comment_to_feed"
+    }
+  }
+}

@@ -1,0 +1,31 @@
+services:
+  kato:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: local/kato:arm64
+    platform: linux/arm64
+    container_name: kato
+    restart: unless-stopped
+    tty: true
+    volumes:
+      - ../../data:/app/data
+      - ../../output:/app/output
+      - ./data:/app/mcp/xiaohongshu/data
+      - ./images:/app/mcp/xiaohongshu/images
+    environment:
+      - PORT=4173
+      - XHS_SERVICE_PORT=18060
+      - XHS_BROWSER_BIN=/usr/bin/chromium
+      - XHS_CDP_HOST=0.0.0.0
+      - XHS_CDP_PORT=9223
+      - XHS_INTERNAL_CDP_PORT=9224
+      - XHS_PROFILE_DIR=/app/mcp/xiaohongshu/data/profile
+      - COOKIES_PATH=/app/mcp/xiaohongshu/data/cookies.json
+      - LANG=zh_CN.UTF-8
+      - LC_ALL=zh_CN.UTF-8
+      - LANGUAGE=zh_CN:zh
+    ports:
+      - "4173:4173"
+      - "18060:18060"
+      - "127.0.0.1:9222:9223"

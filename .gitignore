@@ -1,0 +1,12 @@
+node_modules/
+dist/
+data/
+output/
+*.log
+.env
+.env.*
+!.env.example
+xhs.config.local.json
+mcp/xiaohongshu/source/
+mcp/xiaohongshu/data/
+mcp/xiaohongshu/images/

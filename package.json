@@ -1,0 +1,29 @@
+{
+  "name": "kato",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "init-db": "NODE_OPTIONS=--no-warnings tsx src/cli.ts init-db",
+    "notes:import": "NODE_OPTIONS=--no-warnings tsx src/cli.ts notes:import",
+    "run": "NODE_OPTIONS=--no-warnings tsx src/cli.ts run",
+    "approve": "NODE_OPTIONS=--no-warnings tsx src/cli.ts approve",
+    "open-approved": "NODE_OPTIONS=--no-warnings tsx src/cli.ts open-approved",
+    "publish": "NODE_OPTIONS=--no-warnings tsx src/cli.ts publish",
+    "mark": "NODE_OPTIONS=--no-warnings tsx src/cli.ts mark",
+    "auth:cdp": "NODE_OPTIONS=--no-warnings tsx src/cli.ts auth:cdp",
+    "auth:sync-cookies": "NODE_OPTIONS=--no-warnings tsx src/cli.ts auth:sync-cookies",
+    "doctor": "NODE_OPTIONS=--no-warnings tsx src/cli.ts doctor",
+    "dashboard": "NODE_OPTIONS=--no-warnings tsx src/dashboard/server.ts",
+    "test": "NODE_OPTIONS=--no-warnings tsx --test tests/**/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "playwright": "^1.60.0"
+  }
+}
