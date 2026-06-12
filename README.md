@@ -191,10 +191,14 @@ docker buildx build \
 仓库内置 Luma single-service manifest，默认部署到 `home` region 的 `lab` 节点，并通过 `kato.itool.tech` 访问：
 
 ```bash
+ARK_API_KEY_VALUE=your-ark-api-key \
+ARK_MODEL_VALUE=your-ark-model-or-endpoint \
 ./scripts/deploy-luma.sh
 ```
 
-脚本会写入 `XHS_API_TOKEN` secret，默认值是 `LiuTao0.1`。需要覆盖时：
+脚本会写入 `XHS_API_TOKEN` secret，默认值是 `LiuTao0.1`。生产评论生成还需要 Luma secret `ARK_API_KEY` 和 `ARK_MODEL`；第一次部署可以通过上面的环境变量写入，后续如果 secret 已存在，直接运行脚本即可。
+
+需要覆盖 REST API token 时：
 
 ```bash
 XHS_API_TOKEN_VALUE=your-token ./scripts/deploy-luma.sh
@@ -257,6 +261,12 @@ npm run build
 
 默认使用本地规则生成评论草稿，不需要外部 API。
 
+生产部署默认要求使用火山方舟。评论草稿、批量评论发布会读取：
+
+- `COMMENT_PROVIDER=ark`
+- `ARK_API_KEY`
+- `ARK_MODEL`
+
 如需使用火山方舟：
 
 ```bash
@@ -267,6 +277,8 @@ export ARK_RELEVANCE_MODEL=doubao-seed-2-0-mini-260215
 export ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
 npm run dashboard
 ```
+
+`ARK_RELEVANCE_MODEL`、`ARK_FAST_MODEL`、`CONTENT_MODEL` 都是可选项；不配置时会回落到 `ARK_MODEL`。
 
 API Key 只在本地后端进程读取，不会传到前端页面。
 
