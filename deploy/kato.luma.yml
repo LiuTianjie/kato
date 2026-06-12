@@ -1,0 +1,47 @@
+name: kato
+image: ghcr.io/liutianjie/kato:latest
+region: home
+node: lab
+exposure: tailscale-relay
+domain: kato.itool.tech
+port: 4173
+publishPort: 14173
+replicas: 1
+
+env:
+  NODE_ENV: production
+  PORT: "4173"
+  XHS_SERVICE_PORT: "18060"
+  XHS_API_TOKEN: ${XHS_API_TOKEN}
+  XHS_BROWSER_BIN: /usr/bin/chromium
+  XHS_CDP_HOST: 0.0.0.0
+  XHS_CDP_PORT: "9223"
+  XHS_INTERNAL_CDP_PORT: "9224"
+  XHS_PROFILE_DIR: /app/mcp/xiaohongshu/data/profile
+  COOKIES_PATH: /app/mcp/xiaohongshu/data/cookies.json
+  LANG: zh_CN.UTF-8
+  LC_ALL: zh_CN.UTF-8
+  LANGUAGE: zh_CN:zh
+
+volumes:
+  - kato-data:/app/data
+  - kato-output:/app/output
+  - kato-xhs-data:/app/mcp/xiaohongshu/data
+  - kato-xhs-images:/app/mcp/xiaohongshu/images
+
+healthcheck:
+  test:
+    - CMD-SHELL
+    - node -e "fetch('http://127.0.0.1:4173/api/dashboard').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 30s
+
+resources:
+  limits:
+    cpus: "2.00"
+    memory: 2G
+  reservations:
+    cpus: "0.25"
+    memory: 512M

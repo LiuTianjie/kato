@@ -184,6 +184,28 @@ docker buildx build \
   .
 ```
 
+## Luma 部署
+
+仓库内置 Luma single-service manifest，默认部署到 `home` region 的 `lab` 节点，并通过 `kato.itool.tech` 访问：
+
+```bash
+./scripts/deploy-luma.sh
+```
+
+脚本会写入 `XHS_API_TOKEN` secret，默认值是 `LiuTao0.1`。需要覆盖时：
+
+```bash
+XHS_API_TOKEN_VALUE=your-token ./scripts/deploy-luma.sh
+```
+
+只做校验和 dry-run：
+
+```bash
+DRY_RUN=1 ./scripts/deploy-luma.sh
+```
+
+部署配置见 [deploy/kato.luma.yml](deploy/kato.luma.yml)。它只对外暴露 dashboard 的 `4173` 端口；XHS service 和 CDP 保持容器内部能力，不直接暴露到公网。
+
 ## 操作面板
 
 启动本地看板：
