@@ -30,8 +30,13 @@ export interface CdpLoginResult {
   exportedCookies?: number;
 }
 
+export function getDefaultCdpPort(): number {
+  const value = Number(process.env.XHS_CDP_PORT || DEFAULT_PORT);
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_PORT;
+}
+
 export async function openCdpLoginWindow(config: AppConfig, options: CdpLoginOptions = {}): Promise<CdpLoginResult> {
-  const port = options.port ?? DEFAULT_PORT;
+  const port = options.port ?? getDefaultCdpPort();
   const mcpBaseUrl = getMcpRestBaseUrl(config);
   const cdpUrl = `http://${DEFAULT_HOST}:${port}`;
   let alreadyRunning = await isCdpOpen(port);
@@ -77,7 +82,7 @@ export async function openCdpLoginWindow(config: AppConfig, options: CdpLoginOpt
 
 export async function syncCdpCookiesToMcp(
   config: AppConfig,
-  port = DEFAULT_PORT
+  port = getDefaultCdpPort()
 ): Promise<{ cookiesPath: string; exportedCookies: number }> {
   if (!(await isCdpOpen(port))) {
     throw new Error(`Chrome CDP 端口 ${port} 不可用，请先运行 auth:cdp 打开登录窗口。`);

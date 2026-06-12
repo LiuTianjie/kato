@@ -9,7 +9,7 @@ import { importNotesFromCsv, listActiveNotes } from "./notes/importNotes.js";
 import { markInteraction } from "./runs/approval.js";
 import { parseKeywordArg } from "./runs/keywords.js";
 import { publishConfirmedInteractions } from "./runs/publish.js";
-import { openCdpLoginWindow, syncCdpCookiesToMcp } from "./auth/cdpLogin.js";
+import { getDefaultCdpPort, openCdpLoginWindow, syncCdpCookiesToMcp } from "./auth/cdpLogin.js";
 
 type Args = Record<string, string | boolean>;
 
@@ -70,7 +70,7 @@ async function main(): Promise<void> {
       case "auth:cdp": {
         const result = await openCdpLoginWindow(config, {
           account: typeof args.account === "string" ? args.account : undefined,
-          port: Number(args.port ?? 9222),
+          port: Number(args.port ?? getDefaultCdpPort()),
           restart: args.restart === true,
           wait: args.wait === true,
           syncCookies: args["sync-cookies"] === true,
@@ -96,7 +96,7 @@ async function main(): Promise<void> {
         break;
       }
       case "auth:sync-cookies": {
-        const result = await syncCdpCookiesToMcp(config, Number(args.port ?? 9222));
+        const result = await syncCdpCookiesToMcp(config, Number(args.port ?? getDefaultCdpPort()));
         console.log(`Cookies: exported ${result.exportedCookies} to ${result.cookiesPath}`);
         break;
       }

@@ -26,7 +26,7 @@ import { searchOnlyPosts } from "../runs/searchOnly.js";
 import { generateDraftsForInteractions } from "../runs/generateDrafts.js";
 import { generateAndPublishInteractions } from "../runs/generateAndPublish.js";
 import { publishConfirmedInteractions } from "../runs/publish.js";
-import { openCdpLoginWindow, syncCdpCookiesToMcp } from "../auth/cdpLogin.js";
+import { getDefaultCdpPort, openCdpLoginWindow, syncCdpCookiesToMcp } from "../auth/cdpLogin.js";
 import {
   captureCdpLoginFrame,
   dispatchCdpBrowserAction,
@@ -397,7 +397,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     const body = await readJson(req);
     const result = await openCdpLoginWindow(config, {
       account: typeof body.account === "string" ? body.account : undefined,
-      port: Number(body.port ?? 9222),
+      port: Number(body.port ?? getDefaultCdpPort()),
       restart: body.restart === true
     });
     sendJson(res, 200, result);
@@ -406,7 +406,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
 
   if (req.method === "POST" && url.pathname === "/api/cdp-login/sync-cookies") {
     const body = await readJson(req);
-    const result = await syncCdpCookiesToMcp(config, Number(body.port ?? 9222));
+    const result = await syncCdpCookiesToMcp(config, Number(body.port ?? getDefaultCdpPort()));
     sendJson(res, 200, result);
     return;
   }

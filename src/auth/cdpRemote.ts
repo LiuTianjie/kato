@@ -1,8 +1,7 @@
-import { openCdpLoginWindow } from "./cdpLogin.js";
+import { getDefaultCdpPort, openCdpLoginWindow } from "./cdpLogin.js";
 import type { AppConfig } from "../config.js";
 
 const DEFAULT_HOST = "127.0.0.1";
-const DEFAULT_PORT = 9222;
 const XHS_WEB_URL = "https://www.xiaohongshu.com/explore";
 
 interface CdpTarget {
@@ -38,7 +37,7 @@ export async function getCdpLoginTarget(
   config: AppConfig,
   options: { port?: number; ensure?: boolean } = {}
 ): Promise<{ id: string; title: string; url: string; cdpUrl: string; viewport: Viewport }> {
-  const port = options.port ?? DEFAULT_PORT;
+  const port = options.port ?? getDefaultCdpPort();
   if (options.ensure && !(await isCdpOpen(port))) {
     await openCdpLoginWindow(config, { port });
   }
@@ -57,7 +56,7 @@ export async function captureCdpLoginFrame(
   config: AppConfig,
   options: { port?: number; ensure?: boolean; width?: number; height?: number } = {}
 ): Promise<{ image: string; title: string; url: string; viewport: Viewport; capturedAt: string }> {
-  const port = options.port ?? DEFAULT_PORT;
+  const port = options.port ?? getDefaultCdpPort();
   if (options.ensure && !(await isCdpOpen(port))) {
     await openCdpLoginWindow(config, { port });
   }
@@ -87,7 +86,7 @@ export async function dispatchCdpLoginInput(
   input: Record<string, unknown>,
   options: { port?: number } = {}
 ): Promise<{ ok: true }> {
-  const port = options.port ?? DEFAULT_PORT;
+  const port = options.port ?? getDefaultCdpPort();
   const target = await findPageTarget(port, false);
   const type = String(input.type ?? "");
 
@@ -158,7 +157,7 @@ export async function dispatchCdpBrowserAction(
   input: Record<string, unknown>,
   options: { port?: number } = {}
 ): Promise<{ ok: true; title: string; url: string; viewport: Viewport }> {
-  const port = options.port ?? DEFAULT_PORT;
+  const port = options.port ?? getDefaultCdpPort();
   if (!(await isCdpOpen(port))) {
     await openCdpLoginWindow(config, { port });
   }
@@ -193,7 +192,7 @@ export async function dispatchCdpBrowserAction(
 }
 
 export async function streamCdpBrowserFrames(config: AppConfig, options: ScreencastOptions): Promise<void> {
-  const port = options.port ?? DEFAULT_PORT;
+  const port = options.port ?? getDefaultCdpPort();
   if (options.ensure && !(await isCdpOpen(port))) {
     await openCdpLoginWindow(config, { port });
   }
