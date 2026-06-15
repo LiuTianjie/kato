@@ -80,6 +80,7 @@ const XHS_CREATOR_URL = "https://creator.xiaohongshu.com";
 
 let contextPromise;
 let servicePagePromise;
+let viewerPagePromise;
 let restartPromise;
 let browserTaskTail = Promise.resolve();
 let browserTaskSeq = 0;
@@ -381,6 +382,7 @@ async function ensureContext() {
     contextPromise = launchContext().catch((error) => {
       contextPromise = undefined;
       servicePagePromise = undefined;
+      viewerPagePromise = undefined;
       throw error;
     });
   }
@@ -432,6 +434,7 @@ function enqueueBrowserTask(label, task, options = {}) {
         if (markCancelled) taskContext.signal.removeEventListener("abort", markCancelled);
         browserTaskActive = null;
       }
+      await closeTaskServicePage(taskContext, "task finished").catch(() => undefined);
     }
   };
 
@@ -482,6 +485,7 @@ async function resetBrowserAfterTaskTimeout(label) {
   const oldContextPromise = contextPromise;
   contextPromise = undefined;
   servicePagePromise = undefined;
+  viewerPagePromise = undefined;
   stopCookieAutoPersist();
 
   if (oldContextPromise) {
@@ -651,24 +655,124 @@ async function applyPageFingerprint(page) {
 async function servicePage(taskContext) {
   taskContext?.throwIfCancelled?.();
   const context = await ensureContext();
+  if (taskContext) {
+    if (!taskContext.servicePagePromise) {
+      taskContext.servicePagePromise = createServicePage(context, taskContext);
+    }
+    const page = await taskContext.servicePagePromise;
+    if (page.isClosed()) {
+      taskContext.servicePagePromise = undefined;
+      taskContext.servicePage = undefined;
+      return servicePage(taskContext);
+    }
+    await ensurePageUsable(page, taskContext);
+    bindTaskPage(taskContext, page);
+    return page;
+  }
   if (!servicePagePromise) {
-    servicePagePromise = (async () => {
-      const page = context.pages()[0] || (await context.newPage());
-      page.setDefaultTimeout(30_000);
-      await applyPageFingerprint(page).catch((error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        serviceLog("warn", "stealth", `Service page fingerprint apply failed: ${message}`);
-      });
-      return page;
-    })();
+    servicePagePromise = createServicePage(context);
   }
   const page = await servicePagePromise;
   if (page.isClosed()) {
     servicePagePromise = undefined;
     return servicePage(taskContext);
   }
-  bindTaskPage(taskContext, page);
+  await ensurePageUsable(page);
   return page;
+}
+
+async function createServicePage(context, taskContext) {
+  const page = await context.newPage();
+  page.setDefaultTimeout(30_000);
+  page.on("crash", () => {
+    serviceLog("error", "browser", "Service page crashed; it will be discarded before the next browser action.", {
+      task: taskContext ? `#${taskContext.id}:${taskContext.label}` : "warmup",
+      url: safeLogUrl(page.url())
+    });
+    discardServicePage(page, taskContext);
+  });
+  page.on("close", () => discardServicePage(page, taskContext));
+  await applyPageFingerprint(page).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    serviceLog("warn", "stealth", `Service page fingerprint apply failed: ${message}`);
+  });
+  if (taskContext) taskContext.servicePage = page;
+  return page;
+}
+
+async function viewerPage(taskContext) {
+  taskContext?.throwIfCancelled?.();
+  const context = await ensureContext();
+  if (!viewerPagePromise) {
+    viewerPagePromise = createViewerPage(context);
+  }
+  const page = await viewerPagePromise;
+  if (page.isClosed()) {
+    viewerPagePromise = undefined;
+    return viewerPage(taskContext);
+  }
+  try {
+    await ensurePageUsable(page);
+  } catch (error) {
+    discardViewerPage(page);
+    throw error;
+  }
+  return page;
+}
+
+async function createViewerPage(context) {
+  const page = await context.newPage();
+  page.setDefaultTimeout(30_000);
+  page.on("crash", () => {
+    serviceLog("error", "browser", "Viewer page crashed; it will be recreated on the next browser open.", {
+      url: safeLogUrl(page.url())
+    });
+    discardViewerPage(page);
+  });
+  page.on("close", () => discardViewerPage(page));
+  await applyPageFingerprint(page).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    serviceLog("warn", "stealth", `Viewer page fingerprint apply failed: ${message}`);
+  });
+  return page;
+}
+
+async function ensurePageUsable(page, taskContext) {
+  if (page.isClosed()) throw new Error("Service page is closed.");
+  try {
+    await page.evaluate(() => document.readyState).catch((error) => {
+      throw error;
+    });
+  } catch (error) {
+    discardServicePage(page, taskContext);
+    throw error;
+  }
+}
+
+function discardServicePage(page, taskContext) {
+  if (taskContext?.servicePage === page) {
+    taskContext.servicePage = undefined;
+    taskContext.servicePagePromise = undefined;
+    taskContext.pageAbortBound = false;
+  }
+  if (servicePagePromise) {
+    const currentPromise = servicePagePromise;
+    currentPromise.then((current) => {
+      if (current === page && servicePagePromise === currentPromise) servicePagePromise = undefined;
+    }).catch(() => {
+      if (servicePagePromise === currentPromise) servicePagePromise = undefined;
+    });
+  }
+}
+
+function discardViewerPage(page) {
+  if (!viewerPagePromise) return;
+  const currentPromise = viewerPagePromise;
+  currentPromise.then((current) => {
+    if (current === page && viewerPagePromise === currentPromise) viewerPagePromise = undefined;
+  }).catch(() => {
+    if (viewerPagePromise === currentPromise) viewerPagePromise = undefined;
+  });
 }
 
 function bindTaskPage(taskContext, page) {
@@ -677,8 +781,10 @@ function bindTaskPage(taskContext, page) {
     closeCancelledTaskPage(taskContext, page);
     throw taskAbortReason(taskContext.signal);
   }
+  if (taskContext.pageAbortBound && taskContext.servicePage === page) return;
   const closePage = () => closeCancelledTaskPage(taskContext, page);
   taskContext.signal.addEventListener("abort", closePage, { once: true });
+  taskContext.pageAbortBound = true;
 }
 
 function closeCancelledTaskPage(taskContext, page) {
@@ -687,7 +793,26 @@ function closeCancelledTaskPage(taskContext, page) {
     reason: abortReasonMessage(taskContext.signal)
   });
   if (servicePagePromise) servicePagePromise = undefined;
+  if (taskContext) {
+    taskContext.servicePage = undefined;
+    taskContext.servicePagePromise = undefined;
+    taskContext.pageAbortBound = false;
+  }
   page.close({ runBeforeUnload: false }).catch(() => undefined);
+}
+
+async function closeTaskServicePage(taskContext, reason) {
+  if (!taskContext || taskContext.keepServicePage) return;
+  const page = taskContext.servicePagePromise ? await taskContext.servicePagePromise.catch(() => undefined) : taskContext.servicePage;
+  taskContext.servicePage = undefined;
+  taskContext.servicePagePromise = undefined;
+  taskContext.pageAbortBound = false;
+  if (!page || page.isClosed()) return;
+  serviceLog("info", "queue", `Closing task service page after ${reason}.`, {
+    task: `#${taskContext.id}:${taskContext.label}`,
+    url: safeLogUrl(page.url())
+  });
+  await page.close({ runBeforeUnload: false }).catch(() => undefined);
 }
 
 async function restartBrowser(reason = "manual") {
@@ -697,6 +822,7 @@ async function restartBrowser(reason = "manual") {
     const oldContextPromise = contextPromise;
     contextPromise = undefined;
     servicePagePromise = undefined;
+    viewerPagePromise = undefined;
     stopCookieAutoPersist();
 
     if (oldContextPromise) {
@@ -707,7 +833,7 @@ async function restartBrowser(reason = "manual") {
 
     await requestRuntimeRestart(reason);
     await ensureContext();
-    await servicePage();
+    await warmServicePage();
     return {
       restarted: true,
       reason,
@@ -744,12 +870,22 @@ function isRecoverableBrowserError(error) {
 
 async function openLoginPage(taskContext) {
   return withBrowserRecovery("openLoginPage", async () => {
-    const page = await servicePage(taskContext);
+    const page = await viewerPage(taskContext);
     taskContext?.throwIfCancelled?.();
     await page.goto(XHS_HOME_URL, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
     taskContext?.throwIfCancelled?.();
     await page.bringToFront().catch(() => undefined);
   }, taskContext);
+}
+
+async function warmServicePage() {
+  const context = await ensureContext();
+  const page = await createServicePage(context);
+  try {
+    await ensurePageUsable(page);
+  } finally {
+    await page.close({ runBeforeUnload: false }).catch(() => undefined);
+  }
 }
 
 async function loginStatus(taskContext) {
@@ -1684,12 +1820,16 @@ async function connectBrowserOverCdp() {
 }
 
 async function verifyContextReady(context) {
-  const page = context.pages()[0] || (await context.newPage());
+  const page = await context.newPage();
   page.setDefaultTimeout(30_000);
-  await page.evaluate(() => document.readyState).catch(async (error) => {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Chromium page readiness check failed: ${message}`);
-  });
+  try {
+    await page.evaluate(() => document.readyState).catch(async (error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Chromium page readiness check failed: ${message}`);
+    });
+  } finally {
+    await page.close({ runBeforeUnload: false }).catch(() => undefined);
+  }
 }
 
 async function waitForCdpHttp(timeoutMs = 15_000) {

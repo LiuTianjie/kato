@@ -246,6 +246,8 @@ async function launchChrome() {
     ...(CHROME_NO_SANDBOX ? ["--no-sandbox"] : []),
     "--disable-dev-shm-usage",
     "--disable-notifications",
+    "--disable-session-crashed-bubble",
+    "--hide-crash-restore-bubble",
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-sync",
@@ -261,7 +263,7 @@ async function launchChrome() {
     "about:blank"
   ];
   serviceLog("info", "chrome", "Starting Chrome process.", { bin: BROWSER_BIN, cdp: `${CDP_HOST}:${CDP_PORT}`, display: DISPLAY, profileDir: PROFILE_DIR });
-  const child = spawn(BROWSER_BIN, args, { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, DISPLAY } });
+  const child = spawn(BROWSER_BIN, args, { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, DISPLAY }, detached: true });
   chromeProcess = child;
   captureChildLogs(child, "chrome");
   child.on("exit", (code) => {
@@ -547,13 +549,26 @@ async function fetchJson(url) {
 function terminateProcess(processRef, reason) {
   if (!processRef || processRef.killed) return;
   serviceLog("warn", "process", `Terminating process ${processRef.pid || ""}: ${reason}`);
-  processRef.kill("SIGTERM");
+  killProcessTree(processRef, "SIGTERM");
   setTimeout(() => {
     if (processRef.exitCode === null && processRef.signalCode === null) {
       serviceLog("error", "process", `Process ${processRef.pid || ""} did not exit after SIGTERM; sending SIGKILL.`);
-      processRef.kill("SIGKILL");
+      killProcessTree(processRef, "SIGKILL");
     }
   }, PROCESS_EXIT_GRACE_MS).unref();
+}
+
+function killProcessTree(processRef, signal) {
+  if (!processRef?.pid) return;
+  try {
+    process.kill(-processRef.pid, signal);
+  } catch {
+    try {
+      processRef.kill(signal);
+    } catch {
+      // The process may already be gone.
+    }
+  }
 }
 
 function waitForProcessExit(processRef, timeoutMs) {
