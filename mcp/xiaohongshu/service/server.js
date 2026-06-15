@@ -81,6 +81,7 @@ let browserTaskPending = 0;
 let browserTaskActive = null;
 let browserPriorityPromise;
 let cookiePersistTimer;
+const postTokenCache = new Map();
 
 class BrowserTaskTimeoutError extends Error {
   constructor(message) {
@@ -633,16 +634,19 @@ async function searchFeeds(keyword, limit, options = {}) {
     await autoScroll(page, Math.max(2, pageNumber + 1));
     const posts = await scrapePosts(page);
     const start = (pageNumber - 1) * limit;
-    return uniquePosts(posts).slice(start, start + limit);
+    const unique = uniquePosts(posts);
+    rememberPosts(unique);
+    return unique.slice(start, start + limit);
   });
 }
 
 async function getFeedDetail(body) {
   return withBrowserRecovery("getFeedDetail", async () => {
-    const id = String(body.feed_id || body.id || "").trim();
-    const xsecToken = String(body.xsec_token || body.xsecToken || "").trim();
-    const url = normalizeXhsDetailUrl(body.url, id, xsecToken);
+    const { id, xsecToken, url } = normalizeDetailInput(body);
     if (!url && !id) throw new Error("feed_id or url is required.");
+    if (isTokenRequiredForDetailUrl(url) && !xsecToken) {
+      throw new Error(`xsec_token is required for XHS note detail: ${id || url}`);
+    }
     const page = await servicePage();
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await page.waitForTimeout(2_500);
@@ -670,7 +674,7 @@ async function getFeedDetail(body) {
       };
     });
     const parsed = postFromUrl(url);
-    return {
+    const result = {
       id: id || parsed.id,
       xsecToken: xsecToken || parsed.xsecToken,
       url,
@@ -678,6 +682,8 @@ async function getFeedDetail(body) {
       snippet: cleanSnippet(detail.snippet || detail.text),
       author: detail.author || undefined
     };
+    rememberPosts([result]);
+    return result;
   });
 }
 
@@ -1111,6 +1117,16 @@ function buildXhsUrl(id, xsecToken) {
   return url.toString();
 }
 
+function normalizeDetailInput(body) {
+  const rawUrl = String(body.url || body.share_text || body.shareText || "").trim();
+  const parsed = postFromUrl(extractUrl(rawUrl));
+  const id = String(body.feed_id || body.id || parsed.id || "").trim();
+  const cached = id ? postTokenCache.get(id) : undefined;
+  const xsecToken = String(body.xsec_token || body.xsecToken || parsed.xsecToken || cached?.xsecToken || "").trim();
+  const url = normalizeXhsDetailUrl(rawUrl || cached?.url || "", id, xsecToken);
+  return { id, xsecToken, url };
+}
+
 function normalizeXhsDetailUrl(rawUrl, id, xsecToken) {
   const token = String(xsecToken || "").trim();
   const fallback = id ? buildXhsUrl(id, token) : "";
@@ -1144,6 +1160,40 @@ function normalizeUrlCandidate(value) {
 
 function isXhsExploreUrl(url) {
   return /(^|\.)xiaohongshu\.com$/i.test(url.hostname) && url.pathname.split("/").includes("explore");
+}
+
+function isTokenRequiredForDetailUrl(value) {
+  try {
+    const url = new URL(value);
+    const parts = url.pathname.split("/").filter(Boolean);
+    return isXhsExploreUrl(url) && parts.length >= 2 && parts[0] === "explore" && !url.searchParams.get("xsec_token");
+  } catch {
+    return false;
+  }
+}
+
+function rememberPosts(posts) {
+  for (const post of posts) {
+    const id = String(post.id || "").trim();
+    const parsed = postFromUrl(String(post.url || ""));
+    const xsecToken = String(post.xsecToken || parsed.xsecToken || "").trim();
+    if (!id || !xsecToken) continue;
+    postTokenCache.set(id, {
+      xsecToken,
+      url: normalizeXhsDetailUrl(post.url || "", id, xsecToken),
+      updatedAt: Date.now()
+    });
+  }
+  trimPostTokenCache();
+}
+
+function trimPostTokenCache() {
+  const maxSize = 1000;
+  if (postTokenCache.size <= maxSize) return;
+  const entries = [...postTokenCache.entries()].sort((a, b) => a[1].updatedAt - b[1].updatedAt);
+  for (const [key] of entries.slice(0, postTokenCache.size - maxSize)) {
+    postTokenCache.delete(key);
+  }
 }
 
 function cleanTitle(value) {
