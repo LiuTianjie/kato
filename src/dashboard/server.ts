@@ -1,6 +1,5 @@
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { execFile } from "node:child_process";
 import { connect as connectTcp } from "node:net";
 import type { Duplex } from "node:stream";
 import path from "node:path";
@@ -55,10 +54,12 @@ initSchema(db);
 const publicDir = path.join(config.rootDir, "public");
 const debugScreenshotDir = path.join(config.rootDir, "mcp", "xiaohongshu", "data", "debug");
 const port = Number(process.env.PORT ?? 4173);
-const noVncHost = process.env.XHS_NOVNC_HOST || "127.0.0.1";
-const noVncPort = Number(process.env.XHS_NOVNC_PORT || 6080);
-const vncPort = Number(process.env.XHS_VNC_PORT || 5900);
-const browserDisplay = process.env.XHS_DISPLAY || ":99";
+const browserRuntimeUrl =
+  process.env.BROWSER_RUNTIME_URL ||
+  process.env.XHS_BROWSER_RUNTIME_URL ||
+  `http://127.0.0.1:${process.env.BROWSER_RUNTIME_PORT || process.env.XHS_BROWSER_RUNTIME_PORT || 18100}`;
+const noVncHost = process.env.BROWSER_NOVNC_HOST || process.env.XHS_NOVNC_HOST || "127.0.0.1";
+const noVncPort = Number(process.env.BROWSER_NOVNC_PORT || process.env.XHS_NOVNC_PORT || 6080);
 const noVncViewerUrl = "/novnc/vnc.html?autoconnect=1&resize=scale&path=novnc/websockify";
 const legacyCdpLoginEnabled =
   process.env.KATO_ENABLE_LEGACY_CDP_LOGIN === "1" || process.env.XHS_LEGACY_CDP_LOGIN_ENABLED === "1";
@@ -424,7 +425,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
   }
 
   if (req.method === "POST" && url.pathname === "/api/browser-viewer/open") {
-    await fetchMcpJson("/api/v1/login/qrcode", 45_000);
+    await postRuntimeJson("/browser/open", { url: "https://www.xiaohongshu.com/explore" }, 45_000);
     await waitForBrowserViewerReady(10_000);
     sendJson(res, 200, {
       opened: true,
@@ -685,6 +686,30 @@ async function postMcpJson(endpoint: string, body: Record<string, unknown>, time
   return data;
 }
 
+async function fetchRuntimeJson(endpoint: string, timeoutMs = 20_000): Promise<unknown> {
+  const response = await fetchWithTimeout(`${browserRuntimeUrl.replace(/\/$/, "")}${endpoint}`, {}, timeoutMs);
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!response.ok || isMcpFailure(data)) {
+    throw new Error(mcpErrorMessage(data, `Browser runtime ${endpoint} failed: HTTP ${response.status}`));
+  }
+  return data;
+}
+
+async function postRuntimeJson(endpoint: string, body: Record<string, unknown>, timeoutMs = 35_000): Promise<unknown> {
+  const response = await fetchWithTimeout(`${browserRuntimeUrl.replace(/\/$/, "")}${endpoint}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  }, timeoutMs);
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!response.ok || isMcpFailure(data)) {
+    throw new Error(mcpErrorMessage(data, `Browser runtime ${endpoint} failed: HTTP ${response.status}`));
+  }
+  return data;
+}
+
 function isMcpFailure(payload: unknown): boolean {
   return Boolean(payload && typeof payload === "object" && "success" in payload && (payload as { success?: unknown }).success === false);
 }
@@ -712,39 +737,9 @@ function unwrapMcpData(payload: unknown): unknown {
 
 async function runBrowserViewerAction(body: Record<string, unknown>): Promise<{ ok: true }> {
   const action = String(body.action ?? "");
-  if (action === "navigate") {
-    const url = normalizeViewerUrl(String(body.url ?? ""));
-    await runXdotool(["key", "--clearmodifiers", "ctrl+l"]);
-    await runXdotool(["type", "--delay", "12", "--clearmodifiers", url]);
-    await runXdotool(["key", "--clearmodifiers", "Return"]);
-    return { ok: true };
-  }
-  if (action === "back") {
-    await runXdotool(["key", "--clearmodifiers", "Alt+Left"]);
-    return { ok: true };
-  }
-  if (action === "forward") {
-    await runXdotool(["key", "--clearmodifiers", "Alt+Right"]);
-    return { ok: true };
-  }
-  if (action === "reload") {
-    await runXdotool(["key", "--clearmodifiers", "F5"]);
-    return { ok: true };
-  }
-  throw new Error("不支持的浏览器动作。");
-}
-
-function runXdotool(args: string[]): Promise<void> {
-  return new Promise((resolve, reject) => {
-    execFile("xdotool", args, { env: { ...process.env, DISPLAY: browserDisplay }, timeout: 10_000 }, (error, stdout, stderr) => {
-      if (error) {
-        const message = stderr?.trim() || stdout?.trim() || error.message;
-        reject(new Error(`浏览器远程操作失败：${message}`));
-        return;
-      }
-      resolve();
-    });
-  });
+  const payload = action === "navigate" ? { ...body, url: normalizeViewerUrl(String(body.url ?? "")) } : body;
+  await postRuntimeJson("/browser/action", payload, 20_000);
+  return { ok: true };
 }
 
 async function waitForBrowserViewerReady(timeoutMs: number): Promise<void> {
@@ -752,11 +747,10 @@ async function waitForBrowserViewerReady(timeoutMs: number): Promise<void> {
   let lastError = "";
   while (Date.now() < deadline) {
     try {
-      await probeTcpPort(noVncPort, noVncHost, 1_000);
-      await probeTcpPort(vncPort, noVncHost, 1_000);
-      const response = await fetchWithTimeout(`http://${noVncHost}:${noVncPort}/vnc.html`, { method: "GET" }, 1_500);
-      if (response.ok) return;
-      lastError = `HTTP ${response.status}`;
+      const runtime = await fetchRuntimeJson("/health?ensure=1", 3_000);
+      const ready = (runtime as { runtime?: { noVnc?: { ready?: boolean } } }).runtime?.noVnc?.ready === true;
+      if (ready) return;
+      lastError = "runtime noVNC not ready";
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
     }

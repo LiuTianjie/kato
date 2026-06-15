@@ -6,10 +6,23 @@ COPY package.json package-lock.json tsconfig.json ./
 COPY src ./src
 RUN npm ci && npm run build && npm prune --omit=dev
 
-FROM node:22-bookworm-slim
+FROM node:22-bookworm-slim AS browser-runtime
 
 ENV NODE_ENV=production \
     PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    BROWSER_RUNTIME_PORT=18100 \
+    BROWSER_BIN=/usr/local/bin/kato-chromium \
+    BROWSER_CDP_HOST=127.0.0.1 \
+    BROWSER_CDP_PORT=9224 \
+    BROWSER_DISPLAY=:99 \
+    BROWSER_DISPLAY_SIZE=1440x980x24 \
+    BROWSER_VNC_ENABLED=1 \
+    BROWSER_VNC_PORT=5900 \
+    BROWSER_NOVNC_PORT=6080 \
+    BROWSER_PROFILE_DIR=/app/data/browser-profile \
+    BROWSER_COOKIES_PATH=/app/data/cookies.json \
+    BROWSER_CHROME_USER=kato \
+    BROWSER_CHROME_NO_SANDBOX=1 \
     XHS_BROWSER_BIN=/usr/local/bin/kato-chromium \
     XHS_CDP_HOST=127.0.0.1 \
     XHS_CDP_PORT=9224 \
@@ -18,12 +31,8 @@ ENV NODE_ENV=production \
     XHS_VNC_ENABLED=1 \
     XHS_VNC_PORT=5900 \
     XHS_NOVNC_PORT=6080 \
-    XHS_PROFILE_DIR=/app/mcp/xiaohongshu/data/profile \
-    COOKIES_PATH=/app/mcp/xiaohongshu/data/cookies.json \
     XHS_CHROME_USER=kato \
-    XHS_CHROME_NO_SANDBOX=1 \
-    PORT=4173 \
-    XHS_SERVICE_PORT=18060
+    XHS_CHROME_NO_SANDBOX=1
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -58,6 +67,33 @@ WORKDIR /app
 RUN groupadd --system kato \
   && useradd --system --gid kato --home-dir /home/kato --create-home --shell /usr/sbin/nologin kato
 
+COPY browser-runtime ./browser-runtime
+COPY scripts/kato-chromium.sh /usr/local/bin/kato-chromium
+
+RUN chmod +x /app/browser-runtime/bin/start-browser-runtime.sh /usr/local/bin/kato-chromium \
+  && mkdir -p /app/data \
+  && chown -R kato:kato /home/kato /app/data
+
+EXPOSE 18100
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/app/browser-runtime/bin/start-browser-runtime.sh"]
+
+FROM browser-runtime AS kato
+
+ENV PORT=4173 \
+    XHS_SERVICE_PORT=18060 \
+    BROWSER_RUNTIME_PORT=18100 \
+    BROWSER_RUNTIME_URL=http://127.0.0.1:18100 \
+    XHS_BROWSER_RUNTIME_URL=http://127.0.0.1:18100 \
+    BROWSER_PROFILE_DIR=/app/mcp/xiaohongshu/data/profile \
+    BROWSER_COOKIES_PATH=/app/mcp/xiaohongshu/data/cookies.json \
+    BROWSER_COOKIE_MIRROR_PATHS=/app/data/cookies.json \
+    XHS_PROFILE_DIR=/app/mcp/xiaohongshu/data/profile \
+    COOKIES_PATH=/app/mcp/xiaohongshu/data/cookies.json
+
+WORKDIR /app
+
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json package-lock.json ./
@@ -65,16 +101,14 @@ COPY public ./public
 COPY xhs.config.example.json ./
 COPY mcp/xiaohongshu/service ./mcp/xiaohongshu/service
 COPY scripts/start-kato.sh ./scripts/start-kato.sh
-COPY scripts/kato-chromium.sh /usr/local/bin/kato-chromium
 
-RUN chmod +x ./scripts/start-kato.sh /usr/local/bin/kato-chromium \
+RUN chmod +x ./scripts/start-kato.sh \
   && mkdir -p /app/data /app/output /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images \
-  && chown -R kato:kato /home/kato /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images
+  && chown -R kato:kato /home/kato /app/data /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images
 
 EXPOSE 4173 18060
 
 HEALTHCHECK --interval=30s --timeout=25s --start-period=60s --retries=3 \
-  CMD node -e "const urls=['http://127.0.0.1:'+(process.env.PORT||4173)+'/api/dashboard','http://127.0.0.1:'+(process.env.XHS_SERVICE_PORT||18060)+'/health?ensure=1']; Promise.all(urls.map((url)=>fetch(url,{signal:AbortSignal.timeout(20000)}).then((r)=>{if(!r.ok) throw new Error(url+' '+r.status)}))).then(()=>process.exit(0)).catch((e)=>{console.error(e.message);process.exit(1)})"
+  CMD node -e "const urls=['http://127.0.0.1:'+(process.env.PORT||4173)+'/api/dashboard','http://127.0.0.1:'+(process.env.XHS_SERVICE_PORT||18060)+'/health?ensure=1','http://127.0.0.1:'+(process.env.BROWSER_RUNTIME_PORT||18100)+'/health?ensure=1']; Promise.all(urls.map((url)=>fetch(url,{signal:AbortSignal.timeout(20000)}).then((r)=>{if(!r.ok) throw new Error(url+' '+r.status)}))).then(()=>process.exit(0)).catch((e)=>{console.error(e.message);process.exit(1)})"
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["./scripts/start-kato.sh"]

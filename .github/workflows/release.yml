@@ -20,6 +20,7 @@ concurrency:
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/kato
+  RUNTIME_IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/kato-browser-runtime
 
 jobs:
   image:
@@ -37,7 +38,29 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: docker/metadata-action@v5
-        id: meta
+        id: runtime-meta
+        with:
+          images: ${{ env.RUNTIME_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: browser-runtime
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.runtime-meta.outputs.tags }}
+          labels: ${{ steps.runtime-meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - uses: docker/metadata-action@v5
+        id: app-meta
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
@@ -52,8 +75,8 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.app-meta.outputs.tags }}
+          labels: ${{ steps.app-meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

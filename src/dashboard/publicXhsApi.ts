@@ -20,6 +20,10 @@ interface ApiErrorPayload {
   message: string;
 }
 
+interface RouteOptions {
+  signal?: AbortSignal;
+}
+
 class PublicApiError extends Error {
   constructor(
     readonly status: number,
@@ -28,6 +32,20 @@ class PublicApiError extends Error {
   ) {
     super(message);
     this.name = "PublicApiError";
+  }
+}
+
+class PublicRequestCancelledError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PublicRequestCancelledError";
+  }
+}
+
+class PublicFetchTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PublicFetchTimeoutError";
   }
 }
 
@@ -43,10 +61,11 @@ export async function handlePublicXhsApi(
 ): Promise<boolean> {
   if (!isPublicXhsApiPath(url.pathname)) return false;
 
+  const requestSignal = createRequestAbortSignal(req, res);
   try {
     assertAuthorized(req);
     const body = req.method === "POST" ? await readJson(req) : Object.fromEntries(url.searchParams.entries());
-    const data = await routePublicXhsApi(req, url, body, context);
+    const data = await routePublicXhsApi(req, url, body, context, { signal: requestSignal });
     sendApiSuccess(res, data);
   } catch (error) {
     const apiError = normalizeApiError(error);
@@ -59,60 +78,61 @@ async function routePublicXhsApi(
   req: IncomingMessage,
   url: URL,
   body: Record<string, unknown>,
-  context: PublicXhsApiContext
+  context: PublicXhsApiContext,
+  options: RouteOptions = {}
 ): Promise<unknown> {
   const path = url.pathname;
   const serverxPath = normalizeServerxPath(path);
   const tikhubPath = normalizeTikHubPath(path);
 
   if (req.method === "GET" && tikhubPath === "/search_notes") {
-    return searchNotesForTikHub(context.config, body);
+    return searchNotesForTikHub(context.config, body, options);
   }
 
   if (req.method === "GET" && (tikhubPath === "/get_image_note_detail" || tikhubPath === "/get_video_note_detail")) {
-    return noteDetailForTikHub(context.config, body);
+    return noteDetailForTikHub(context.config, body, options);
   }
 
   if (req.method === "GET" && tikhubPath === "/get_note_comments") {
-    return noteCommentsForTikHub(context.config, body);
+    return noteCommentsForTikHub(context.config, body, options);
   }
 
   if (req.method === "GET" && tikhubPath === "/get_note_sub_comments") {
-    return noteSubCommentsForTikHub(context.config, body);
+    return noteSubCommentsForTikHub(context.config, body, options);
   }
 
   if (req.method === "POST" && serverxPath === "/search_notes") {
-    return searchNotesForServerx(context.config, body);
+    return searchNotesForServerx(context.config, body, options);
   }
 
   if (req.method === "POST" && serverxPath === "/note_detail") {
-    return noteDetailForServerx(context.config, body);
+    return noteDetailForServerx(context.config, body, options);
   }
 
   if (req.method === "POST" && serverxPath === "/note_comments") {
-    return noteCommentsForServerx(context.config, body);
+    return noteCommentsForServerx(context.config, body, options);
   }
 
   if (req.method === "POST" && serverxPath === "/note_sub_comments") {
-    return noteSubCommentsForServerx(context.config, body);
+    return noteSubCommentsForServerx(context.config, body, options);
   }
 
   if (req.method === "GET" && path === "/api/v1/xhs/health") {
-    return getPublicHealth(context.config);
+    return getPublicHealth(context.config, options);
   }
 
   if (req.method === "GET" && path === "/api/v1/xhs/auth/status") {
-    return fetchMcpJson(context.config, "/api/v1/login/status");
+    return fetchMcpJson(context.config, "/api/v1/login/status", options.signal);
   }
 
   if (req.method === "POST" && path === "/api/v1/xhs/posts/search") {
     const keywords = normalizeKeywords(body);
     const limit = normalizeLimit(body.limit, 20);
-    return searchOnlyPosts(context.config, { keywords, limit });
+    return searchOnlyPosts(context.config, { keywords, limit, signal: options.signal });
   }
 
   if (req.method === "POST" && path === "/api/v1/xhs/posts/detail") {
-    return getPostDetail(context.config, body);
+    return getPostDetail(context.config, body, options);
   }
 
   if (req.method === "POST" && path === "/api/v1/xhs/notes/sync") {
@@ -127,13 +147,13 @@ async function routePublicXhsApi(
   if (req.method === "POST" && path === "/api/v1/xhs/comments/publish") {
     assertConfirmed(body);
     const idempotencyKey = requireIdempotencyKey(body);
-    return runIdempotent(`publish:${idempotencyKey}`, () => publishComment(context.config, body));
+    return runIdempotent(`publish:${idempotencyKey}`, () => publishComment(context.config, body, options));
   }
 
   if (req.method === "POST" && path === "/api/v1/xhs/posts/like") {
     assertConfirmed(body);
     const idempotencyKey = requireIdempotencyKey(body);
-    return runIdempotent(`like:${idempotencyKey}`, () => likePost(context.config, body));
+    return runIdempotent(`like:${idempotencyKey}`, () => likePost(context.config, body, options));
   }
 
   throw new PublicApiError(404, "NOT_FOUND", "API endpoint not found.");
@@ -158,12 +178,12 @@ function normalizeTikHubPath(pathname: string): string {
   return "";
 }
 
-async function getPublicHealth(config: AppConfig): Promise<Record<string, unknown>> {
-  const mcpHealth = await fetchMcpJson(config, "/health").catch((error) => ({
+async function getPublicHealth(config: AppConfig, options: RouteOptions = {}): Promise<Record<string, unknown>> {
+  const mcpHealth = await fetchMcpJson(config, "/health", options.signal).catch((error) => ({
     ok: false,
     error: error instanceof Error ? error.message : String(error)
   }));
-  const authStatus = await fetchMcpJson(config, "/api/v1/login/status").catch((error) => ({
+  const authStatus = await fetchMcpJson(config, "/api/v1/login/status", options.signal).catch((error) => ({
     ok: false,
     error: error instanceof Error ? error.message : String(error)
   }));
@@ -175,11 +195,11 @@ async function getPublicHealth(config: AppConfig): Promise<Record<string, unknow
   };
 }
 
-async function getPostDetail(config: AppConfig, body: Record<string, unknown>): Promise<XhsPost> {
+async function getPostDetail(config: AppConfig, body: Record<string, unknown>, options: RouteOptions = {}): Promise<XhsPost> {
   const adapter = createXhsAdapter(config);
   try {
     const input = normalizePostInput(body);
-    const detail = await adapter.getPost(input);
+    const detail = await adapter.getPost(input, { signal: options.signal });
     if (!detail) throw new PublicApiError(404, "POST_NOT_FOUND", "Post detail not found.");
     return detail;
   } finally {
@@ -187,25 +207,37 @@ async function getPostDetail(config: AppConfig, body: Record<string, unknown>): 
   }
 }
 
-async function searchNotesForServerx(config: AppConfig, body: Record<string, unknown>): Promise<Record<string, unknown>[]> {
+async function searchNotesForServerx(
+  config: AppConfig,
+  body: Record<string, unknown>,
+  options: RouteOptions = {}
+): Promise<Record<string, unknown>[]> {
   const keyword = String(body.keyword ?? body.query ?? "").trim();
   const keywords = keyword ? [keyword] : normalizeKeywords(body);
   const limit = normalizeLimit(body.limit, 20);
-  const result = await searchOnlyPosts(config, { keywords, limit });
+  const result = await searchOnlyPosts(config, { keywords, limit, signal: options.signal });
   const posts = await Promise.all(
     result.posts.slice(0, limit).map(async (post) => {
-      const comments = await safeGetComments(config, post, normalizeLimit(body.max_comments, 20));
+      const comments = await safeGetComments(config, post, normalizeLimit(body.max_comments, 20), options);
       return toServerxPost(post, comments);
     })
   );
   return posts;
 }
 
-async function searchNotesForTikHub(config: AppConfig, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function searchNotesForTikHub(
+  config: AppConfig,
+  body: Record<string, unknown>,
+  options: RouteOptions = {}
+): Promise<Record<string, unknown>> {
   const page = normalizePositiveInt(body.page, 1);
   const pageSize = normalizeLimit(body.limit ?? body.page_size ?? body.pageSize, 20);
   const keyword = String(body.keyword ?? body.query ?? "").trim();
-  const result = await searchOnlyPosts(config, { keywords: keyword ? [keyword] : normalizeKeywords(body), limit: page * pageSize });
+  const result = await searchOnlyPosts(config, {
+    keywords: keyword ? [keyword] : normalizeKeywords(body),
+    limit: page * pageSize,
+    signal: options.signal
+  });
   const start = (page - 1) * pageSize;
   const posts = result.posts.slice(start, start + pageSize).map((post) => toServerxPost(post));
   return {
@@ -226,26 +258,42 @@ async function searchNotesForTikHub(config: AppConfig, body: Record<string, unkn
   };
 }
 
-async function noteDetailForServerx(config: AppConfig, body: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const post = await getPostDetail(config, normalizeServerxPostInput(body));
-  const comments = await safeGetComments(config, post, normalizeLimit(body.max_comments, 50));
+async function noteDetailForServerx(
+  config: AppConfig,
+  body: Record<string, unknown>,
+  options: RouteOptions = {}
+): Promise<Record<string, unknown>> {
+  const post = await getPostDetail(config, normalizeServerxPostInput(body), options);
+  const comments = await safeGetComments(config, post, normalizeLimit(body.max_comments, 50), options);
   return toServerxPost(post, comments);
 }
 
-async function noteDetailForTikHub(config: AppConfig, body: Record<string, unknown>): Promise<Record<string, unknown>> {
-  return noteDetailForServerx(config, body);
+async function noteDetailForTikHub(
+  config: AppConfig,
+  body: Record<string, unknown>,
+  options: RouteOptions = {}
+): Promise<Record<string, unknown>> {
+  return noteDetailForServerx(config, body, options);
 }
 
-async function noteCommentsForServerx(config: AppConfig, body: Record<string, unknown>): Promise<Record<string, unknown>[]> {
+async function noteCommentsForServerx(
+  config: AppConfig,
+  body: Record<string, unknown>,
+  options: RouteOptions = {}
+): Promise<Record<string, unknown>[]> {
   const post = normalizePostInput(normalizeServerxPostInput(body));
-  const comments = await safeGetComments(config, post, normalizeLimit(body.max_comments ?? body.limit, 50));
+  const comments = await safeGetComments(config, post, normalizeLimit(body.max_comments ?? body.limit, 50), options);
   return comments.map(toServerxComment);
 }
 
-async function noteCommentsForTikHub(config: AppConfig, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function noteCommentsForTikHub(
+  config: AppConfig,
+  body: Record<string, unknown>,
+  options: RouteOptions = {}
+): Promise<Record<string, unknown>> {
   const page = normalizeCursorPage(body.index, body.cursor, 0);
   const pageSize = normalizeLimit(body.limit ?? body.max_comments ?? body.page_size, 50);
-  const comments = await noteCommentsForServerx(config, { ...body, max_comments: (page + 1) * pageSize });
+  const comments = await noteCommentsForServerx(config, { ...body, max_comments: (page + 1) * pageSize }, options);
   const start = page * pageSize;
   const items = comments.slice(start, start + pageSize);
   const nextIndex = page + 1;
@@ -264,10 +312,14 @@ async function noteCommentsForTikHub(config: AppConfig, body: Record<string, unk
   };
 }
 
-async function noteSubCommentsForServerx(config: AppConfig, body: Record<string, unknown>): Promise<Record<string, unknown>[]> {
+async function noteSubCommentsForServerx(
+  config: AppConfig,
+  body: Record<string, unknown>,
+  options: RouteOptions = {}
+): Promise<Record<string, unknown>[]> {
   const post = normalizePostInput(normalizeServerxPostInput(body));
   const parentId = String(body.comment_id ?? body.parent_comment_id ?? body.parent_id ?? "").trim();
-  const comments = await safeGetComments(config, post, normalizeLimit(body.max_comments ?? body.limit, 20));
+  const comments = await safeGetComments(config, post, normalizeLimit(body.max_comments ?? body.limit, 20), options);
   const subComments = parentId ? comments.filter((comment) => comment.parentId === parentId) : comments;
   return (subComments.length ? subComments : comments).map((comment) => ({
     ...toServerxComment(comment),
@@ -276,10 +328,14 @@ async function noteSubCommentsForServerx(config: AppConfig, body: Record<string,
   }));
 }
 
-async function noteSubCommentsForTikHub(config: AppConfig, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function noteSubCommentsForTikHub(
+  config: AppConfig,
+  body: Record<string, unknown>,
+  options: RouteOptions = {}
+): Promise<Record<string, unknown>> {
   const page = Math.max(normalizeCursorPage(body.index, body.cursor, 1) - 1, 0);
   const pageSize = normalizeLimit(body.limit ?? body.max_comments ?? body.page_size, 20);
-  const comments = await noteSubCommentsForServerx(config, { ...body, max_comments: (page + 1) * pageSize });
+  const comments = await noteSubCommentsForServerx(config, { ...body, max_comments: (page + 1) * pageSize }, options);
   const start = page * pageSize;
   const items = comments.slice(start, start + pageSize);
   const nextIndex = page + 2;
@@ -296,12 +352,13 @@ async function noteSubCommentsForTikHub(config: AppConfig, body: Record<string, 
   };
 }
 
-async function safeGetComments(config: AppConfig, post: XhsPost, limit: number): Promise<XhsComment[]> {
+async function safeGetComments(config: AppConfig, post: XhsPost, limit: number, options: RouteOptions = {}): Promise<XhsComment[]> {
   const adapter = createXhsAdapter(config);
   try {
     if (!adapter.getComments) return [];
-    return await adapter.getComments(post, limit);
-  } catch {
+    return await adapter.getComments(post, limit, { signal: options.signal });
+  } catch (error) {
+    if (isAbortLikeError(error)) throw error;
     return [];
   } finally {
     await adapter.close?.();
@@ -315,26 +372,26 @@ async function draftComment(db: Db, body: Record<string, unknown>): Promise<{ po
   return { post, ...draft };
 }
 
-async function publishComment(config: AppConfig, body: Record<string, unknown>): Promise<{ published: true; post: XhsPost }> {
+async function publishComment(config: AppConfig, body: Record<string, unknown>, options: RouteOptions = {}): Promise<{ published: true; post: XhsPost }> {
   const post = normalizePostInput(body);
   const content = String(body.content ?? body.comment ?? "").trim();
   if (!content) throw new PublicApiError(400, "CONTENT_REQUIRED", "content is required.");
   if (!post.xsecToken) throw new PublicApiError(400, "XSEC_TOKEN_REQUIRED", "post.xsecToken is required.");
   const adapter = createXhsAdapter(config);
   try {
-    await adapter.publishComment(post, content);
+    await adapter.publishComment(post, content, { signal: options.signal });
     return { published: true, post };
   } finally {
     await adapter.close?.();
   }
 }
 
-async function likePost(config: AppConfig, body: Record<string, unknown>): Promise<{ liked: boolean; post: XhsPost }> {
+async function likePost(config: AppConfig, body: Record<string, unknown>, options: RouteOptions = {}): Promise<{ liked: boolean; post: XhsPost }> {
   const post = normalizePostInput(body);
   if (!post.xsecToken) throw new PublicApiError(400, "XSEC_TOKEN_REQUIRED", "post.xsecToken is required.");
   const adapter = createXhsAdapter(config);
   try {
-    const liked = adapter.likePost ? await adapter.likePost(post) : false;
+    const liked = adapter.likePost ? await adapter.likePost(post, { signal: options.signal }) : false;
     return { liked, post };
   } finally {
     await adapter.close?.();
@@ -555,22 +612,28 @@ async function runIdempotent(key: string, task: () => Promise<unknown>): Promise
   return promise;
 }
 
-async function fetchMcpJson(config: AppConfig, endpoint: string): Promise<unknown> {
+async function fetchMcpJson(config: AppConfig, endpoint: string, signal?: AbortSignal): Promise<unknown> {
   const base = config.xhs.mcp?.url ? new URL(config.xhs.mcp.url).origin : "http://localhost:18060";
-  const response = await fetchWithTimeout(`${base}${endpoint}`, {}, MCP_FETCH_TIMEOUT_MS);
+  const response = await fetchWithTimeout(`${base}${endpoint}`, {}, MCP_FETCH_TIMEOUT_MS, signal);
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
   if (!response.ok) throw new PublicApiError(502, "MCP_ERROR", `MCP ${endpoint} failed: HTTP ${response.status}`);
   return data;
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number, externalSignal?: AbortSignal): Promise<Response> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const abortFromExternal = () => {
+    if (!controller.signal.aborted) controller.abort(externalSignal?.reason ?? new PublicRequestCancelledError("Client request was aborted."));
+  };
+  if (externalSignal?.aborted) abortFromExternal();
+  else externalSignal?.addEventListener("abort", abortFromExternal, { once: true });
+  const timeout = setTimeout(() => controller.abort(new PublicFetchTimeoutError(`Fetch timed out after ${timeoutMs}ms.`)), timeoutMs);
   try {
     return await fetch(url, { ...init, signal: controller.signal });
   } finally {
     clearTimeout(timeout);
+    externalSignal?.removeEventListener("abort", abortFromExternal);
   }
 }
 
@@ -582,12 +645,14 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
 }
 
 function sendApiSuccess(res: ServerResponse, data: unknown): void {
+  if (res.writableEnded || res.destroyed) return;
   res.statusCode = 200;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.end(JSON.stringify({ success: true, data }));
 }
 
 function sendApiError(res: ServerResponse, status: number, error: ApiErrorPayload): void {
+  if (res.writableEnded || res.destroyed) return;
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.end(JSON.stringify({ success: false, error }));
@@ -595,8 +660,43 @@ function sendApiError(res: ServerResponse, status: number, error: ApiErrorPayloa
 
 function normalizeApiError(error: unknown): PublicApiError {
   if (error instanceof PublicApiError) return error;
+  if (error instanceof PublicFetchTimeoutError) return new PublicApiError(504, "UPSTREAM_TIMEOUT", error.message);
+  if (isAbortLikeError(error)) return new PublicApiError(499, "CLIENT_CLOSED_REQUEST", error instanceof Error ? error.message : "Client request was aborted.");
   if (error instanceof SyntaxError) return new PublicApiError(400, "INVALID_JSON", "Invalid JSON body.");
   return new PublicApiError(500, "INTERNAL_ERROR", error instanceof Error ? error.message : String(error));
+}
+
+function createRequestAbortSignal(req: IncomingMessage, res: ServerResponse): AbortSignal {
+  const controller = new AbortController();
+  const abort = (message: string) => {
+    if (controller.signal.aborted || res.writableEnded) return;
+    controller.abort(new PublicRequestCancelledError(message));
+  };
+  if (typeof req.on === "function") {
+    req.on("aborted", () => abort("Client aborted the HTTP request."));
+    req.on("close", () => {
+      const requestWasAborted = (req as IncomingMessage & { aborted?: boolean; readableAborted?: boolean }).aborted === true ||
+        (req as IncomingMessage & { aborted?: boolean; readableAborted?: boolean }).readableAborted === true;
+      if (requestWasAborted && !res.writableEnded) abort("Client closed the HTTP request before completion.");
+    });
+  }
+  if (typeof (res as ServerResponse & { on?: unknown }).on === "function") {
+    (res as ServerResponse & { on: ServerResponse["on"] }).on("close", () => {
+      if (!res.writableEnded) abort("Client connection closed before Kato returned a result.");
+    });
+  }
+  return controller.signal;
+}
+
+function isAbortLikeError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const name = "name" in error ? String((error as { name?: unknown }).name || "") : "";
+  const message = "message" in error ? String((error as { message?: unknown }).message || "") : "";
+  return (
+    name === "AbortError" ||
+    name === "PublicRequestCancelledError" ||
+    /aborted|abort|CLIENT_CLOSED_REQUEST|Client connection closed|Client request was aborted/i.test(message)
+  );
 }
 
 function optionalString(value: unknown): string | undefined {

@@ -1,7 +1,6 @@
 import { createServer } from "node:http";
-import { createServer as createTcpServer, connect as connectTcp } from "node:net";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { execFileSync, spawn } from "node:child_process";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { chromium } from "playwright-extra";
@@ -21,11 +20,11 @@ try {
 }
 
 const PORT = Number(process.env.PORT || 18060);
-const BROWSER_BIN = process.env.XHS_BROWSER_BIN || process.env.CHROME_BIN || "/usr/bin/google-chrome-stable";
-const CDP_HOST = process.env.XHS_CDP_HOST || "127.0.0.1";
-const CDP_PORT = Number(process.env.XHS_CDP_PORT || 9224);
-const INTERNAL_CDP_PORT = Number(process.env.XHS_INTERNAL_CDP_PORT || CDP_PORT);
-const CDP_PROXY_ENABLED = process.env.XHS_CDP_PROXY_ENABLED === "1";
+const BROWSER_RUNTIME_URL =
+  process.env.XHS_BROWSER_RUNTIME_URL ||
+  process.env.BROWSER_RUNTIME_URL ||
+  `http://127.0.0.1:${process.env.BROWSER_RUNTIME_PORT || process.env.XHS_BROWSER_RUNTIME_PORT || 18100}`;
+const INTERNAL_CDP_PORT = Number(process.env.XHS_INTERNAL_CDP_PORT || process.env.BROWSER_CDP_PORT || process.env.XHS_CDP_PORT || 9224);
 const PROFILE_DIR = process.env.XHS_PROFILE_DIR || "/app/data/profile";
 const COOKIES_PATH = process.env.COOKIES_PATH || "/app/data/cookies.json";
 const COOKIE_FALLBACK_PATHS = uniquePaths([
@@ -33,12 +32,10 @@ const COOKIE_FALLBACK_PATHS = uniquePaths([
   "/app/mcp/xiaohongshu/data/cookies.json",
   "/app/data/cookies.json"
 ]);
-const CHROMIUM_HEADLESS = process.env.XHS_CHROMIUM_HEADLESS === "1";
-const CHROME_NO_SANDBOX = process.env.XHS_CHROME_NO_SANDBOX === "1";
 const CDP_CONNECT_TIMEOUT_MS = normalizePositiveEnv("XHS_CDP_CONNECT_TIMEOUT_MS", 30_000);
 const BROWSER_STATUS_TIMEOUT_MS = normalizePositiveEnv("XHS_BROWSER_STATUS_TIMEOUT_MS", 2_000);
 const BROWSER_RESTART_TIMEOUT_MS = normalizePositiveEnv("XHS_BROWSER_RESTART_TIMEOUT_MS", 120_000);
-const PROCESS_EXIT_GRACE_MS = normalizePositiveEnv("XHS_PROCESS_EXIT_GRACE_MS", 2_000);
+const BROWSER_RUNTIME_TIMEOUT_MS = normalizePositiveEnv("XHS_BROWSER_RUNTIME_TIMEOUT_MS", 30_000);
 const HEALTH_ENSURE_TIMEOUT_MS = normalizePositiveEnv("XHS_HEALTH_ENSURE_TIMEOUT_MS", 20_000);
 const CDP_CONNECT_ATTEMPTS = normalizePositiveEnv("XHS_CDP_CONNECT_ATTEMPTS", 3);
 const BROWSER_TASK_TIMEOUT_MS = normalizePositiveEnv("XHS_BROWSER_TASK_TIMEOUT_MS", 180_000);
@@ -83,8 +80,6 @@ const XHS_CREATOR_URL = "https://creator.xiaohongshu.com";
 
 let contextPromise;
 let servicePagePromise;
-let browserProcess;
-let cdpProxyStarted = false;
 let restartPromise;
 let browserTaskTail = Promise.resolve();
 let browserTaskSeq = 0;
@@ -98,6 +93,13 @@ class BrowserTaskTimeoutError extends Error {
   constructor(message) {
     super(message);
     this.name = "BrowserTaskTimeoutError";
+  }
+}
+
+class BrowserTaskCancelledError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "BrowserTaskCancelledError";
   }
 }
 
@@ -168,6 +170,7 @@ function safeLogUrl(value) {
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    const requestSignal = createRequestAbortSignal(req, res);
 
     if (req.method === "GET" && url.pathname === "/api/v1/browser/logs") {
       const since = Number(url.searchParams.get("since") || 0);
@@ -191,14 +194,14 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/api/v1/login/status") {
-      const data = await enqueueBrowserTask("login:status", () => loginStatus());
+      const data = await enqueueBrowserTask("login:status", (taskContext) => loginStatus(taskContext), { signal: requestSignal });
       sendJson(res, 200, { success: true, data });
       return;
     }
 
     if (req.method === "GET" && url.pathname === "/api/v1/login/qrcode") {
       serviceLog("info", "browser", "Open login/browser viewer requested.");
-      await enqueueBrowserTask("login:qrcode", () => openLoginPage());
+      await enqueueBrowserTask("login:qrcode", (taskContext) => openLoginPage(taskContext), { signal: requestSignal });
       sendJson(res, 200, { success: true, data: { opened: true, loginUrl: XHS_HOME_URL, viewer: "novnc" } });
       return;
     }
@@ -225,7 +228,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/api/v1/user/me") {
-      const data = await enqueueBrowserTask("user:me", () => currentUserSummary());
+      const data = await enqueueBrowserTask("user:me", (taskContext) => currentUserSummary(taskContext), { signal: requestSignal });
       sendJson(res, 200, { success: true, data });
       return;
     }
@@ -234,7 +237,7 @@ const server = createServer(async (req, res) => {
       const keyword = url.searchParams.get("keyword") || url.searchParams.get("query") || "";
       const limit = normalizeLimit(url.searchParams.get("limit"), 20);
       const page = normalizePositiveInt(url.searchParams.get("page"), 1);
-      const feeds = await enqueueBrowserTask("feeds:search", () => searchFeeds(keyword, limit, { page }));
+      const feeds = await enqueueBrowserTask("feeds:search", (taskContext) => searchFeeds(keyword, limit, { page, taskContext }), { signal: requestSignal });
       sendJson(res, 200, { success: true, data: pagedPayload("feeds", feeds, { page, limit }) });
       return;
     }
@@ -244,14 +247,14 @@ const server = createServer(async (req, res) => {
       const keyword = String(body.keyword || body.query || "");
       const limit = normalizeLimit(body.limit, 20);
       const page = normalizePositiveInt(body.page, 1);
-      const feeds = await enqueueBrowserTask("feeds:search", () => searchFeeds(keyword, limit, { page }));
+      const feeds = await enqueueBrowserTask("feeds:search", (taskContext) => searchFeeds(keyword, limit, { page, taskContext }), { signal: requestSignal });
       sendJson(res, 200, { success: true, data: pagedPayload("feeds", feeds, { page, limit }) });
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/v1/feeds/detail") {
       const body = await readJson(req);
-      const post = await enqueueBrowserTask("feeds:detail", () => getFeedDetail(body));
+      const post = await enqueueBrowserTask("feeds:detail", (taskContext) => getFeedDetail(body, taskContext), { signal: requestSignal });
       sendJson(res, 200, { success: true, data: { note: toNotePayload(post), feeds: [post] } });
       return;
     }
@@ -260,7 +263,9 @@ const server = createServer(async (req, res) => {
       const body = await readJson(req);
       const limit = normalizeLimit(body.limit || body.max_comments || body.max_comment_items, 50);
       const index = normalizeCursorIndex(body.index, body.cursor, 0);
-      const comments = await enqueueBrowserTask("feeds:comments", () => getFeedComments(body, limit, { index }));
+      const comments = await enqueueBrowserTask("feeds:comments", (taskContext) => getFeedComments(body, limit, { index, taskContext }), {
+        signal: requestSignal
+      });
       sendJson(res, 200, {
         success: true,
         data: {
@@ -279,14 +284,14 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/v1/feeds/comment") {
       const body = await readJson(req);
-      await enqueueBrowserTask("feeds:comment", () => postComment(body));
+      await enqueueBrowserTask("feeds:comment", (taskContext) => postComment(body, taskContext), { signal: requestSignal });
       sendJson(res, 200, { success: true, data: { posted: true } });
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/v1/feeds/like") {
       const body = await readJson(req);
-      await enqueueBrowserTask("feeds:like", () => likeFeed(body));
+      await enqueueBrowserTask("feeds:like", (taskContext) => likeFeed(body, taskContext), { signal: requestSignal });
       sendJson(res, 200, { success: true, data: { liked: body.unlike === true ? false : true } });
       return;
     }
@@ -299,6 +304,11 @@ const server = createServer(async (req, res) => {
     sendJson(res, 404, { success: false, error: { code: "NOT_FOUND", message: "Endpoint not found." } });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (error instanceof BrowserTaskCancelledError) {
+      serviceLog("warn", "request", `${req.method || "GET"} ${req.url || "/"} cancelled: ${message}`);
+      sendJson(res, 499, { success: false, error: { code: "CLIENT_CLOSED_REQUEST", message } });
+      return;
+    }
     serviceLog("error", "request", `${req.method || "GET"} ${req.url || "/"} failed: ${message}`);
     sendJson(res, 500, { success: false, error: { code: "INTERNAL_ERROR", message } });
   }
@@ -315,24 +325,28 @@ async function shutdown() {
   try {
     const context = contextPromise ? await contextPromise : undefined;
     if (context) await persistContextCookies(context, "shutdown").catch(() => undefined);
-    await context?.browser()?.close();
+    await context?.browser()?.close().catch(() => undefined);
   } finally {
     stopCookieAutoPersist();
-    browserProcess?.kill();
     process.exit(0);
   }
 }
 
 async function browserSummary() {
-  if (!contextPromise) return { running: false, queue: browserQueueSummary(), stealth: stealthSummary() };
+  const runtime = await runtimeBrowserSummary().catch((error) => ({
+    ok: false,
+    error: error instanceof Error ? error.message : String(error)
+  }));
+  if (!contextPromise) return { running: false, queue: browserQueueSummary(), stealth: stealthSummary(), runtime };
   try {
     const context = await withTimeout(contextPromise, BROWSER_STATUS_TIMEOUT_MS, "Browser status timed out.");
-    return { running: true, pages: context.pages().length, queue: browserQueueSummary(), stealth: stealthSummary() };
+    return { running: true, pages: context.pages().length, queue: browserQueueSummary(), stealth: stealthSummary(), runtime };
   } catch (error) {
     return {
       running: false,
       queue: browserQueueSummary(),
       stealth: stealthSummary(),
+      runtime,
       error: error instanceof Error ? error.message : String(error)
     };
   }
@@ -377,22 +391,47 @@ function enqueueBrowserTask(label, task, options = {}) {
   const id = ++browserTaskSeq;
   const timeoutMs = normalizePositiveInt(options.timeoutMs, BROWSER_TASK_TIMEOUT_MS);
   const queuedAt = Date.now();
+  const taskContext = createBrowserTaskContext(id, label, options.signal);
   browserTaskPending += 1;
 
   const run = async () => {
-    if (browserPriorityPromise) await browserPriorityPromise.catch(() => undefined);
-    browserTaskPending = Math.max(0, browserTaskPending - 1);
-    browserTaskActive = { id, label, startedAt: new Date().toISOString() };
-    const waitedMs = Date.now() - queuedAt;
-    serviceLog("info", "queue", `Browser task #${id} started: ${label}.`, { waitedMs, pending: browserTaskPending });
+    let removedFromPending = false;
+    const removeFromPending = () => {
+      if (removedFromPending) return;
+      browserTaskPending = Math.max(0, browserTaskPending - 1);
+      removedFromPending = true;
+    };
+    let markCancelled;
     try {
-      const jitterMs = await humanDelay(`task:${label}`, BROWSER_TASK_DELAY_MIN_MS, BROWSER_TASK_DELAY_MAX_MS, { log: true });
+      if (browserPriorityPromise) await waitForAbortable(browserPriorityPromise.catch(() => undefined), taskContext);
+      removeFromPending();
+      taskContext.throwIfCancelled();
+      browserTaskActive = { id, label, startedAt: new Date().toISOString(), cancelled: false };
+      markCancelled = () => {
+        if (browserTaskActive?.id !== id) return;
+        browserTaskActive.cancelled = true;
+        browserTaskActive.cancelReason = abortReasonMessage(taskContext.signal);
+        serviceLog("warn", "queue", `Browser task #${id} cancelled: ${label}.`, {
+          reason: browserTaskActive.cancelReason
+        });
+      };
+      taskContext.signal.addEventListener("abort", markCancelled, { once: true });
+      const waitedMs = Date.now() - queuedAt;
+      serviceLog("info", "queue", `Browser task #${id} started: ${label}.`, { waitedMs, pending: browserTaskPending });
+      const jitterMs = await humanDelay(`task:${label}`, BROWSER_TASK_DELAY_MIN_MS, BROWSER_TASK_DELAY_MAX_MS, {
+        log: true,
+        signal: taskContext.signal
+      });
       if (jitterMs > 0 && browserTaskActive?.id === id) browserTaskActive.delayMs = jitterMs;
-      return await runBrowserTaskWithTimeout(label, task, timeoutMs);
+      return await runBrowserTaskWithTimeout(label, task, timeoutMs, taskContext);
     } finally {
-      const activeMs = Date.now() - (queuedAt + waitedMs);
-      serviceLog("info", "queue", `Browser task #${id} finished: ${label}.`, { activeMs, pending: browserTaskPending });
-      browserTaskActive = null;
+      removeFromPending();
+      const activeMs = browserTaskActive?.id === id ? Date.now() - Date.parse(browserTaskActive.startedAt) : 0;
+      if (browserTaskActive?.id === id) {
+        serviceLog("info", "queue", `Browser task #${id} finished: ${label}.`, { activeMs, pending: browserTaskPending });
+        if (markCancelled) taskContext.signal.removeEventListener("abort", markCancelled);
+        browserTaskActive = null;
+      }
     }
   };
 
@@ -410,21 +449,27 @@ function priorityRestartBrowser(reason) {
   return browserPriorityPromise;
 }
 
-async function runBrowserTaskWithTimeout(label, task, timeoutMs) {
+async function runBrowserTaskWithTimeout(label, task, timeoutMs, taskContext) {
   let timer;
-  const taskPromise = Promise.resolve().then(task);
-  const timeoutPromise = new Promise((_, reject) => {
-    timer = setTimeout(
-      () => reject(new BrowserTaskTimeoutError(`Browser task ${label} timed out after ${timeoutMs}ms.`)),
-      timeoutMs
-    );
+  const taskPromise = Promise.resolve().then(() => task(taskContext));
+  const abortPromise = new Promise((_, reject) => {
+    if (taskContext.signal.aborted) {
+      reject(taskAbortReason(taskContext.signal));
+      return;
+    }
+    taskContext.signal.addEventListener("abort", () => reject(taskAbortReason(taskContext.signal)), { once: true });
   });
   try {
-    return await Promise.race([taskPromise, timeoutPromise]);
+    timer = setTimeout(() => {
+      taskContext.abort(new BrowserTaskTimeoutError(`Browser task ${label} timed out after ${timeoutMs}ms.`));
+    }, timeoutMs);
+    return await Promise.race([taskPromise, abortPromise]);
   } catch (error) {
     if (error instanceof BrowserTaskTimeoutError) {
       taskPromise.catch(() => undefined);
       await resetBrowserAfterTaskTimeout(label);
+    } else if (error instanceof BrowserTaskCancelledError) {
+      taskPromise.catch(() => undefined);
     }
     throw error;
   } finally {
@@ -435,22 +480,65 @@ async function runBrowserTaskWithTimeout(label, task, timeoutMs) {
 async function resetBrowserAfterTaskTimeout(label) {
   serviceLog("warn", "queue", `Browser task timed out; resetting Chromium before next task: ${label}`);
   const oldContextPromise = contextPromise;
-  const oldProcess = browserProcess;
   contextPromise = undefined;
   servicePagePromise = undefined;
-
-  if (oldProcess) {
-    terminateProcess(oldProcess, `task timeout: ${label}`);
-    await waitForProcessExit(oldProcess, PROCESS_EXIT_GRACE_MS + 500).catch(() => undefined);
-  }
-  if (browserProcess === oldProcess) browserProcess = undefined;
+  stopCookieAutoPersist();
 
   if (oldContextPromise) {
     const context = await withTimeout(oldContextPromise, 1_500, "Timed-out browser context close timed out.").catch(() => undefined);
     await withTimeout(context?.browser()?.close(), 1_500, "Timed-out browser close timed out.").catch(() => undefined);
   }
 
-  await waitForCdpClosed(3_000).catch(() => undefined);
+  await requestRuntimeRestart(`task timeout: ${label}`);
+}
+
+function createBrowserTaskContext(id, label, externalSignal) {
+  const controller = new AbortController();
+  const context = {
+    id,
+    label,
+    signal: controller.signal,
+    abort(reason) {
+      if (!controller.signal.aborted) controller.abort(reason);
+    },
+    throwIfCancelled() {
+      if (controller.signal.aborted) throw taskAbortReason(controller.signal);
+    }
+  };
+
+  if (externalSignal) {
+    const abortFromExternal = () => {
+      context.abort(taskAbortReason(externalSignal, `Browser task ${label} cancelled because client disconnected.`));
+    };
+    if (externalSignal.aborted) abortFromExternal();
+    else externalSignal.addEventListener("abort", abortFromExternal, { once: true });
+  }
+
+  return context;
+}
+
+function taskAbortReason(signal, fallbackMessage = "Browser task was cancelled.") {
+  const reason = signal?.reason;
+  if (reason instanceof Error) return reason;
+  if (typeof reason === "string" && reason) return new BrowserTaskCancelledError(reason);
+  return new BrowserTaskCancelledError(fallbackMessage);
+}
+
+function abortReasonMessage(signal) {
+  return taskAbortReason(signal).message;
+}
+
+async function waitForAbortable(promise, taskContext) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      if (taskContext.signal.aborted) {
+        reject(taskAbortReason(taskContext.signal));
+        return;
+      }
+      taskContext.signal.addEventListener("abort", () => reject(taskAbortReason(taskContext.signal)), { once: true });
+    })
+  ]);
 }
 
 function browserQueueSummary() {
@@ -463,51 +551,8 @@ function browserQueueSummary() {
 async function launchContext() {
   await mkdir(PROFILE_DIR, { recursive: true });
   await mkdir(path.dirname(COOKIES_PATH), { recursive: true });
-  await clearStaleProfileLocks();
-  const spawned = spawn(
-    BROWSER_BIN,
-    [
-      ...(CHROMIUM_HEADLESS ? ["--headless=new"] : []),
-      ...(CHROME_NO_SANDBOX ? ["--no-sandbox"] : []),
-      "--disable-dev-shm-usage",
-      "--disable-notifications",
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-sync",
-      "--disable-blink-features=AutomationControlled",
-      "--password-store=basic",
-      "--window-size=1440,980",
-      `--user-agent=${WINDOWS_USER_AGENT}`,
-      "--accept-lang=zh-CN,zh,en-US,en",
-      `--remote-debugging-address=${CDP_HOST}`,
-      `--remote-debugging-port=${INTERNAL_CDP_PORT}`,
-      "--lang=zh-CN",
-      `--user-data-dir=${PROFILE_DIR}`,
-      "about:blank"
-    ],
-    { stdio: ["ignore", "pipe", "pipe"] }
-  );
-  browserProcess = spawned;
-  serviceLog("info", "chrome", "Starting Chrome process.", {
-    bin: BROWSER_BIN,
-    cdp: `${CDP_HOST}:${INTERNAL_CDP_PORT}`,
-    display: process.env.DISPLAY || "",
-    profileDir: PROFILE_DIR
-  });
-  spawned.stdout?.on("data", (chunk) => captureProcessLog("chrome", "info", chunk));
-  spawned.stderr?.on("data", (chunk) => captureProcessLog("chrome", "warn", chunk));
-  spawned.on("exit", (code) => {
-    serviceLog("error", "chrome", `Chromium exited with code ${code ?? "unknown"}.`);
-    if (browserProcess === spawned) {
-      browserProcess = undefined;
-      contextPromise = undefined;
-      servicePagePromise = undefined;
-      stopCookieAutoPersist();
-    }
-  });
-
   try {
-    startCdpProxy();
+    await ensureRuntimeBrowser();
     await waitForCdpHttp();
     const browser = await connectBrowserOverCdp();
     const context = browser.contexts()[0] || (await browser.newContext({ viewport: { width: 1440, height: 980 }, locale: "zh-CN" }));
@@ -524,21 +569,9 @@ async function launchContext() {
     await verifyContextReady(context);
     return context;
   } catch (error) {
-    if (browserProcess === spawned) {
-      terminateProcess(spawned, "launch failed");
-      browserProcess = undefined;
-    }
     stopCookieAutoPersist();
     throw error;
   }
-}
-
-async function clearStaleProfileLocks() {
-  await Promise.all(
-    ["SingletonLock", "SingletonCookie", "SingletonSocket"].map((name) =>
-      rm(path.join(PROFILE_DIR, name), { force: true, recursive: true }).catch(() => undefined)
-    )
-  );
 }
 
 async function configureContextFingerprint(context) {
@@ -615,7 +648,8 @@ async function applyPageFingerprint(page) {
   }
 }
 
-async function servicePage() {
+async function servicePage(taskContext) {
+  taskContext?.throwIfCancelled?.();
   const context = await ensureContext();
   if (!servicePagePromise) {
     servicePagePromise = (async () => {
@@ -631,26 +665,39 @@ async function servicePage() {
   const page = await servicePagePromise;
   if (page.isClosed()) {
     servicePagePromise = undefined;
-    return servicePage();
+    return servicePage(taskContext);
   }
+  bindTaskPage(taskContext, page);
   return page;
+}
+
+function bindTaskPage(taskContext, page) {
+  if (!taskContext?.signal) return;
+  if (taskContext.signal.aborted) {
+    closeCancelledTaskPage(taskContext, page);
+    throw taskAbortReason(taskContext.signal);
+  }
+  const closePage = () => closeCancelledTaskPage(taskContext, page);
+  taskContext.signal.addEventListener("abort", closePage, { once: true });
+}
+
+function closeCancelledTaskPage(taskContext, page) {
+  if (!page || page.isClosed()) return;
+  serviceLog("warn", "queue", `Closing active page for cancelled task #${taskContext.id}: ${taskContext.label}.`, {
+    reason: abortReasonMessage(taskContext.signal)
+  });
+  if (servicePagePromise) servicePagePromise = undefined;
+  page.close({ runBeforeUnload: false }).catch(() => undefined);
 }
 
 async function restartBrowser(reason = "manual") {
   if (restartPromise) return restartPromise;
   restartPromise = withTimeout((async () => {
-    serviceLog("warn", "browser", `Restarting Chromium: ${reason}`);
+    serviceLog("warn", "browser", `Restarting runtime browser: ${reason}`);
     const oldContextPromise = contextPromise;
-    const oldProcess = browserProcess;
     contextPromise = undefined;
     servicePagePromise = undefined;
     stopCookieAutoPersist();
-
-    if (oldProcess) {
-      terminateProcess(oldProcess, reason);
-      await waitForProcessExit(oldProcess, PROCESS_EXIT_GRACE_MS + 500).catch(() => undefined);
-    }
-    if (browserProcess === oldProcess) browserProcess = undefined;
 
     if (oldContextPromise) {
       const context = await withTimeout(oldContextPromise, 1_500, "Old browser context close timed out.").catch(() => undefined);
@@ -658,8 +705,7 @@ async function restartBrowser(reason = "manual") {
       await withTimeout(context?.browser()?.close(), 1_500, "Old browser close timed out.").catch(() => undefined);
     }
 
-    await waitForCdpClosed(3_000).catch(() => undefined);
-    await delay(1_000);
+    await requestRuntimeRestart(reason);
     await ensureContext();
     await servicePage();
     return {
@@ -673,14 +719,18 @@ async function restartBrowser(reason = "manual") {
   return restartPromise;
 }
 
-async function withBrowserRecovery(label, task) {
+async function withBrowserRecovery(label, task, taskContext) {
   try {
+    taskContext?.throwIfCancelled?.();
     return await task();
   } catch (error) {
+    if (error instanceof BrowserTaskCancelledError || error instanceof BrowserTaskTimeoutError) throw error;
     if (!isRecoverableBrowserError(error)) throw error;
+    taskContext?.throwIfCancelled?.();
     const message = error instanceof Error ? error.message : String(error);
     serviceLog("warn", "browser", `Recoverable browser error in ${label}; restarting.`, { error: message.slice(0, 240) });
     await restartBrowser(`${label}: ${message.slice(0, 240)}`);
+    taskContext?.throwIfCancelled?.();
     return task();
   }
 }
@@ -692,30 +742,33 @@ function isRecoverableBrowserError(error) {
   );
 }
 
-async function openLoginPage() {
+async function openLoginPage(taskContext) {
   return withBrowserRecovery("openLoginPage", async () => {
-    const page = await servicePage();
+    const page = await servicePage(taskContext);
+    taskContext?.throwIfCancelled?.();
     await page.goto(XHS_HOME_URL, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
+    taskContext?.throwIfCancelled?.();
     await page.bringToFront().catch(() => undefined);
-  });
+  }, taskContext);
 }
 
-async function loginStatus() {
+async function loginStatus(taskContext) {
   return withBrowserRecovery("loginStatus", async () => {
+    taskContext?.throwIfCancelled?.();
     const context = await ensureContext();
     const cookies = await context.cookies();
     const xhsCookies = cookies.filter((cookie) => /xiaohongshu|xhs|rednote/i.test(cookie.domain));
     if (xhsCookies.length) await persistCookies(xhsCookies, "loginStatus");
     return {
       is_logged_in: xhsCookies.some((cookie) => ["web_session", "id_token"].includes(cookie.name) && cookie.value),
-      username: await readVisibleUsername().catch(() => ""),
+      username: await readVisibleUsername(taskContext).catch(() => ""),
       cookie_count: xhsCookies.length
     };
-  });
+  }, taskContext);
 }
 
-async function currentUserSummary() {
-  const status = await loginStatus();
+async function currentUserSummary(taskContext) {
+  const status = await loginStatus(taskContext);
   return {
     userBasicInfo: { nickname: status.username || "" },
     feeds: []
@@ -723,23 +776,26 @@ async function currentUserSummary() {
 }
 
 async function searchFeeds(keyword, limit, options = {}) {
+  const taskContext = options.taskContext;
   return withBrowserRecovery("searchFeeds", async () => {
     if (!keyword.trim()) return [];
     const pageNumber = normalizePositiveInt(options.page, 1);
     serviceLog("info", "feeds", "Search feeds requested.", { keyword, limit, page: pageNumber });
-    const page = await servicePage();
+    const page = await servicePage(taskContext);
     const capture = startPostResponseCapture(page);
     const url = new URL("https://www.xiaohongshu.com/search_result");
     url.searchParams.set("keyword", keyword);
     url.searchParams.set("source", "web_search_result_notes");
     let capturedPosts = [];
     try {
+      taskContext?.throwIfCancelled?.();
       await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: 60_000 });
-      await humanDelay("search:settle", 2_400, 5_200);
-      await autoScroll(page, Math.max(2, pageNumber + 1));
+      await humanDelay("search:settle", 2_400, 5_200, { signal: taskContext?.signal });
+      await autoScroll(page, Math.max(2, pageNumber + 1), taskContext);
     } finally {
       capturedPosts = await capture.stop();
     }
+    taskContext?.throwIfCancelled?.();
     const posts = [...capturedPosts, ...(await scrapePosts(page))];
     const start = (pageNumber - 1) * limit;
     const unique = uniquePosts(posts);
@@ -754,10 +810,10 @@ async function searchFeeds(keyword, limit, options = {}) {
       currentUrl: safeLogUrl(page.url())
     });
     return result;
-  });
+  }, taskContext);
 }
 
-async function getFeedDetail(body) {
+async function getFeedDetail(body, taskContext) {
   return withBrowserRecovery("getFeedDetail", async () => {
     const { id, xsecToken, url } = normalizeDetailInput(body);
     if (!url && !id) throw new Error("feed_id or url is required.");
@@ -769,9 +825,11 @@ async function getFeedDetail(body) {
       hasXsecToken: Boolean(xsecToken),
       url: safeLogUrl(url)
     });
-    const page = await servicePage();
+    const page = await servicePage(taskContext);
+    taskContext?.throwIfCancelled?.();
     const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await humanDelay("detail:settle", 2_100, 5_000);
+    await humanDelay("detail:settle", 2_100, 5_000, { signal: taskContext?.signal });
+    taskContext?.throwIfCancelled?.();
     const detail = await page.evaluate(() => {
       const pick = (selectors) => {
         for (const selector of selectors) {
@@ -817,42 +875,43 @@ async function getFeedDetail(body) {
     };
     rememberPosts([result]);
     return result;
-  });
+  }, taskContext);
 }
 
-async function postComment(body) {
+async function postComment(body, taskContext) {
   const content = String(body.content || body.comment || "").trim();
   if (!content) throw new Error("content is required.");
-  const post = await getFeedDetail(body);
-  const page = await servicePage();
-  await focusCommentEditor(page);
-  await humanDelay("comment:before-type", 450, 1_400);
-  await humanType(page, content);
-  await humanDelay("comment:before-submit", 700, 1_900);
+  const post = await getFeedDetail(body, taskContext);
+  const page = await servicePage(taskContext);
+  await focusCommentEditor(page, taskContext);
+  await humanDelay("comment:before-type", 450, 1_400, { signal: taskContext?.signal });
+  await humanType(page, content, taskContext);
+  await humanDelay("comment:before-submit", 700, 1_900, { signal: taskContext?.signal });
   const clicked = await clickFirstVisible(page, [
     "button:has-text('发送')",
     "button:has-text('发布')",
     "button:has-text('评论')",
     ".submit",
     "[class*=submit]"
-  ]);
+  ], taskContext);
   if (!clicked) throw new Error(`Cannot find comment submit button for ${post.id}.`);
 }
 
-async function likeFeed(body) {
-  const post = await getFeedDetail(body);
-  const page = await servicePage();
-  await humanDelay("like:before-click", 550, 1_600);
+async function likeFeed(body, taskContext) {
+  const post = await getFeedDetail(body, taskContext);
+  const page = await servicePage(taskContext);
+  await humanDelay("like:before-click", 550, 1_600, { signal: taskContext?.signal });
   const clicked = await clickFirstVisible(page, [
     "[aria-label*='点赞']",
     "button:has-text('点赞')",
     "[class*=like]",
     "[class*=interact] button"
-  ]);
+  ], taskContext);
   if (!clicked) throw new Error(`Cannot find like button for ${post.id}.`);
 }
 
 async function handleMcp(req, res) {
+  const requestSignal = createRequestAbortSignal(req, res);
   const payload = await readJson(req);
   if (!payload.id && payload.method?.startsWith("notifications/")) {
     sendJson(res, 202, {});
@@ -876,7 +935,9 @@ async function handleMcp(req, res) {
 
     if (payload.method === "tools/call") {
       const toolName = String(payload.params?.name || "unknown");
-      const result = await enqueueBrowserTask(`mcp:${toolName}`, () => callTool(payload.params || {}));
+      const result = await enqueueBrowserTask(`mcp:${toolName}`, (taskContext) => callTool(payload.params || {}, taskContext), {
+        signal: requestSignal
+      });
       sendMcpResult(res, payload.id, result);
       return;
     }
@@ -887,22 +948,22 @@ async function handleMcp(req, res) {
   }
 }
 
-async function callTool(params) {
+async function callTool(params, taskContext) {
   const name = String(params.name || "");
   const args = params.arguments || {};
   if (name === "search_feeds") {
     const limit = normalizeLimit(args.limit, 20);
     const page = normalizePositiveInt(args.page, 1);
-    const feeds = await searchFeeds(String(args.keyword || args.query || ""), limit, { page });
+    const feeds = await searchFeeds(String(args.keyword || args.query || ""), limit, { page, taskContext });
     return toolJson(pagedPayload("feeds", feeds, { page, limit }));
   }
   if (name === "get_feed_detail") {
-    return toolJson(await getFeedDetail(args));
+    return toolJson(await getFeedDetail(args, taskContext));
   }
   if (name === "get_feed_comments") {
     const limit = normalizeLimit(args.limit || args.max_comments || args.max_comment_items, 50);
     const index = normalizeCursorIndex(args.index, args.cursor, 0);
-    const comments = await getFeedComments(args, limit, { index });
+    const comments = await getFeedComments(args, limit, { index, taskContext });
     return toolJson({
       comments,
       items: comments,
@@ -911,11 +972,11 @@ async function callTool(params) {
     });
   }
   if (name === "post_comment_to_feed") {
-    await postComment(args);
+    await postComment(args, taskContext);
     return toolJson({ posted: true });
   }
   if (name === "like_feed") {
-    await likeFeed(args);
+    await likeFeed(args, taskContext);
     return toolJson({ liked: args.unlike === true ? false : true });
   }
   throw new Error(`Unknown tool: ${name}`);
@@ -937,7 +998,7 @@ function toolJson(value) {
   };
 }
 
-async function focusCommentEditor(page) {
+async function focusCommentEditor(page, taskContext) {
   const selectors = [
     "textarea",
     "[contenteditable='true']",
@@ -946,9 +1007,12 @@ async function focusCommentEditor(page) {
     "[placeholder*='评论']"
   ];
   for (const selector of selectors) {
+    taskContext?.throwIfCancelled?.();
     const locator = page.locator(selector).last();
     if ((await locator.count()) > 0 && (await locator.isVisible().catch(() => false))) {
-      await humanDelay("focus:comment-editor", BROWSER_ACTION_DELAY_MIN_MS, BROWSER_ACTION_DELAY_MAX_MS);
+      await humanDelay("focus:comment-editor", BROWSER_ACTION_DELAY_MIN_MS, BROWSER_ACTION_DELAY_MAX_MS, {
+        signal: taskContext?.signal
+      });
       await locator.click();
       return;
     }
@@ -956,11 +1020,14 @@ async function focusCommentEditor(page) {
   throw new Error("Cannot find comment editor.");
 }
 
-async function clickFirstVisible(page, selectors) {
+async function clickFirstVisible(page, selectors, taskContext) {
   for (const selector of selectors) {
+    taskContext?.throwIfCancelled?.();
     const locator = page.locator(selector).last();
     if ((await locator.count()) > 0 && (await locator.isVisible().catch(() => false))) {
-      await humanDelay("click:visible", BROWSER_ACTION_DELAY_MIN_MS, BROWSER_ACTION_DELAY_MAX_MS);
+      await humanDelay("click:visible", BROWSER_ACTION_DELAY_MIN_MS, BROWSER_ACTION_DELAY_MAX_MS, {
+        signal: taskContext?.signal
+      });
       await locator.click({ timeout: 5_000 }).catch(() => undefined);
       return true;
     }
@@ -996,6 +1063,7 @@ async function scrapePosts(page) {
 }
 
 async function getFeedComments(body, limit, options = {}) {
+  const taskContext = options.taskContext;
   return withBrowserRecovery("getFeedComments", async () => {
     const detailInput = normalizeDetailInput(body);
     const index = normalizeCursorIndex(options.index, options.cursor, 0);
@@ -1005,10 +1073,11 @@ async function getFeedComments(body, limit, options = {}) {
       limit,
       index
     });
-    await getFeedDetail(body);
-    const page = await servicePage();
-    await humanDelay("comments:before-scroll", 700, 1_800);
-    await autoScroll(page, Math.max(3, index + 3));
+    await getFeedDetail(body, taskContext);
+    const page = await servicePage(taskContext);
+    await humanDelay("comments:before-scroll", 700, 1_800, { signal: taskContext?.signal });
+    await autoScroll(page, Math.max(3, index + 3), taskContext);
+    taskContext?.throwIfCancelled?.();
     const scraped = await scrapeComments(page);
     const comments = uniqueComments(scraped, limit, index * limit);
     serviceLog("info", "comments", "Note comments completed.", {
@@ -1019,7 +1088,7 @@ async function getFeedComments(body, limit, options = {}) {
       currentUrl: safeLogUrl(page.url())
     });
     return comments;
-  });
+  }, taskContext);
 }
 
 function startPostResponseCapture(page) {
@@ -1259,15 +1328,17 @@ function uniqueComments(comments, limit, offset = 0) {
   return result;
 }
 
-async function autoScroll(page, steps) {
+async function autoScroll(page, steps, taskContext) {
   for (let i = 0; i < steps; i += 1) {
-    await humanDelay("scroll:pre", 180, 620);
+    taskContext?.throwIfCancelled?.();
+    await humanDelay("scroll:pre", 180, 620, { signal: taskContext?.signal });
     await page.mouse.wheel(randomBetween(-18, 18), randomBetween(520, 1_180)).catch(() => undefined);
-    await humanDelay("scroll:settle", 650, 1_650);
+    await humanDelay("scroll:settle", 650, 1_650, { signal: taskContext?.signal });
   }
 }
 
-async function humanType(page, content) {
+async function humanType(page, content, taskContext) {
+  taskContext?.throwIfCancelled?.();
   const delayMs = randomBetween(BROWSER_TYPE_DELAY_MIN_MS, BROWSER_TYPE_DELAY_MAX_MS);
   try {
     await page.keyboard.type(content, { delay: delayMs });
@@ -1312,8 +1383,9 @@ function uniquePosts(posts) {
   return result;
 }
 
-async function readVisibleUsername() {
-  const page = await servicePage();
+async function readVisibleUsername(taskContext) {
+  const page = await servicePage(taskContext);
+  taskContext?.throwIfCancelled?.();
   return page.evaluate(() => {
     const candidates = [...document.querySelectorAll("[class*=nickname], [class*=user], [class*=name]")];
     return candidates.map((node) => node.textContent?.trim()).find((text) => text && text.length <= 40) || "";
@@ -1533,8 +1605,57 @@ function pagedPayload(key, items, { page, limit }) {
   };
 }
 
-function cdpUrl() {
-  return `http://127.0.0.1:${CDP_PORT}`;
+async function ensureRuntimeBrowser() {
+  const payload = await fetchRuntimeJson("/health?ensure=1", {}, BROWSER_RUNTIME_TIMEOUT_MS);
+  const runtime = payload?.runtime || payload?.data?.runtime || payload;
+  serviceLog("info", "runtime", "Browser runtime ensured.", {
+    url: BROWSER_RUNTIME_URL,
+    chrome: runtime?.chrome?.running === true,
+    cdp: runtime?.cdp?.ready === true,
+    noVnc: runtime?.noVnc?.ready === true
+  });
+  return runtime;
+}
+
+async function runtimeBrowserSummary() {
+  const payload = await fetchRuntimeJson("/health", {}, BROWSER_STATUS_TIMEOUT_MS);
+  return payload?.runtime || payload;
+}
+
+async function requestRuntimeRestart(reason) {
+  const payload = await fetchRuntimeJson(
+    "/browser/restart",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason })
+    },
+    Math.max(BROWSER_RESTART_TIMEOUT_MS, 30_000)
+  );
+  serviceLog("warn", "runtime", "Browser runtime restarted.", { reason });
+  return payload?.data || payload;
+}
+
+async function fetchRuntimeJson(endpoint, init = {}, timeoutMs = BROWSER_RUNTIME_TIMEOUT_MS) {
+  const url = `${BROWSER_RUNTIME_URL.replace(/\/$/, "")}${endpoint}`;
+  const response = await fetchWithAbort(url, init, timeoutMs);
+  const text = await response.text();
+  const payload = text ? JSON.parse(text) : {};
+  if (!response.ok || (payload && typeof payload === "object" && payload.success === false)) {
+    const error = payload?.error?.message || payload?.message || `Browser runtime ${endpoint} failed: HTTP ${response.status}`;
+    throw new Error(error);
+  }
+  return payload;
+}
+
+async function fetchWithAbort(url, init, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function connectBrowserOverCdp() {
@@ -1574,17 +1695,20 @@ async function waitForCdpHttp(timeoutMs = 15_000) {
   throw new Error(`Chromium CDP port ${INTERNAL_CDP_PORT} did not become ready.`);
 }
 
-async function waitForCdpClosed(timeoutMs = 3_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const response = await fetch(`http://127.0.0.1:${INTERNAL_CDP_PORT}/json/version`).catch(() => null);
-    if (!response?.ok) return;
-    await delay(150);
-  }
-}
-
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function delay(ms, signal) {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  if (signal.aborted) return Promise.reject(taskAbortReason(signal));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(taskAbortReason(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 async function humanDelay(label, minMs = BROWSER_ACTION_DELAY_MIN_MS, maxMs = BROWSER_ACTION_DELAY_MAX_MS, options = {}) {
@@ -1592,7 +1716,7 @@ async function humanDelay(label, minMs = BROWSER_ACTION_DELAY_MIN_MS, maxMs = BR
   const durationMs = randomBetween(minMs, maxMs);
   if (durationMs <= 0) return 0;
   if (options.log) serviceLog("info", "human-delay", `Waiting before ${label}.`, { durationMs });
-  await delay(durationMs);
+  await delay(durationMs, options.signal);
   return durationMs;
 }
 
@@ -1610,29 +1734,6 @@ function withTimeout(promise, timeoutMs, message) {
     timer = setTimeout(() => reject(new Error(message)), timeoutMs);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
-
-function terminateProcess(processRef, reason) {
-  if (!processRef || processRef.killed) return;
-  serviceLog("warn", "chrome", `Terminating Chromium process: ${reason}`);
-  processRef.kill("SIGTERM");
-  setTimeout(() => {
-    if (processRef.exitCode === null && processRef.signalCode === null) {
-      serviceLog("error", "chrome", "Chromium did not exit after SIGTERM; sending SIGKILL.");
-      processRef.kill("SIGKILL");
-    }
-  }, PROCESS_EXIT_GRACE_MS).unref();
-}
-
-function waitForProcessExit(processRef, timeoutMs) {
-  if (!processRef || processRef.exitCode !== null || processRef.signalCode !== null) return Promise.resolve();
-  return new Promise((resolve) => {
-    const timeout = setTimeout(resolve, timeoutMs);
-    processRef.once("exit", () => {
-      clearTimeout(timeout);
-      resolve();
-    });
-  });
 }
 
 function normalizePositiveEnv(name, fallback) {
@@ -1669,27 +1770,6 @@ function uniquePaths(paths) {
   return [...new Set(paths.filter(Boolean))];
 }
 
-function startCdpProxy() {
-  if (!CDP_PROXY_ENABLED || CDP_PORT === INTERNAL_CDP_PORT) return;
-  if (cdpProxyStarted) return;
-  cdpProxyStarted = true;
-  const proxy = createTcpServer((client) => {
-    const upstream = connectTcp(INTERNAL_CDP_PORT, "127.0.0.1");
-    client.pipe(upstream);
-    upstream.pipe(client);
-    const close = () => {
-      client.destroy();
-      upstream.destroy();
-    };
-    client.on("error", close);
-    upstream.on("error", close);
-  });
-  proxy.on("error", (error) => serviceLog("error", "cdp", `CDP proxy error: ${error.message}`));
-  proxy.listen(CDP_PORT, "127.0.0.1", () => {
-    serviceLog("info", "cdp", `CDP proxy listening on 127.0.0.1:${CDP_PORT} -> 127.0.0.1:${INTERNAL_CDP_PORT}`);
-  });
-}
-
 async function readJson(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -1697,7 +1777,26 @@ async function readJson(req) {
   return raw ? JSON.parse(raw) : {};
 }
 
+function createRequestAbortSignal(req, res) {
+  const controller = new AbortController();
+  const abort = (reason) => {
+    if (controller.signal.aborted || res.writableEnded) return;
+    controller.abort(new BrowserTaskCancelledError(reason));
+  };
+  req.on("aborted", () => abort("Client aborted the HTTP request."));
+  req.on("close", () => {
+    if ((req.aborted === true || req.readableAborted === true) && !res.writableEnded) {
+      abort("Client closed the HTTP request before completion.");
+    }
+  });
+  res.on("close", () => {
+    if (!res.writableEnded) abort("Client connection closed before the browser task completed.");
+  });
+  return controller.signal;
+}
+
 function sendJson(res, status, payload, headers = {}) {
+  if (res.writableEnded || res.destroyed) return;
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", ...headers });
   res.end(JSON.stringify(payload));
 }

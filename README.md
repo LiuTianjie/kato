@@ -161,9 +161,22 @@ curl -X POST http://localhost:4173/api/v1/xhs/posts/search \
 
 接口覆盖登录状态、帖子搜索、详情、我的笔记同步、评论草稿、评论发布和点赞。发布/点赞必须传 `confirm:true` 和 `idempotencyKey`，重复 key 不会重复调用 XHS service。完整契约见 [docs/public-xhs-api.md](docs/public-xhs-api.md)。
 
-## AMD64 镜像
+## AMD64 镜像与 Browser Runtime
 
-Kato 镜像只发布 `linux/amd64`。容器内使用 `google-chrome-stable`、Xvfb 和 noVNC；CDP 仅绑定在容器内部 `127.0.0.1:9224`，Dashboard 通过 `/novnc/*` 反代浏览器画面。
+Kato 镜像只发布 `linux/amd64`。仓库内置一个可复用的 `browser-runtime` 镜像 target，负责 `google-chrome-stable`、Xvfb、x11vnc、noVNC、websockify、xdotool、内部 CDP、健康检查和重启恢复。最终 `kato` 镜像基于这个 runtime 构建，小红书只是第一个平台 adapter。后续接 B 站、抖音时按 [docs/platform-adapters.md](docs/platform-adapters.md) 的分层接入。
+
+Runtime 默认监听容器内部 `127.0.0.1:18100`；CDP 仅绑定容器内部 `127.0.0.1:9224`，不需要也不应该映射到公网。Dashboard 通过 `/novnc/*` 反代浏览器画面。
+
+单独构建基础 runtime：
+
+```bash
+docker buildx build \
+  --platform linux/amd64 \
+  --target browser-runtime \
+  -f Dockerfile \
+  -t ghcr.io/your-org/kato-browser-runtime:latest \
+  .
+```
 
 如需手动发布镜像：
 

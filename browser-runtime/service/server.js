@@ -1,0 +1,645 @@
+import { createServer } from "node:http";
+import { connect as connectTcp } from "node:net";
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import { execFileSync, spawn } from "node:child_process";
+import path from "node:path";
+
+const PORT = numberEnv(["BROWSER_RUNTIME_PORT", "XHS_BROWSER_RUNTIME_PORT"], 18100);
+const DISPLAY = stringEnv(["BROWSER_DISPLAY", "XHS_DISPLAY"], ":99");
+const DISPLAY_SIZE = stringEnv(["BROWSER_DISPLAY_SIZE", "XHS_DISPLAY_SIZE"], "1440x980x24");
+const VNC_ENABLED = stringEnv(["BROWSER_VNC_ENABLED", "XHS_VNC_ENABLED"], "1") !== "0";
+const VNC_PORT = numberEnv(["BROWSER_VNC_PORT", "XHS_VNC_PORT"], 5900);
+const NOVNC_PORT = numberEnv(["BROWSER_NOVNC_PORT", "XHS_NOVNC_PORT"], 6080);
+const CDP_HOST = stringEnv(["BROWSER_CDP_HOST", "XHS_CDP_HOST"], "127.0.0.1");
+const CDP_PORT = numberEnv(["BROWSER_CDP_PORT", "XHS_INTERNAL_CDP_PORT", "XHS_CDP_PORT"], 9224);
+const BROWSER_BIN = stringEnv(["BROWSER_BIN", "XHS_BROWSER_BIN", "CHROME_BIN"], "/usr/local/bin/kato-chromium");
+const CHROME_USER = stringEnv(["BROWSER_CHROME_USER", "XHS_CHROME_USER"], "kato");
+const DEFAULT_DATA_DIR = path.join(process.cwd(), "data", "browser-runtime");
+const PROFILE_DIR = stringEnv(["BROWSER_PROFILE_DIR", "XHS_PROFILE_DIR"], path.join(DEFAULT_DATA_DIR, "profile"));
+const COOKIES_PATH = stringEnv(["BROWSER_COOKIES_PATH", "COOKIES_PATH"], path.join(DEFAULT_DATA_DIR, "cookies.json"));
+const COOKIE_MIRROR_PATHS = uniquePaths([
+  COOKIES_PATH,
+  ...stringEnv(["BROWSER_COOKIE_MIRROR_PATHS"], "").split(",").map((item) => item.trim()).filter(Boolean)
+]);
+const HEADLESS = stringEnv(["BROWSER_HEADLESS", "XHS_CHROMIUM_HEADLESS"], "0") === "1";
+const CHROME_NO_SANDBOX = stringEnv(["BROWSER_CHROME_NO_SANDBOX", "XHS_CHROME_NO_SANDBOX"], "1") === "1";
+const ACCEPT_LANGUAGE = stringEnv(["BROWSER_ACCEPT_LANGUAGE", "XHS_BROWSER_ACCEPT_LANGUAGE"], "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7");
+const WINDOWS_PLATFORM_VERSION = stringEnv(["BROWSER_PLATFORM_VERSION", "XHS_BROWSER_PLATFORM_VERSION"], "10.0.0");
+const BROWSER_VERSION = detectChromeVersion();
+const BROWSER_MAJOR_VERSION = stringEnv(["BROWSER_MAJOR_VERSION", "XHS_BROWSER_MAJOR_VERSION"], BROWSER_VERSION.major);
+const USER_AGENT =
+  stringEnv(["BROWSER_USER_AGENT", "XHS_BROWSER_USER_AGENT"], "") ||
+  `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${BROWSER_VERSION.full} Safari/537.36`;
+const START_TIMEOUT_MS = numberEnv(["BROWSER_START_TIMEOUT_MS", "XHS_HEALTH_ENSURE_TIMEOUT_MS"], 20_000);
+const RESTART_TIMEOUT_MS = numberEnv(["BROWSER_RESTART_TIMEOUT_MS", "XHS_BROWSER_RESTART_TIMEOUT_MS"], 120_000);
+const PROCESS_EXIT_GRACE_MS = numberEnv(["BROWSER_PROCESS_EXIT_GRACE_MS", "XHS_PROCESS_EXIT_GRACE_MS"], 2_000);
+const LOG_LIMIT = numberEnv(["BROWSER_RUNTIME_LOG_LIMIT", "XHS_SERVICE_LOG_LIMIT"], 800);
+
+let logSeq = 0;
+const logs = [];
+let xvfbProcess;
+let vncSupervisor;
+let noVncSupervisor;
+let chromeProcess;
+let restartPromise;
+
+const server = createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+    if (req.method === "GET" && url.pathname === "/health") {
+      const ensure = url.searchParams.get("ensure") === "1";
+      const status = ensure ? await ensureRuntimeReady() : await runtimeStatus();
+      const ok = status.chrome.running && status.cdp.ready && (!VNC_ENABLED || (status.vnc.ready && status.noVnc.ready));
+      sendJson(res, ensure && !ok ? 503 : 200, { ok: ensure ? ok : true, service: "kato-browser-runtime", runtime: status });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/browser/open") {
+      const body = await readJson(req);
+      const status = await ensureRuntimeReady();
+      const targetUrl = normalizeViewerUrl(String(body.url || ""));
+      if (targetUrl) await navigateWithXdotool(targetUrl);
+      sendJson(res, 200, {
+        success: true,
+        data: {
+          opened: true,
+          url: targetUrl,
+          viewer: "novnc",
+          viewerUrl: "/novnc/vnc.html?autoconnect=1&resize=scale&path=novnc/websockify",
+          runtime: status
+        }
+      });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/browser/restart") {
+      const body = await readJson(req);
+      const reason = String(body.reason || "manual");
+      const data = await restartBrowser(reason);
+      sendJson(res, 200, { success: true, data });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/browser/action") {
+      const body = await readJson(req);
+      await ensureRuntimeReady();
+      await runBrowserAction(body);
+      sendJson(res, 200, { success: true, data: { ok: true } });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/browser/cookies/sync") {
+      await ensureRuntimeReady();
+      const body = await readJson(req);
+      const domains = Array.isArray(body.domains) ? body.domains.map((item) => String(item)).filter(Boolean) : [];
+      const cookies = await exportCookies(domains);
+      await persistCookies(cookies);
+      serviceLog("info", "cookies", `Persisted ${cookies.length} browser cookies.`, { cookiesPath: COOKIES_PATH, domains });
+      sendJson(res, 200, { success: true, data: { cookiesPath: COOKIES_PATH, exportedCookies: cookies.length } });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/browser/logs") {
+      const since = Number(url.searchParams.get("since") || 0);
+      const limit = Number(url.searchParams.get("limit") || 200);
+      sendJson(res, 200, { success: true, data: { logs: logsSince(since, limit), cursor: logSeq } });
+      return;
+    }
+
+    sendJson(res, 404, { success: false, error: { code: "NOT_FOUND", message: "Endpoint not found." } });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    serviceLog("error", "request", `${req.method || "GET"} ${req.url || "/"} failed: ${message}`);
+    sendJson(res, 500, { success: false, error: { code: "INTERNAL_ERROR", message } });
+  }
+});
+
+server.listen(PORT, "127.0.0.1", () => {
+  serviceLog("info", "runtime", `kato-browser-runtime listening on http://127.0.0.1:${PORT}`);
+});
+
+startDisplayRuntime().catch((error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  serviceLog("error", "runtime", `Display runtime failed to start: ${message}`);
+});
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+async function startDisplayRuntime() {
+  await ensureRuntimeDirs();
+  if (!xvfbProcess) {
+    xvfbProcess = spawn("Xvfb", [DISPLAY, "-screen", "0", DISPLAY_SIZE, "-ac", "+extension", "RANDR"], {
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    captureChildLogs(xvfbProcess, "xvfb");
+    xvfbProcess.on("exit", (code) => {
+      serviceLog("error", "xvfb", `Xvfb exited with code ${code ?? "unknown"}.`);
+      xvfbProcess = undefined;
+    });
+    await delay(500);
+  }
+
+  if (VNC_ENABLED) {
+    if (!vncSupervisor) vncSupervisor = startSupervisor("x11vnc", () => [
+      "-display",
+      DISPLAY,
+      "-forever",
+      "-shared",
+      "-nopw",
+      "-localhost",
+      "-listen",
+      "127.0.0.1",
+      "-rfbport",
+      String(VNC_PORT),
+      "-quiet"
+    ]);
+    if (!noVncSupervisor) noVncSupervisor = startSupervisor("websockify", () => [
+      "--web=/usr/share/novnc",
+      `127.0.0.1:${NOVNC_PORT}`,
+      `127.0.0.1:${VNC_PORT}`
+    ]);
+  }
+}
+
+function startSupervisor(command, argsFactory) {
+  const supervisor = { stopped: false, child: undefined };
+  const run = () => {
+    if (supervisor.stopped) return;
+    const child = spawn(command, argsFactory(), { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, DISPLAY } });
+    supervisor.child = child;
+    captureChildLogs(child, command);
+    child.on("exit", (code) => {
+      if (supervisor.stopped) return;
+      serviceLog("warn", command, `${command} exited with code ${code ?? "unknown"}; restarting in 1s.`);
+      setTimeout(run, 1_000).unref();
+    });
+  };
+  run();
+  return supervisor;
+}
+
+async function ensureRuntimeReady() {
+  await startDisplayRuntime();
+  await ensureBrowser();
+  const deadline = Date.now() + START_TIMEOUT_MS;
+  let status = await runtimeStatus();
+  while (Date.now() < deadline) {
+    if (status.chrome.running && status.cdp.ready && (!VNC_ENABLED || (status.vnc.ready && status.noVnc.ready))) return status;
+    await delay(250);
+    status = await runtimeStatus();
+  }
+  throw new Error(`Browser runtime not ready: ${JSON.stringify(status)}`);
+}
+
+async function runtimeStatus() {
+  const cdp = await isHttpReady(`http://127.0.0.1:${CDP_PORT}/json/version`, 600);
+  return {
+    display: { value: DISPLAY, running: Boolean(xvfbProcess && xvfbProcess.exitCode === null && xvfbProcess.signalCode === null) },
+    chrome: {
+      running: Boolean(chromeProcess && chromeProcess.exitCode === null && chromeProcess.signalCode === null),
+      pid: chromeProcess?.pid,
+      profileDir: PROFILE_DIR,
+      bin: BROWSER_BIN
+    },
+    cdp: {
+      host: CDP_HOST,
+      port: CDP_PORT,
+      ready: cdp.ok,
+      internal: true,
+      error: cdp.error
+    },
+    vnc: {
+      enabled: VNC_ENABLED,
+      host: "127.0.0.1",
+      port: VNC_PORT,
+      ready: VNC_ENABLED ? await isTcpReady(VNC_PORT, "127.0.0.1", 600) : false
+    },
+    noVnc: {
+      enabled: VNC_ENABLED,
+      host: "127.0.0.1",
+      port: NOVNC_PORT,
+      ready: VNC_ENABLED ? (await isHttpReady(`http://127.0.0.1:${NOVNC_PORT}/vnc.html`, 600)).ok : false
+    },
+    logs: { cursor: logSeq }
+  };
+}
+
+async function ensureBrowser() {
+  const running = chromeProcess && chromeProcess.exitCode === null && chromeProcess.signalCode === null;
+  const cdpReady = (await isHttpReady(`http://127.0.0.1:${CDP_PORT}/json/version`, 600)).ok;
+  if (running && cdpReady) return;
+  if (running && !cdpReady) {
+    terminateProcess(chromeProcess, "CDP not ready");
+    await waitForProcessExit(chromeProcess, PROCESS_EXIT_GRACE_MS + 500).catch(() => undefined);
+    chromeProcess = undefined;
+  }
+  await launchChrome();
+}
+
+async function launchChrome() {
+  await ensureRuntimeDirs();
+  await clearStaleProfileLocks();
+  const args = [
+    ...(HEADLESS ? ["--headless=new"] : []),
+    ...(CHROME_NO_SANDBOX ? ["--no-sandbox"] : []),
+    "--disable-dev-shm-usage",
+    "--disable-notifications",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-sync",
+    "--disable-blink-features=AutomationControlled",
+    "--password-store=basic",
+    "--window-size=1440,980",
+    `--user-agent=${USER_AGENT}`,
+    "--accept-lang=zh-CN,zh,en-US,en",
+    `--remote-debugging-address=${CDP_HOST}`,
+    `--remote-debugging-port=${CDP_PORT}`,
+    "--lang=zh-CN",
+    `--user-data-dir=${PROFILE_DIR}`,
+    "about:blank"
+  ];
+  serviceLog("info", "chrome", "Starting Chrome process.", { bin: BROWSER_BIN, cdp: `${CDP_HOST}:${CDP_PORT}`, display: DISPLAY, profileDir: PROFILE_DIR });
+  const child = spawn(BROWSER_BIN, args, { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, DISPLAY } });
+  chromeProcess = child;
+  captureChildLogs(child, "chrome");
+  child.on("exit", (code) => {
+    serviceLog("error", "chrome", `Chrome exited with code ${code ?? "unknown"}.`);
+    if (chromeProcess === child) chromeProcess = undefined;
+  });
+  await waitForCdpHttp(START_TIMEOUT_MS);
+}
+
+async function restartBrowser(reason = "manual") {
+  if (restartPromise) return restartPromise;
+  restartPromise = withTimeout((async () => {
+    serviceLog("warn", "chrome", `Restarting Chrome: ${reason}`);
+    const oldProcess = chromeProcess;
+    chromeProcess = undefined;
+    if (oldProcess) {
+      terminateProcess(oldProcess, reason);
+      await waitForProcessExit(oldProcess, PROCESS_EXIT_GRACE_MS + 500).catch(() => undefined);
+    }
+    await waitForCdpClosed(3_000).catch(() => undefined);
+    await delay(800);
+    await ensureBrowser();
+    return { restarted: true, reason, runtime: await runtimeStatus() };
+  })(), RESTART_TIMEOUT_MS, "Browser runtime restart timed out.").finally(() => {
+    restartPromise = undefined;
+  });
+  return restartPromise;
+}
+
+async function runBrowserAction(body) {
+  const action = String(body.action || "");
+  if (action === "navigate") {
+    await navigateWithXdotool(normalizeViewerUrl(String(body.url || "")));
+    return;
+  }
+  if (action === "back") {
+    await runXdotool(["key", "--clearmodifiers", "Alt+Left"]);
+    return;
+  }
+  if (action === "forward") {
+    await runXdotool(["key", "--clearmodifiers", "Alt+Right"]);
+    return;
+  }
+  if (action === "reload") {
+    await runXdotool(["key", "--clearmodifiers", "F5"]);
+    return;
+  }
+  throw new Error("Unsupported browser action.");
+}
+
+async function navigateWithXdotool(url) {
+  if (!url) return;
+  await runXdotool(["key", "--clearmodifiers", "ctrl+l"]);
+  await runXdotool(["type", "--delay", "12", "--clearmodifiers", url]);
+  await runXdotool(["key", "--clearmodifiers", "Return"]);
+}
+
+function runXdotool(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("xdotool", args, { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, DISPLAY } });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("xdotool timed out."));
+    }, 10_000);
+    child.on("exit", (code) => {
+      clearTimeout(timeout);
+      if (code === 0) resolve();
+      else reject(new Error((stderr || stdout || `xdotool exited with code ${code}`).trim()));
+    });
+    child.on("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+  });
+}
+
+async function exportCookies(domains = []) {
+  const cookies = await fetchCookiesFromCdp();
+  const filters = domains.map((item) => item.toLowerCase());
+  if (!filters.length) return cookies;
+  return cookies.filter((cookie) => filters.some((filter) => String(cookie.domain || "").toLowerCase().includes(filter)));
+}
+
+async function fetchCookiesFromCdp() {
+  const version = await fetchJson(`http://127.0.0.1:${CDP_PORT}/json/version`);
+  if (version?.webSocketDebuggerUrl) {
+    try {
+      const storage = await sendCdpCommand(version.webSocketDebuggerUrl, "Storage.getCookies", {});
+      if (Array.isArray(storage.cookies)) return storage.cookies;
+    } catch (error) {
+      serviceLog("warn", "cookies", `Storage.getCookies failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  const targets = await fetchJson(`http://127.0.0.1:${CDP_PORT}/json/list`);
+  const page = Array.isArray(targets) ? targets.find((item) => item?.type === "page" && item.webSocketDebuggerUrl) : undefined;
+  if (!page?.webSocketDebuggerUrl) return [];
+  const network = await sendCdpCommand(page.webSocketDebuggerUrl, "Network.getAllCookies", {});
+  return Array.isArray(network.cookies) ? network.cookies : [];
+}
+
+function sendCdpCommand(webSocketUrl, method, params = {}) {
+  return new Promise((resolve, reject) => {
+    if (typeof WebSocket !== "function") {
+      reject(new Error("Node WebSocket API unavailable."));
+      return;
+    }
+    const id = 1;
+    const socket = new WebSocket(webSocketUrl);
+    const timeout = setTimeout(() => {
+      socket.close();
+      reject(new Error(`CDP ${method} timed out.`));
+    }, 8_000);
+    socket.addEventListener("open", () => {
+      socket.send(JSON.stringify({ id, method, params }));
+    });
+    socket.addEventListener("message", (event) => {
+      const payload = JSON.parse(String(event.data));
+      if (payload.id !== id) return;
+      clearTimeout(timeout);
+      socket.close();
+      if (payload.error) reject(new Error(payload.error.message || `CDP ${method} failed.`));
+      else resolve(payload.result || {});
+    });
+    socket.addEventListener("error", () => {
+      clearTimeout(timeout);
+      reject(new Error("CDP websocket failed."));
+    });
+  });
+}
+
+async function persistCookies(cookies) {
+  const data = JSON.stringify(cookies, null, 2);
+  await Promise.all(
+    COOKIE_MIRROR_PATHS.map(async (cookiesPath) => {
+      await mkdir(path.dirname(cookiesPath), { recursive: true });
+      await writeFile(cookiesPath, data, "utf8");
+    })
+  );
+}
+
+async function ensureRuntimeDirs() {
+  await mkdir(PROFILE_DIR, { recursive: true });
+  await mkdir(path.dirname(COOKIES_PATH), { recursive: true });
+  if (CHROME_USER) {
+    try {
+      execFileSync("chown", ["-R", `${CHROME_USER}:${CHROME_USER}`, PROFILE_DIR, path.dirname(COOKIES_PATH)], {
+        stdio: "ignore",
+        timeout: 5_000
+      });
+    } catch {
+      // Best effort: containers that do not run as root may not be able to chown.
+    }
+  }
+}
+
+async function clearStaleProfileLocks() {
+  await Promise.all(
+    ["SingletonLock", "SingletonCookie", "SingletonSocket"].map((name) =>
+      rm(path.join(PROFILE_DIR, name), { force: true, recursive: true }).catch(() => undefined)
+    )
+  );
+}
+
+function captureChildLogs(child, source) {
+  child.stdout?.on("data", (chunk) => captureProcessLog(source, "info", chunk));
+  child.stderr?.on("data", (chunk) => captureProcessLog(source, source === "chrome" ? "warn" : "info", chunk));
+  child.on("error", (error) => serviceLog("error", source, `${source} process error: ${error.message}`));
+}
+
+function captureProcessLog(source, level, chunk) {
+  String(chunk || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .forEach((line) => serviceLog(level, source, line));
+}
+
+function serviceLog(level, source, message, details) {
+  const entry = {
+    seq: ++logSeq,
+    time: new Date().toISOString(),
+    level,
+    source,
+    message: sanitizeLogText(message),
+    details: sanitizeLogDetails(details)
+  };
+  logs.push(entry);
+  while (logs.length > LOG_LIMIT) logs.shift();
+  const suffix = entry.details ? ` ${JSON.stringify(entry.details)}` : "";
+  const line = `[${entry.time}] [${entry.source}] ${entry.level.toUpperCase()} ${entry.message}${suffix}`;
+  if (level === "error" || level === "warn") console.error(line);
+  else console.log(line);
+}
+
+function logsSince(since, limit) {
+  const cursor = Number.isFinite(Number(since)) ? Math.max(0, Math.floor(Number(since))) : 0;
+  const max = Number.isFinite(Number(limit)) ? Math.max(1, Math.min(500, Math.floor(Number(limit)))) : 200;
+  return logs.filter((entry) => entry.seq > cursor).slice(-max);
+}
+
+function sanitizeLogText(value) {
+  return String(value || "")
+    .replace(/(xsec_token|xsecToken)=([^&\s]+)/gi, "$1=[redacted]")
+    .replace(/("?(?:xsec_token|xsecToken)"?\s*:\s*")([^"]+)(")/gi, "$1[redacted]$3")
+    .slice(0, 1000);
+}
+
+function sanitizeLogDetails(value) {
+  if (value === undefined) return undefined;
+  try {
+    return JSON.parse(JSON.stringify(value, (_key, item) => (typeof item === "string" ? sanitizeLogText(item) : item)));
+  } catch {
+    return sanitizeLogText(value);
+  }
+}
+
+async function waitForCdpHttp(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const response = await fetch(`http://127.0.0.1:${CDP_PORT}/json/version`).catch(() => null);
+    if (response?.ok) return;
+    await delay(250);
+  }
+  throw new Error(`Chrome CDP port ${CDP_PORT} did not become ready.`);
+}
+
+async function waitForCdpClosed(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const response = await fetch(`http://127.0.0.1:${CDP_PORT}/json/version`).catch(() => null);
+    if (!response?.ok) return;
+    await delay(150);
+  }
+}
+
+async function isHttpReady(url, timeoutMs) {
+  try {
+    const response = await fetchWithTimeout(url, timeoutMs);
+    return { ok: response.ok, status: response.status };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function isTcpReady(port, host, timeoutMs) {
+  return new Promise((resolve) => {
+    const socket = connectTcp(port, host);
+    const done = (ready) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(ready);
+    };
+    socket.setTimeout(timeoutMs, () => done(false));
+    socket.on("connect", () => done(true));
+    socket.on("error", () => done(false));
+  });
+}
+
+async function fetchWithTimeout(url, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchJson(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${url} HTTP ${response.status}`);
+  return response.json();
+}
+
+function terminateProcess(processRef, reason) {
+  if (!processRef || processRef.killed) return;
+  serviceLog("warn", "process", `Terminating process ${processRef.pid || ""}: ${reason}`);
+  processRef.kill("SIGTERM");
+  setTimeout(() => {
+    if (processRef.exitCode === null && processRef.signalCode === null) {
+      serviceLog("error", "process", `Process ${processRef.pid || ""} did not exit after SIGTERM; sending SIGKILL.`);
+      processRef.kill("SIGKILL");
+    }
+  }, PROCESS_EXIT_GRACE_MS).unref();
+}
+
+function waitForProcessExit(processRef, timeoutMs) {
+  if (!processRef || processRef.exitCode !== null || processRef.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timeout = setTimeout(resolve, timeoutMs);
+    processRef.once("exit", () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+  });
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function normalizeViewerUrl(raw) {
+  const value = raw.trim();
+  if (!value) return "";
+  if (/^https?:\/\//i.test(value)) return value;
+  if (/^[\w.-]+\.[a-z]{2,}(\/|$)/i.test(value)) return `https://${value}`;
+  return `https://www.google.com/search?q=${encodeURIComponent(value)}`;
+}
+
+async function readJson(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(Buffer.from(chunk));
+  const raw = Buffer.concat(chunks).toString("utf8");
+  return raw ? JSON.parse(raw) : {};
+}
+
+function sendJson(res, status, payload) {
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(payload));
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function detectChromeVersion() {
+  const fallback = stringEnv(["BROWSER_FULL_VERSION", "XHS_BROWSER_FULL_VERSION"], "137.0.0.0");
+  try {
+    const output = execFileSync(stringEnv(["GOOGLE_CHROME_BIN"], "/usr/bin/google-chrome-stable"), ["--version"], {
+      encoding: "utf8",
+      timeout: 2_000
+    });
+    const version = output.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1] || fallback;
+    return { full: version, major: version.split(".")[0] || "137" };
+  } catch {
+    return { full: fallback, major: fallback.split(".")[0] || "137" };
+  }
+}
+
+function numberEnv(names, fallback) {
+  const value = Number(stringEnv(names, String(fallback)));
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.floor(value);
+}
+
+function stringEnv(names, fallback) {
+  for (const name of names) {
+    const value = process.env[name];
+    if (value !== undefined && value !== "") return value;
+  }
+  return fallback;
+}
+
+function uniquePaths(paths) {
+  return [...new Set(paths.filter(Boolean))];
+}
+
+async function shutdown() {
+  server.close();
+  if (chromeProcess) terminateProcess(chromeProcess, "shutdown");
+  for (const supervisor of [vncSupervisor, noVncSupervisor]) {
+    if (!supervisor) continue;
+    supervisor.stopped = true;
+    supervisor.child?.kill("SIGTERM");
+  }
+  if (xvfbProcess) terminateProcess(xvfbProcess, "shutdown");
+  await delay(250);
+  process.exit(0);
+}

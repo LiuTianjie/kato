@@ -127,7 +127,7 @@ export async function syncBrowserViewerCookiesToMcp(config: AppConfig): Promise<
 export async function restartContainerBrowser(config: AppConfig, reason = "manual", port = getDefaultCdpPort()): Promise<unknown> {
   const mcpBaseUrl = getMcpRestBaseUrl(config);
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30_000);
+  const timeout = setTimeout(() => controller.abort(), 130_000);
   try {
     const response = await fetch(`${mcpBaseUrl}/api/v1/browser/restart`, {
       method: "POST",

@@ -7,14 +7,18 @@ import { resolveFromRoot } from "../config.js";
 import type { XhsComment, XhsPost } from "../domain/types.js";
 
 export interface XhsAdapter {
-  searchPosts(query: string, limit: number): Promise<XhsPost[]>;
-  getPost(post: XhsPost | string): Promise<XhsPost | null>;
-  getComments?(post: XhsPost | string, limit: number): Promise<XhsComment[]>;
+  searchPosts(query: string, limit: number, options?: XhsAdapterRequestOptions): Promise<XhsPost[]>;
+  getPost(post: XhsPost | string, options?: XhsAdapterRequestOptions): Promise<XhsPost | null>;
+  getComments?(post: XhsPost | string, limit: number, options?: XhsAdapterRequestOptions): Promise<XhsComment[]>;
   openPost(url: string): Promise<void>;
   prefillComment(url: string, comment: string): Promise<boolean>;
-  publishComment(post: XhsPost, comment: string): Promise<boolean>;
-  likePost?(post: XhsPost): Promise<boolean>;
+  publishComment(post: XhsPost, comment: string, options?: XhsAdapterRequestOptions): Promise<boolean>;
+  likePost?(post: XhsPost, options?: XhsAdapterRequestOptions): Promise<boolean>;
   close?(): Promise<void>;
+}
+
+export interface XhsAdapterRequestOptions {
+  signal?: AbortSignal;
 }
 
 export function createXhsAdapter(config: AppConfig): XhsAdapter {
@@ -40,7 +44,7 @@ class FixtureXhsAdapter implements XhsAdapter {
     this.posts = JSON.parse(readFileSync(fixturePath, "utf8")) as XhsPost[];
   }
 
-  async searchPosts(query: string, limit: number): Promise<XhsPost[]> {
+  async searchPosts(query: string, limit: number, _options?: XhsAdapterRequestOptions): Promise<XhsPost[]> {
     const normalized = normalize(query);
     return this.posts
       .filter((post) => {
@@ -50,12 +54,12 @@ class FixtureXhsAdapter implements XhsAdapter {
       .slice(0, limit);
   }
 
-  async getPost(postOrUrl: XhsPost | string): Promise<XhsPost | null> {
+  async getPost(postOrUrl: XhsPost | string, _options?: XhsAdapterRequestOptions): Promise<XhsPost | null> {
     const idOrUrl = typeof postOrUrl === "string" ? postOrUrl : postOrUrl.id || postOrUrl.url;
     return this.posts.find((post) => post.id === idOrUrl || post.url === idOrUrl) ?? null;
   }
 
-  async getComments(_postOrUrl: XhsPost | string, _limit: number): Promise<XhsComment[]> {
+  async getComments(_postOrUrl: XhsPost | string, _limit: number, _options?: XhsAdapterRequestOptions): Promise<XhsComment[]> {
     return [];
   }
 
@@ -67,12 +71,12 @@ class FixtureXhsAdapter implements XhsAdapter {
     return false;
   }
 
-  async publishComment(post: XhsPost, comment: string): Promise<boolean> {
+  async publishComment(post: XhsPost, comment: string, _options?: XhsAdapterRequestOptions): Promise<boolean> {
     console.log(`[fixture] Would publish to ${post.url}: ${comment}`);
     return true;
   }
 
-  async likePost(post: XhsPost): Promise<boolean> {
+  async likePost(post: XhsPost, _options?: XhsAdapterRequestOptions): Promise<boolean> {
     console.log(`[fixture] Would like ${post.url}`);
     return true;
   }
@@ -108,9 +112,9 @@ class HttpMcpXhsAdapter implements XhsAdapter {
     };
   }
 
-  async searchPosts(query: string, limit: number): Promise<XhsPost[]> {
+  async searchPosts(query: string, limit: number, options: XhsAdapterRequestOptions = {}): Promise<XhsPost[]> {
     if (this.tools.searchPosts === "search_feeds") {
-      return this.searchFeedsRest(query, limit);
+      return this.searchFeedsRest(query, limit, options);
     }
 
     await this.ensureInitialized();
@@ -118,11 +122,11 @@ class HttpMcpXhsAdapter implements XhsAdapter {
     return coercePosts(result).slice(0, limit);
   }
 
-  async getPost(postOrUrl: XhsPost | string): Promise<XhsPost | null> {
+  async getPost(postOrUrl: XhsPost | string, options: XhsAdapterRequestOptions = {}): Promise<XhsPost | null> {
     if (!this.tools.getPost) return null;
     const post = typeof postOrUrl === "string" ? urlToPost(postOrUrl) : postOrUrl;
     if (this.tools.getPost === "get_feed_detail" && post.xsecToken) {
-      return this.getFeedDetailRest(post);
+      return this.getFeedDetailRest(post, options);
     }
 
     await this.ensureInitialized();
@@ -137,8 +141,8 @@ class HttpMcpXhsAdapter implements XhsAdapter {
     return coercePosts(result)[0] ?? null;
   }
 
-  async getComments(postOrUrl: XhsPost | string, limit: number): Promise<XhsComment[]> {
-    return this.getFeedCommentsRest(typeof postOrUrl === "string" ? urlToPost(postOrUrl) : postOrUrl, limit);
+  async getComments(postOrUrl: XhsPost | string, limit: number, options: XhsAdapterRequestOptions = {}): Promise<XhsComment[]> {
+    return this.getFeedCommentsRest(typeof postOrUrl === "string" ? urlToPost(postOrUrl) : postOrUrl, limit, options);
   }
 
   async openPost(url: string): Promise<void> {
@@ -157,7 +161,7 @@ class HttpMcpXhsAdapter implements XhsAdapter {
     return true;
   }
 
-  async publishComment(post: XhsPost, comment: string): Promise<boolean> {
+  async publishComment(post: XhsPost, comment: string, options: XhsAdapterRequestOptions = {}): Promise<boolean> {
     if (!this.tools.publishComment) {
       throw new Error("No publishComment MCP tool configured.");
     }
@@ -165,7 +169,7 @@ class HttpMcpXhsAdapter implements XhsAdapter {
       if (!post.xsecToken) {
         throw new Error(`Cannot publish ${post.id}: missing xsec_token from search results.`);
       }
-      await this.postCommentRest(post, comment);
+      await this.postCommentRest(post, comment, options);
       return true;
     }
 
@@ -181,13 +185,13 @@ class HttpMcpXhsAdapter implements XhsAdapter {
     return true;
   }
 
-  async likePost(post: XhsPost): Promise<boolean> {
+  async likePost(post: XhsPost, options: XhsAdapterRequestOptions = {}): Promise<boolean> {
     if (!this.tools.likePost) return false;
     if (!post.xsecToken) {
       throw new Error(`Cannot like ${post.id}: missing xsec_token from search results.`);
     }
     if (this.tools.likePost === "like_feed") {
-      await this.likeFeedRest(post);
+      await this.likeFeedRest(post, options);
       return true;
     }
     await this.ensureInitialized();
@@ -199,7 +203,7 @@ class HttpMcpXhsAdapter implements XhsAdapter {
     return true;
   }
 
-  private async postCommentRest(post: XhsPost, comment: string): Promise<void> {
+  private async postCommentRest(post: XhsPost, comment: string, options: XhsAdapterRequestOptions = {}): Promise<void> {
     const response = await fetchWithTimeout(new URL("/api/v1/feeds/comment", this.restBaseUrl), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -208,13 +212,13 @@ class HttpMcpXhsAdapter implements XhsAdapter {
         xsec_token: post.xsecToken,
         content: comment
       })
-    }, this.restTimeoutMs);
+    }, this.restTimeoutMs, options.signal);
     if (!response.ok) {
       throw new Error(`XHS REST comment failed: HTTP ${response.status} ${await response.text()}`);
     }
   }
 
-  private async likeFeedRest(post: XhsPost): Promise<void> {
+  private async likeFeedRest(post: XhsPost, options: XhsAdapterRequestOptions = {}): Promise<void> {
     const response = await fetchWithTimeout(new URL("/api/v1/feeds/like", this.restBaseUrl), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -223,7 +227,7 @@ class HttpMcpXhsAdapter implements XhsAdapter {
         xsec_token: post.xsecToken,
         unlike: false
       })
-    }, this.restTimeoutMs);
+    }, this.restTimeoutMs, options.signal);
     if (!response.ok) {
       throw new Error(`XHS REST like failed: HTTP ${response.status} ${await response.text()}`);
     }
@@ -249,17 +253,17 @@ class HttpMcpXhsAdapter implements XhsAdapter {
     return result;
   }
 
-  private async searchFeedsRest(query: string, limit: number): Promise<XhsPost[]> {
+  private async searchFeedsRest(query: string, limit: number, options: XhsAdapterRequestOptions = {}): Promise<XhsPost[]> {
     const url = new URL("/api/v1/feeds/search", this.restBaseUrl);
     url.searchParams.set("keyword", query);
-    const response = await fetchWithTimeout(url, {}, this.restTimeoutMs);
+    const response = await fetchWithTimeout(url, {}, this.restTimeoutMs, options.signal);
     if (!response.ok) {
       throw new Error(`XHS REST search failed: HTTP ${response.status} ${await response.text()}`);
     }
     return coercePosts(await response.json()).slice(0, limit);
   }
 
-  private async getFeedDetailRest(post: XhsPost): Promise<XhsPost | null> {
+  private async getFeedDetailRest(post: XhsPost, options: XhsAdapterRequestOptions = {}): Promise<XhsPost | null> {
     const response = await fetchWithTimeout(new URL("/api/v1/feeds/detail", this.restBaseUrl), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -272,14 +276,14 @@ class HttpMcpXhsAdapter implements XhsAdapter {
           scroll_speed: "normal"
         }
       })
-    }, this.restTimeoutMs);
+    }, this.restTimeoutMs, options.signal);
     if (!response.ok) {
       throw new Error(`XHS REST detail failed: HTTP ${response.status} ${await response.text()}`);
     }
     return coercePosts(await response.json())[0] ?? post;
   }
 
-  private async getFeedCommentsRest(post: XhsPost, limit: number): Promise<XhsComment[]> {
+  private async getFeedCommentsRest(post: XhsPost, limit: number, options: XhsAdapterRequestOptions = {}): Promise<XhsComment[]> {
     const response = await fetchWithTimeout(new URL("/api/v1/feeds/comments", this.restBaseUrl), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -289,7 +293,7 @@ class HttpMcpXhsAdapter implements XhsAdapter {
         url: post.url,
         limit
       })
-    }, this.restTimeoutMs);
+    }, this.restTimeoutMs, options.signal);
     if (!response.ok) {
       throw new Error(`XHS REST comments failed: HTTP ${response.status} ${await response.text()}`);
     }
@@ -582,13 +586,19 @@ function normalize(value: string): string {
   return value.toLowerCase().replace(/\s+/g, "");
 }
 
-async function fetchWithTimeout(url: URL, init: RequestInit, timeoutMs: number): Promise<Response> {
+async function fetchWithTimeout(url: URL, init: RequestInit, timeoutMs: number, externalSignal?: AbortSignal): Promise<Response> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const abortFromExternal = () => {
+    if (!controller.signal.aborted) controller.abort(externalSignal?.reason ?? new Error("XHS request was aborted."));
+  };
+  if (externalSignal?.aborted) abortFromExternal();
+  else externalSignal?.addEventListener("abort", abortFromExternal, { once: true });
+  const timeout = setTimeout(() => controller.abort(new Error(`XHS request timed out after ${timeoutMs}ms.`)), timeoutMs);
   try {
     return await fetch(url, { ...init, signal: controller.signal });
   } finally {
     clearTimeout(timeout);
+    externalSignal?.removeEventListener("abort", abortFromExternal);
   }
 }
 

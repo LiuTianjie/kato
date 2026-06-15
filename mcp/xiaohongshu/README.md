@@ -1,6 +1,8 @@
 # Kato XHS browser service
 
-本目录保留 Kato 内置 XHS browser service 的代码和兼容 Compose 入口。正式部署使用根目录单镜像：dashboard、容器内 Chromium、REST API、CDP 和可选 MCP 兼容层都在同一个 `kato` 容器里。
+本目录保留 Kato 内置 XHS browser service 的代码和兼容 Compose 入口。正式部署使用根目录单镜像：dashboard、browser-runtime、REST API、CDP 和可选 MCP 兼容层都在同一个 `kato` 容器里。
+
+底层 Chrome、Xvfb、noVNC 和重启恢复由通用 `browser-runtime` 负责；本目录的 XHS service 只负责小红书搜索、详情、评论、登录态和平台数据解析。
 
 ```bash
 cd ../..

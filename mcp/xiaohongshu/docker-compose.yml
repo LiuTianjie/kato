@@ -16,6 +16,19 @@ services:
     environment:
       - PORT=4173
       - XHS_SERVICE_PORT=18060
+      - BROWSER_RUNTIME_PORT=18100
+      - BROWSER_RUNTIME_URL=http://127.0.0.1:18100
+      - XHS_BROWSER_RUNTIME_URL=http://127.0.0.1:18100
+      - BROWSER_BIN=/usr/local/bin/kato-chromium
+      - BROWSER_CDP_HOST=127.0.0.1
+      - BROWSER_CDP_PORT=9224
+      - BROWSER_DISPLAY=:99
+      - BROWSER_VNC_ENABLED=1
+      - BROWSER_VNC_PORT=5900
+      - BROWSER_NOVNC_PORT=6080
+      - BROWSER_PROFILE_DIR=/app/mcp/xiaohongshu/data/profile
+      - BROWSER_COOKIES_PATH=/app/mcp/xiaohongshu/data/cookies.json
+      - BROWSER_COOKIE_MIRROR_PATHS=/app/data/cookies.json
       - XHS_BROWSER_BIN=/usr/local/bin/kato-chromium
       - XHS_CDP_HOST=127.0.0.1
       - XHS_CDP_PORT=9224

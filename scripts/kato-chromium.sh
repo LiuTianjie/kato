@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DISPLAY_SIZE="${XHS_DISPLAY_SIZE:-1440x980x24}"
-CHROME_USER="${XHS_CHROME_USER:-kato}"
+DISPLAY_SIZE="${BROWSER_DISPLAY_SIZE:-${XHS_DISPLAY_SIZE:-1440x980x24}}"
+CHROME_USER="${BROWSER_CHROME_USER:-${XHS_CHROME_USER:-kato}}"
 CHROME_BIN="/usr/bin/google-chrome-stable"
 
 run_chrome() {
