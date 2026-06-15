@@ -39,6 +39,13 @@ export interface XhsPost {
   publishedAt?: string;
 }
 
+export interface XhsComment {
+  id: string;
+  content: string;
+  author?: string;
+  parentId?: string;
+}
+
 export interface ScoredPost extends XhsPost {
   score: number;
   matchedKeywords: string[];

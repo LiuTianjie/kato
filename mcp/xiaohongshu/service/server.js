@@ -69,6 +69,14 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/api/v1/feeds/comments") {
+      const body = await readJson(req);
+      const limit = normalizeLimit(body.limit || body.max_comments || body.max_comment_items, 50);
+      const comments = await getFeedComments(body, limit);
+      sendJson(res, 200, { success: true, data: { comments, items: comments } });
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/api/v1/feeds/comment") {
       const body = await readJson(req);
       await postComment(body);
@@ -345,6 +353,10 @@ async function callTool(params) {
   if (name === "get_feed_detail") {
     return toolJson(await getFeedDetail(args));
   }
+  if (name === "get_feed_comments") {
+    const comments = await getFeedComments(args, normalizeLimit(args.limit || args.max_comments || args.max_comment_items, 50));
+    return toolJson({ comments, items: comments });
+  }
   if (name === "post_comment_to_feed") {
     await postComment(args);
     return toolJson({ posted: true });
@@ -360,6 +372,7 @@ function toolList() {
   return [
     { name: "search_feeds", description: "Search Xiaohongshu posts", inputSchema: { type: "object" } },
     { name: "get_feed_detail", description: "Read a Xiaohongshu post detail", inputSchema: { type: "object" } },
+    { name: "get_feed_comments", description: "Read Xiaohongshu post comments", inputSchema: { type: "object" } },
     { name: "post_comment_to_feed", description: "Post a confirmed comment", inputSchema: { type: "object" } },
     { name: "like_feed", description: "Like a confirmed post", inputSchema: { type: "object" } }
   ];
@@ -425,6 +438,132 @@ async function scrapePosts(page) {
       };
     });
   });
+}
+
+async function getFeedComments(body, limit) {
+  await getFeedDetail(body);
+  const page = await servicePage();
+  await autoScroll(page, 3);
+  return uniqueComments(await scrapeComments(page), limit);
+}
+
+async function scrapeComments(page) {
+  return page.evaluate(() => {
+    const selectors = [
+      "[class*=comment-item]",
+      "[class*=CommentItem]",
+      "[class*=parent-comment]",
+      "[class*=commentItem]",
+      "[data-comment-id]"
+    ];
+    const nodes = [...document.querySelectorAll(selectors.join(","))];
+    const fallbackNodes = nodes.length
+      ? nodes
+      : [...document.querySelectorAll("div, li")]
+          .filter((node) => {
+            const className = String(node.getAttribute("class") || "");
+            const text = (node.textContent || "").replace(/\s+/g, " ").trim();
+            return /comment|评论/i.test(className) && text.length >= 2 && text.length <= 500;
+          })
+          .slice(0, 100);
+
+    return fallbackNodes.map((node, index) => {
+      const text = pickCommentText(node);
+      const author = pickAuthorText(node);
+      const id =
+        node.getAttribute("data-comment-id") ||
+        node.getAttribute("data-id") ||
+        node.id ||
+        `comment-${index}-${hashText(`${author}:${text}`)}`;
+      const parent = node.closest("[data-comment-id]")?.getAttribute("data-comment-id") || "";
+      return {
+        id,
+        comment_id: id,
+        content: text,
+        text,
+        author,
+        author_name: author,
+        parent_id: parent && parent !== id ? parent : ""
+      };
+    });
+
+    function pickCommentText(node) {
+      const candidates = [
+        "[class*=content]",
+        "[class*=Content]",
+        "[class*=text]",
+        "[class*=Text]",
+        "[class*=desc]"
+      ];
+      for (const selector of candidates) {
+        const text = [...node.querySelectorAll(selector)]
+          .map((item) => item.textContent || "")
+          .map((item) => item.replace(/\s+/g, " ").trim())
+          .find((item) => item && item.length <= 500);
+        if (text) return cleanCommentText(text);
+      }
+      return cleanCommentText((node.textContent || "").replace(/\s+/g, " ").trim());
+    }
+
+    function pickAuthorText(node) {
+      const selectors = [
+        "[class*=author]",
+        "[class*=Author]",
+        "[class*=nickname]",
+        "[class*=Nickname]",
+        "[class*=name]",
+        "[class*=Name]"
+      ];
+      for (const selector of selectors) {
+        const text = [...node.querySelectorAll(selector)]
+          .map((item) => item.textContent || "")
+          .map((item) => item.replace(/\s+/g, " ").trim())
+          .find((item) => item && item.length <= 80);
+        if (text) return text;
+      }
+      return "";
+    }
+
+    function cleanCommentText(value) {
+      return String(value || "")
+        .replace(/^(回复|评论)\s*/g, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 1000);
+    }
+
+    function hashText(value) {
+      let hash = 0;
+      for (let i = 0; i < value.length; i += 1) {
+        hash = (hash * 31 + value.charCodeAt(i)) >>> 0;
+      }
+      return hash.toString(16);
+    }
+  });
+}
+
+function uniqueComments(comments, limit) {
+  const seen = new Set();
+  const result = [];
+  for (const comment of comments) {
+    const content = String(comment.content || comment.text || "").trim();
+    if (!content) continue;
+    const key = String(comment.id || comment.comment_id || content);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({
+      id: key,
+      comment_id: key,
+      content,
+      text: content,
+      author: comment.author || undefined,
+      author_name: comment.author_name || comment.author || undefined,
+      parent_id: comment.parent_id || undefined,
+      parent_comment_id: comment.parent_id || undefined
+    });
+    if (result.length >= limit) break;
+  }
+  return result;
 }
 
 async function autoScroll(page, steps) {

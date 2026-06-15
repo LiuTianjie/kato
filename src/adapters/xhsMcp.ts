@@ -4,11 +4,12 @@ import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import type { AppConfig, XhsConfig } from "../config.js";
 import { resolveFromRoot } from "../config.js";
-import type { XhsPost } from "../domain/types.js";
+import type { XhsComment, XhsPost } from "../domain/types.js";
 
 export interface XhsAdapter {
   searchPosts(query: string, limit: number): Promise<XhsPost[]>;
   getPost(post: XhsPost | string): Promise<XhsPost | null>;
+  getComments?(post: XhsPost | string, limit: number): Promise<XhsComment[]>;
   openPost(url: string): Promise<void>;
   prefillComment(url: string, comment: string): Promise<boolean>;
   publishComment(post: XhsPost, comment: string): Promise<boolean>;
@@ -52,6 +53,10 @@ class FixtureXhsAdapter implements XhsAdapter {
   async getPost(postOrUrl: XhsPost | string): Promise<XhsPost | null> {
     const idOrUrl = typeof postOrUrl === "string" ? postOrUrl : postOrUrl.id || postOrUrl.url;
     return this.posts.find((post) => post.id === idOrUrl || post.url === idOrUrl) ?? null;
+  }
+
+  async getComments(_postOrUrl: XhsPost | string, _limit: number): Promise<XhsComment[]> {
+    return [];
   }
 
   async openPost(url: string): Promise<void> {
@@ -129,6 +134,10 @@ class HttpMcpXhsAdapter implements XhsAdapter {
       max_comment_items: 10
     });
     return coercePosts(result)[0] ?? null;
+  }
+
+  async getComments(postOrUrl: XhsPost | string, limit: number): Promise<XhsComment[]> {
+    return this.getFeedCommentsRest(typeof postOrUrl === "string" ? urlToPost(postOrUrl) : postOrUrl, limit);
   }
 
   async openPost(url: string): Promise<void> {
@@ -268,6 +277,23 @@ class HttpMcpXhsAdapter implements XhsAdapter {
     }
     return coercePosts(await response.json())[0] ?? post;
   }
+
+  private async getFeedCommentsRest(post: XhsPost, limit: number): Promise<XhsComment[]> {
+    const response = await fetch(new URL("/api/v1/feeds/comments", this.restBaseUrl), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        feed_id: post.id,
+        xsec_token: post.xsecToken,
+        url: post.url,
+        limit
+      })
+    });
+    if (!response.ok) {
+      throw new Error(`XHS REST comments failed: HTTP ${response.status} ${await response.text()}`);
+    }
+    return coerceComments(await response.json()).slice(0, limit);
+  }
 }
 
 class StdioMcpXhsAdapter implements XhsAdapter {
@@ -314,6 +340,19 @@ class StdioMcpXhsAdapter implements XhsAdapter {
     });
     const posts = coercePosts(result);
     return posts[0] ?? null;
+  }
+
+  async getComments(postOrUrl: XhsPost | string, limit: number): Promise<XhsComment[]> {
+    await this.ensureInitialized();
+    const post = typeof postOrUrl === "string" ? urlToPost(postOrUrl) : postOrUrl;
+    const result = await this.callTool("get_feed_comments", {
+      idOrUrl: post.url || post.id,
+      url: post.url,
+      feed_id: post.id,
+      xsec_token: post.xsecToken,
+      limit
+    });
+    return coerceComments(result).slice(0, limit);
   }
 
   async openPost(url: string): Promise<void> {
@@ -562,6 +601,20 @@ function coercePosts(value: unknown): XhsPost[] {
     }));
 }
 
+function coerceComments(value: unknown): XhsComment[] {
+  const raw = unwrapMcpContent(value);
+  const list = extractCommentList(raw);
+  return list
+    .map((item) => item as Record<string, unknown>)
+    .map((item) => ({
+      id: String(item.id ?? item.comment_id ?? item.commentId ?? ""),
+      content: String(item.content ?? item.text ?? item.comment_content ?? ""),
+      author: optionalText(item.author ?? item.author_name ?? item.nickname),
+      parentId: optionalText(item.parentId ?? item.parent_id ?? item.parent_comment_id ?? item.parentCommentId)
+    }))
+    .filter((item) => item.id && item.content);
+}
+
 function unwrapMcpContent(value: unknown): unknown {
   const candidate = value as { content?: Array<{ type?: string; text?: string }> };
   if (!candidate?.content?.length) return value;
@@ -604,6 +657,27 @@ function extractPostList(raw: unknown): unknown[] {
   return item.url || item.id ? [item] : [];
 }
 
+function extractCommentList(raw: unknown): unknown[] {
+  if (Array.isArray(raw)) return raw;
+  const item = raw as Record<string, unknown> | null;
+  if (!item) return [];
+  const data = item.data as Record<string, unknown> | unknown[] | undefined;
+  if (Array.isArray(data)) return data;
+  const candidates = [
+    item,
+    data,
+    (data as Record<string, unknown> | undefined)?.comments,
+    (data as Record<string, unknown> | undefined)?.items,
+    item.comments,
+    item.items,
+    item.comment_list
+  ];
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) return candidate;
+  }
+  return [];
+}
+
 function normalizePostShape(item: Partial<XhsPost> & Record<string, unknown>): Partial<XhsPost> & Record<string, unknown> {
   const noteCard = item.noteCard as Record<string, unknown> | undefined;
   const note = item.note as Record<string, unknown> | undefined;
@@ -625,6 +699,11 @@ function normalizePostShape(item: Partial<XhsPost> & Record<string, unknown>): P
     commentCount: toOptionalNumber(item.commentCount ?? interactInfo?.commentCount),
     publishedAt: item.publishedAt ?? (note?.time ? new Date(Number(note.time) * 1000).toISOString() : undefined)
   };
+}
+
+function optionalText(value: unknown): string | undefined {
+  const text = String(value ?? "").trim();
+  return text || undefined;
 }
 
 function buildXhsUrl(id: string, xsecToken: string): string {

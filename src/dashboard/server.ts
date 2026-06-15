@@ -41,7 +41,7 @@ import {
   updateInteractionDraft,
   updateInteractionStatus
 } from "./queries.js";
-import { handlePublicXhsApi } from "./publicXhsApi.js";
+import { handlePublicXhsApi, isPublicXhsApiPath } from "./publicXhsApi.js";
 
 const config = loadConfig();
 mkdirSync(config.dataDir, { recursive: true });
@@ -76,7 +76,7 @@ const operations = new Map<string, Operation>();
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
-    if (url.pathname.startsWith("/api/")) {
+    if (url.pathname.startsWith("/api/") || isPublicXhsApiPath(url.pathname)) {
       await handleApi(req, res, url);
       return;
     }

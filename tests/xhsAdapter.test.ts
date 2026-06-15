@@ -93,6 +93,58 @@ test("http adapter publishes plain comment text through REST without related not
   }
 });
 
+test("http adapter reads comments through XHS browser service REST", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+
+  globalThis.fetch = async (_input, init) => {
+    calls.push({
+      url: String(_input),
+      body: JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>
+    });
+    return new Response(
+      JSON.stringify({
+        success: true,
+        data: {
+          comments: [
+            {
+              comment_id: "comment-1",
+              content: "这个讲得差，想退费",
+              author_name: "用户A",
+              parent_comment_id: ""
+            }
+          ]
+        }
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  };
+
+  try {
+    const adapter = createXhsAdapter(httpConfig());
+    const comments = await adapter.getComments?.(
+      {
+        id: "target-feed",
+        url: "https://www.xiaohongshu.com/explore/target-feed?xsec_token=target-token",
+        title: "目标帖子",
+        snippet: "目标内容",
+        xsecToken: "target-token"
+      },
+      10
+    );
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "http://fake.local/api/v1/feeds/comments");
+    assert.equal(calls[0].body.feed_id, "target-feed");
+    assert.equal(calls[0].body.xsec_token, "target-token");
+    assert.equal(comments?.[0].id, "comment-1");
+    assert.equal(comments?.[0].content, "这个讲得差，想退费");
+    assert.equal(comments?.[0].author, "用户A");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 function httpConfig(): AppConfig {
   return {
     rootDir: "/tmp/redbook-adapter-test",

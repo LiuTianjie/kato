@@ -6,6 +6,12 @@
 http://localhost:4173/api/v1/xhs/*
 ```
 
+生产部署默认地址：
+
+```text
+https://kato.itool.tech/api/v1/xhs/*
+```
+
 这些接口面向本地或内网自动化调用。CDP 浏览器接管、推流、点击输入仍是 dashboard 内部能力，不作为公共契约。
 
 ## 鉴权
@@ -24,7 +30,7 @@ Authorization: Bearer change-me
 X-API-Key: change-me
 ```
 
-未携带 token 返回 `401`；token 不正确返回 `403`；服务端未配置 `XHS_API_TOKEN` 时返回 `503`。
+未携带 token 返回 `401`；token 不正确返回 `403`。如果服务端未设置 `XHS_API_TOKEN`，会使用部署脚本默认 token `LiuTao0.1`。
 
 ## 响应格式
 
@@ -132,6 +138,65 @@ curl -X POST http://localhost:4173/api/v1/xhs/posts/like \
   -d '{"post":{"id":"笔记ID","url":"https://www.xiaohongshu.com/explore/笔记ID","xsecToken":"搜索结果中的 token"},"confirm":true,"idempotencyKey":"like-20260612-001"}'
 ```
 
+## Serverx 舆情采集兼容接口
+
+这些接口用于让 `serverx` 直接接入 Kato，替换 TikHub 小红书采集。它们同样要求 `XHS_API_TOKEN`，并返回 `serverx` 舆情模块可直接归一化的字段。
+
+根路径和 namespaced 路径都可用：
+
+```text
+POST /search_notes
+POST /note_detail
+POST /note_comments
+POST /note_sub_comments
+
+POST /api/v1/xhs/serverx/search_notes
+POST /api/v1/xhs/serverx/note_detail
+POST /api/v1/xhs/serverx/note_comments
+POST /api/v1/xhs/serverx/note_sub_comments
+```
+
+生产环境推荐把 `serverx` 的小红书采集 base URL 指向：
+
+```text
+https://kato.itool.tech
+```
+
+### POST /search_notes
+
+按关键词搜索笔记，并尽力携带评论列表。
+
+```bash
+curl -X POST https://kato.itool.tech/search_notes \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $XHS_API_TOKEN" \
+  -d '{"keyword":"提分侠","limit":20,"max_comments":20}'
+```
+
+### POST /note_detail
+
+读取指定笔记详情，并尽力携带评论列表。
+
+```bash
+curl -X POST https://kato.itool.tech/note_detail \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $XHS_API_TOKEN" \
+  -d '{"note_id":"笔记ID","url":"https://www.xiaohongshu.com/explore/笔记ID","xsec_token":"搜索结果中的 token","max_comments":50}'
+```
+
+### POST /note_comments
+
+单独读取指定笔记评论。
+
+```bash
+curl -X POST https://kato.itool.tech/note_comments \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $XHS_API_TOKEN" \
+  -d '{"note_id":"笔记ID","url":"https://www.xiaohongshu.com/explore/笔记ID","xsec_token":"搜索结果中的 token","limit":50}'
+```
+
+`note_sub_comments` 预留给 `serverx` 的子评论接口契约；当前返回空数组。Kato 会在抓取一级评论时尽力从页面中识别已展开的父子评论关系。
+
 ## 幂等语义
 
 `comments/publish` 和 `posts/like` 必须传 `idempotencyKey`。同一进程内重复提交同一个 key，会返回第一次调用的结果，不会重复调用 XHS service 发布或点赞。
@@ -140,7 +205,6 @@ curl -X POST http://localhost:4173/api/v1/xhs/posts/like \
 
 - `UNAUTHORIZED`: 未携带 token。
 - `FORBIDDEN`: token 不正确。
-- `API_TOKEN_NOT_CONFIGURED`: 未设置 `XHS_API_TOKEN`。
 - `POST_IDENTIFIER_REQUIRED`: 缺少 `post.id` 或 `post.url`。
 - `CONFIRM_REQUIRED`: 发布/点赞缺少 `confirm:true`。
 - `IDEMPOTENCY_KEY_REQUIRED`: 发布/点赞缺少 `idempotencyKey`。
