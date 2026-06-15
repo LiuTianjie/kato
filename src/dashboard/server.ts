@@ -58,6 +58,7 @@ const port = Number(process.env.PORT ?? 4173);
 const noVncHost = process.env.XHS_NOVNC_HOST || "127.0.0.1";
 const noVncPort = Number(process.env.XHS_NOVNC_PORT || 6080);
 const browserDisplay = process.env.XHS_DISPLAY || ":99";
+const noVncViewerUrl = "/novnc/vnc.html?autoconnect=1&resize=scale&path=novnc/websockify";
 const legacyCdpLoginEnabled =
   process.env.KATO_ENABLE_LEGACY_CDP_LOGIN === "1" || process.env.XHS_LEGACY_CDP_LOGIN_ENABLED === "1";
 type OperationState = "running" | "completed" | "failed" | "cancelled";
@@ -423,7 +424,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     await fetchMcpJson("/api/v1/login/qrcode", 45_000);
     sendJson(res, 200, {
       opened: true,
-      viewerUrl: "/novnc/vnc.html?autoconnect=1&resize=scale&path=websockify",
+      viewerUrl: noVncViewerUrl,
       loginUrl: "https://www.xiaohongshu.com/explore"
     });
     return;

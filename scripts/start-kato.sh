@@ -24,6 +24,13 @@ cleanup() {
 
 trap cleanup INT TERM EXIT
 
+CHROME_USER="${XHS_CHROME_USER:-kato}"
+PROFILE_DIR="${XHS_PROFILE_DIR:-/app/mcp/xiaohongshu/data/profile}"
+mkdir -p /app/data /app/output /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images "$PROFILE_DIR"
+if id "$CHROME_USER" >/dev/null 2>&1; then
+  chown -R "$CHROME_USER:$CHROME_USER" /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images "$PROFILE_DIR" /home/"$CHROME_USER" 2>/dev/null || true
+fi
+
 export DISPLAY="${XHS_DISPLAY:-:99}"
 DISPLAY_SIZE="${XHS_DISPLAY_SIZE:-1440x980x24}"
 Xvfb "$DISPLAY" -screen 0 "$DISPLAY_SIZE" -ac +extension RANDR &

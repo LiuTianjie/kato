@@ -20,6 +20,8 @@ ENV NODE_ENV=production \
     XHS_NOVNC_PORT=6080 \
     XHS_PROFILE_DIR=/app/mcp/xiaohongshu/data/profile \
     COOKIES_PATH=/app/mcp/xiaohongshu/data/cookies.json \
+    XHS_CHROME_USER=kato \
+    XHS_CHROME_NO_SANDBOX=1 \
     PORT=4173 \
     XHS_SERVICE_PORT=18060
 
@@ -53,6 +55,9 @@ ENV LANG=zh_CN.UTF-8 \
 
 WORKDIR /app
 
+RUN groupadd --system kato \
+  && useradd --system --gid kato --home-dir /home/kato --create-home --shell /usr/sbin/nologin kato
+
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json package-lock.json ./
@@ -63,7 +68,8 @@ COPY scripts/start-kato.sh ./scripts/start-kato.sh
 COPY scripts/kato-chromium.sh /usr/local/bin/kato-chromium
 
 RUN chmod +x ./scripts/start-kato.sh /usr/local/bin/kato-chromium \
-  && mkdir -p /app/data /app/output /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images
+  && mkdir -p /app/data /app/output /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images \
+  && chown -R kato:kato /home/kato /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images
 
 EXPOSE 4173 18060
 

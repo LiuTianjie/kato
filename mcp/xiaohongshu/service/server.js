@@ -30,6 +30,7 @@ const COOKIE_FALLBACK_PATHS = uniquePaths([
   "/app/data/cookies.json"
 ]);
 const CHROMIUM_HEADLESS = process.env.XHS_CHROMIUM_HEADLESS === "1";
+const CHROME_NO_SANDBOX = process.env.XHS_CHROME_NO_SANDBOX === "1";
 const CDP_CONNECT_TIMEOUT_MS = normalizePositiveEnv("XHS_CDP_CONNECT_TIMEOUT_MS", 30_000);
 const BROWSER_STATUS_TIMEOUT_MS = normalizePositiveEnv("XHS_BROWSER_STATUS_TIMEOUT_MS", 2_000);
 const BROWSER_RESTART_TIMEOUT_MS = normalizePositiveEnv("XHS_BROWSER_RESTART_TIMEOUT_MS", 120_000);
@@ -372,7 +373,7 @@ async function launchContext() {
     BROWSER_BIN,
     [
       ...(CHROMIUM_HEADLESS ? ["--headless=new"] : []),
-      "--no-sandbox",
+      ...(CHROME_NO_SANDBOX ? ["--no-sandbox"] : []),
       "--disable-dev-shm-usage",
       "--disable-notifications",
       "--no-first-run",

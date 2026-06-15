@@ -5,6 +5,7 @@ import { appendClientLog } from "./logPanel.js";
 
 let connected = false;
 let viewerUrl = "";
+const DEFAULT_VIEWER_URL = "/novnc/vnc.html?autoconnect=1&resize=scale&path=novnc/websockify";
 
 export function bindCdpViewer() {
   $("connectCdpViewer").addEventListener("click", connectCdpViewer);
@@ -26,11 +27,11 @@ export async function connectCdpViewer() {
   appendClientLog("开始 · 连接容器浏览器远程画面");
   try {
     const result = await dashboardApi.openBrowserViewer();
-    viewerUrl = result.viewerUrl || "/novnc/vnc.html?autoconnect=1&resize=scale&path=websockify";
+    viewerUrl = result.viewerUrl || DEFAULT_VIEWER_URL;
     ensureViewerFrame(viewerUrl);
     setAddressValue(result.loginUrl || "https://www.xiaohongshu.com/explore");
-    setViewerStatus("远程画面已连接");
-    appendClientLog("成功 · 已连接容器浏览器远程画面");
+    setViewerStatus("noVNC 已打开");
+    appendClientLog("成功 · 已打开 noVNC 浏览器画面");
   } catch (error) {
     connected = false;
     setViewerStatus(`连接失败：${errorMessage(error)}`, true);
@@ -59,7 +60,7 @@ async function runBrowserAction(action, extra = {}) {
   try {
     await dashboardApi.sendBrowserViewerAction({ action, ...extra });
     if (action === "navigate") setAddressValue(extra.url || "");
-    setViewerStatus("远程画面已连接");
+    setViewerStatus("noVNC 已打开");
   } catch (error) {
     setViewerStatus(`操作失败：${errorMessage(error)}`, true);
   } finally {
