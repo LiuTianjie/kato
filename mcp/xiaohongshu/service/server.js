@@ -7,13 +7,17 @@ import { randomUUID } from "node:crypto";
 import { chromium } from "playwright-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 
+const SERVICE_LOG_LIMIT = normalizePositiveEnv("XHS_SERVICE_LOG_LIMIT", 600);
+let serviceLogSeq = 0;
+const serviceLogs = [];
+
 let stealthPluginReady = false;
 try {
   chromium.use(StealthPlugin());
   stealthPluginReady = true;
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
-  console.error(`Stealth plugin unavailable; using custom fingerprint fallback only: ${message}`);
+  serviceLog("warn", "stealth", `Stealth plugin unavailable; using custom fingerprint fallback only: ${message}`);
 }
 
 const PORT = Number(process.env.PORT || 18060);
@@ -38,6 +42,13 @@ const PROCESS_EXIT_GRACE_MS = normalizePositiveEnv("XHS_PROCESS_EXIT_GRACE_MS", 
 const HEALTH_ENSURE_TIMEOUT_MS = normalizePositiveEnv("XHS_HEALTH_ENSURE_TIMEOUT_MS", 20_000);
 const CDP_CONNECT_ATTEMPTS = normalizePositiveEnv("XHS_CDP_CONNECT_ATTEMPTS", 3);
 const BROWSER_TASK_TIMEOUT_MS = normalizePositiveEnv("XHS_BROWSER_TASK_TIMEOUT_MS", 180_000);
+const HUMAN_DELAY_ENABLED = process.env.XHS_HUMAN_DELAY_ENABLED !== "0";
+const BROWSER_TASK_DELAY_MIN_MS = normalizeNonNegativeEnv("XHS_BROWSER_TASK_DELAY_MIN_MS", 900);
+const BROWSER_TASK_DELAY_MAX_MS = normalizeDelayMax("XHS_BROWSER_TASK_DELAY_MAX_MS", 2_800, BROWSER_TASK_DELAY_MIN_MS);
+const BROWSER_ACTION_DELAY_MIN_MS = normalizeNonNegativeEnv("XHS_BROWSER_ACTION_DELAY_MIN_MS", 260);
+const BROWSER_ACTION_DELAY_MAX_MS = normalizeDelayMax("XHS_BROWSER_ACTION_DELAY_MAX_MS", 1_100, BROWSER_ACTION_DELAY_MIN_MS);
+const BROWSER_TYPE_DELAY_MIN_MS = normalizeNonNegativeEnv("XHS_BROWSER_TYPE_DELAY_MIN_MS", 45);
+const BROWSER_TYPE_DELAY_MAX_MS = normalizeDelayMax("XHS_BROWSER_TYPE_DELAY_MAX_MS", 135, BROWSER_TYPE_DELAY_MIN_MS);
 const STEALTH_PLUGIN_READY = stealthPluginReady;
 const BROWSER_VERSION = detectChromeVersion();
 const BROWSER_MAJOR_VERSION = process.env.XHS_BROWSER_MAJOR_VERSION || BROWSER_VERSION.major;
@@ -90,9 +101,86 @@ class BrowserTaskTimeoutError extends Error {
   }
 }
 
+function serviceLog(level, source, message, details) {
+  const entry = {
+    seq: ++serviceLogSeq,
+    time: new Date().toISOString(),
+    level,
+    source,
+    message: sanitizeLogText(message),
+    details: sanitizeLogDetails(details)
+  };
+  serviceLogs.push(entry);
+  while (serviceLogs.length > SERVICE_LOG_LIMIT) serviceLogs.shift();
+
+  const suffix = entry.details ? ` ${JSON.stringify(entry.details)}` : "";
+  const line = `[${entry.time}] [${entry.source}] ${entry.level.toUpperCase()} ${entry.message}${suffix}`;
+  if (level === "error" || level === "warn") console.error(line);
+  else console.log(line);
+}
+
+function serviceLogsSince(since, limit) {
+  const cursor = Number.isFinite(Number(since)) ? Math.max(0, Math.floor(Number(since))) : 0;
+  const max = Number.isFinite(Number(limit)) ? Math.max(1, Math.min(500, Math.floor(Number(limit)))) : 200;
+  return serviceLogs.filter((entry) => entry.seq > cursor).slice(-max);
+}
+
+function sanitizeLogText(value) {
+  return String(value || "")
+    .replace(/(xsec_token|xsecToken)=([^&\s]+)/gi, "$1=[redacted]")
+    .replace(/("?(?:xsec_token|xsecToken)"?\s*:\s*")([^"]+)(")/gi, "$1[redacted]$3")
+    .slice(0, 1000);
+}
+
+function sanitizeLogDetails(value) {
+  if (value === undefined) return undefined;
+  try {
+    return JSON.parse(JSON.stringify(value, (_key, item) => {
+      if (typeof item === "string") return sanitizeLogText(item);
+      return item;
+    }));
+  } catch {
+    return sanitizeLogText(value);
+  }
+}
+
+function captureProcessLog(source, level, chunk) {
+  String(chunk || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .forEach((line) => serviceLog(level, source, line));
+}
+
+function safeLogUrl(value) {
+  const text = String(value || "");
+  try {
+    const url = new URL(text);
+    for (const key of ["xsec_token", "xsecToken"]) {
+      if (url.searchParams.has(key)) url.searchParams.set(key, "[redacted]");
+    }
+    return url.toString().slice(0, 600);
+  } catch {
+    return sanitizeLogText(text).slice(0, 600);
+  }
+}
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+    if (req.method === "GET" && url.pathname === "/api/v1/browser/logs") {
+      const since = Number(url.searchParams.get("since") || 0);
+      const limit = Number(url.searchParams.get("limit") || 200);
+      sendJson(res, 200, {
+        success: true,
+        data: {
+          logs: serviceLogsSince(since, limit),
+          cursor: serviceLogSeq
+        }
+      });
+      return;
+    }
 
     if (req.method === "GET" && url.pathname === "/health") {
       const ensure = url.searchParams.get("ensure") === "1";
@@ -109,6 +197,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/api/v1/login/qrcode") {
+      serviceLog("info", "browser", "Open login/browser viewer requested.");
       await enqueueBrowserTask("login:qrcode", () => openLoginPage());
       sendJson(res, 200, { success: true, data: { opened: true, loginUrl: XHS_HOME_URL, viewer: "novnc" } });
       return;
@@ -116,6 +205,7 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/v1/browser/restart") {
       const body = await readJson(req);
+      serviceLog("warn", "browser", "Browser restart requested.", { reason: body.reason || "manual" });
       const data = await priorityRestartBrowser(`priority:${String(body.reason || "manual")}`);
       sendJson(res, 200, { success: true, data });
       return;
@@ -129,6 +219,7 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/v1/browser/sync-cookies") {
       const context = await ensureContext();
       const exportedCookies = await persistContextCookies(context, "manual-sync");
+      serviceLog("info", "cookies", "Browser cookies synced manually.", { exportedCookies });
       sendJson(res, 200, { success: true, data: { cookiesPath: COOKIES_PATH, exportedCookies } });
       return;
     }
@@ -208,12 +299,13 @@ const server = createServer(async (req, res) => {
     sendJson(res, 404, { success: false, error: { code: "NOT_FOUND", message: "Endpoint not found." } });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    serviceLog("error", "request", `${req.method || "GET"} ${req.url || "/"} failed: ${message}`);
     sendJson(res, 500, { success: false, error: { code: "INTERNAL_ERROR", message } });
   }
 });
 
 server.listen(PORT, () => {
-  console.log(`kato-xhs-browser listening on http://0.0.0.0:${PORT}`);
+  serviceLog("info", "service", `kato-xhs-browser listening on http://0.0.0.0:${PORT}`);
 });
 
 process.on("SIGINT", shutdown);
@@ -292,12 +384,14 @@ function enqueueBrowserTask(label, task, options = {}) {
     browserTaskPending = Math.max(0, browserTaskPending - 1);
     browserTaskActive = { id, label, startedAt: new Date().toISOString() };
     const waitedMs = Date.now() - queuedAt;
-    console.error(`Browser task #${id} started: ${label}; waited=${waitedMs}ms pending=${browserTaskPending}`);
+    serviceLog("info", "queue", `Browser task #${id} started: ${label}.`, { waitedMs, pending: browserTaskPending });
     try {
+      const jitterMs = await humanDelay(`task:${label}`, BROWSER_TASK_DELAY_MIN_MS, BROWSER_TASK_DELAY_MAX_MS, { log: true });
+      if (jitterMs > 0 && browserTaskActive?.id === id) browserTaskActive.delayMs = jitterMs;
       return await runBrowserTaskWithTimeout(label, task, timeoutMs);
     } finally {
       const activeMs = Date.now() - (queuedAt + waitedMs);
-      console.error(`Browser task #${id} finished: ${label}; active=${activeMs}ms pending=${browserTaskPending}`);
+      serviceLog("info", "queue", `Browser task #${id} finished: ${label}.`, { activeMs, pending: browserTaskPending });
       browserTaskActive = null;
     }
   };
@@ -339,7 +433,7 @@ async function runBrowserTaskWithTimeout(label, task, timeoutMs) {
 }
 
 async function resetBrowserAfterTaskTimeout(label) {
-  console.error(`Browser task timed out; resetting Chromium before next task: ${label}`);
+  serviceLog("warn", "queue", `Browser task timed out; resetting Chromium before next task: ${label}`);
   const oldContextPromise = contextPromise;
   const oldProcess = browserProcess;
   contextPromise = undefined;
@@ -394,10 +488,16 @@ async function launchContext() {
     { stdio: ["ignore", "pipe", "pipe"] }
   );
   browserProcess = spawned;
-  spawned.stdout?.on("data", (chunk) => process.stdout.write(chunk));
-  spawned.stderr?.on("data", (chunk) => process.stderr.write(chunk));
+  serviceLog("info", "chrome", "Starting Chrome process.", {
+    bin: BROWSER_BIN,
+    cdp: `${CDP_HOST}:${INTERNAL_CDP_PORT}`,
+    display: process.env.DISPLAY || "",
+    profileDir: PROFILE_DIR
+  });
+  spawned.stdout?.on("data", (chunk) => captureProcessLog("chrome", "info", chunk));
+  spawned.stderr?.on("data", (chunk) => captureProcessLog("chrome", "warn", chunk));
   spawned.on("exit", (code) => {
-    console.error(`Chromium exited with code ${code ?? "unknown"}`);
+    serviceLog("error", "chrome", `Chromium exited with code ${code ?? "unknown"}.`);
     if (browserProcess === spawned) {
       browserProcess = undefined;
       contextPromise = undefined;
@@ -418,7 +518,7 @@ async function launchContext() {
       page.setDefaultTimeout(30_000);
       applyPageFingerprint(page).catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
-        console.error(`Page fingerprint apply failed: ${message}`);
+        serviceLog("warn", "stealth", `Page fingerprint apply failed: ${message}`);
       });
     });
     await verifyContextReady(context);
@@ -495,7 +595,7 @@ async function configureContextFingerprint(context) {
     }
   ).catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`Context fingerprint init script failed: ${message}`);
+    serviceLog("warn", "stealth", `Context fingerprint init script failed: ${message}`);
   });
 
   await Promise.all(context.pages().map((page) => applyPageFingerprint(page)));
@@ -523,7 +623,7 @@ async function servicePage() {
       page.setDefaultTimeout(30_000);
       await applyPageFingerprint(page).catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
-        console.error(`Service page fingerprint apply failed: ${message}`);
+        serviceLog("warn", "stealth", `Service page fingerprint apply failed: ${message}`);
       });
       return page;
     })();
@@ -539,7 +639,7 @@ async function servicePage() {
 async function restartBrowser(reason = "manual") {
   if (restartPromise) return restartPromise;
   restartPromise = withTimeout((async () => {
-    console.error(`Restarting Chromium: ${reason}`);
+    serviceLog("warn", "browser", `Restarting Chromium: ${reason}`);
     const oldContextPromise = contextPromise;
     const oldProcess = browserProcess;
     contextPromise = undefined;
@@ -579,6 +679,7 @@ async function withBrowserRecovery(label, task) {
   } catch (error) {
     if (!isRecoverableBrowserError(error)) throw error;
     const message = error instanceof Error ? error.message : String(error);
+    serviceLog("warn", "browser", `Recoverable browser error in ${label}; restarting.`, { error: message.slice(0, 240) });
     await restartBrowser(`${label}: ${message.slice(0, 240)}`);
     return task();
   }
@@ -625,18 +726,34 @@ async function searchFeeds(keyword, limit, options = {}) {
   return withBrowserRecovery("searchFeeds", async () => {
     if (!keyword.trim()) return [];
     const pageNumber = normalizePositiveInt(options.page, 1);
+    serviceLog("info", "feeds", "Search feeds requested.", { keyword, limit, page: pageNumber });
     const page = await servicePage();
+    const capture = startPostResponseCapture(page);
     const url = new URL("https://www.xiaohongshu.com/search_result");
     url.searchParams.set("keyword", keyword);
     url.searchParams.set("source", "web_search_result_notes");
-    await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await page.waitForTimeout(3_000);
-    await autoScroll(page, Math.max(2, pageNumber + 1));
-    const posts = await scrapePosts(page);
+    let capturedPosts = [];
+    try {
+      await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: 60_000 });
+      await humanDelay("search:settle", 2_400, 5_200);
+      await autoScroll(page, Math.max(2, pageNumber + 1));
+    } finally {
+      capturedPosts = await capture.stop();
+    }
+    const posts = [...capturedPosts, ...(await scrapePosts(page))];
     const start = (pageNumber - 1) * limit;
     const unique = uniquePosts(posts);
     rememberPosts(unique);
-    return unique.slice(start, start + limit);
+    const result = unique.slice(start, start + limit);
+    serviceLog("info", "feeds", "Search feeds completed.", {
+      keyword,
+      page: pageNumber,
+      captured: capturedPosts.length,
+      scraped: unique.length,
+      returned: result.length,
+      currentUrl: safeLogUrl(page.url())
+    });
+    return result;
   });
 }
 
@@ -647,9 +764,14 @@ async function getFeedDetail(body) {
     if (isTokenRequiredForDetailUrl(url) && !xsecToken) {
       throw new Error(`xsec_token is required for XHS note detail: ${id || url}`);
     }
+    serviceLog("info", "detail", "Note detail requested.", {
+      id,
+      hasXsecToken: Boolean(xsecToken),
+      url: safeLogUrl(url)
+    });
     const page = await servicePage();
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await page.waitForTimeout(2_500);
+    const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await humanDelay("detail:settle", 2_100, 5_000);
     const detail = await page.evaluate(() => {
       const pick = (selectors) => {
         for (const selector of selectors) {
@@ -674,6 +796,17 @@ async function getFeedDetail(body) {
       };
     });
     const parsed = postFromUrl(url);
+    const finalUrl = page.url();
+    const looksBlockedOrMissing =
+      /\/404(?:\?|$)/.test(finalUrl) ||
+      /当前笔记暂时无法浏览|你访问的页面不见了|扫码查看|error_code=300031/.test(detail.text || "");
+    serviceLog(looksBlockedOrMissing ? "warn" : "info", "detail", "Note detail page loaded.", {
+      id: id || parsed.id,
+      status: response?.status?.(),
+      finalUrl: safeLogUrl(finalUrl),
+      title: cleanTitle(detail.title),
+      blockedOrMissing: looksBlockedOrMissing
+    });
     const result = {
       id: id || parsed.id,
       xsecToken: xsecToken || parsed.xsecToken,
@@ -693,8 +826,9 @@ async function postComment(body) {
   const post = await getFeedDetail(body);
   const page = await servicePage();
   await focusCommentEditor(page);
-  await page.keyboard.insertText(content);
-  await page.waitForTimeout(500);
+  await humanDelay("comment:before-type", 450, 1_400);
+  await humanType(page, content);
+  await humanDelay("comment:before-submit", 700, 1_900);
   const clicked = await clickFirstVisible(page, [
     "button:has-text('发送')",
     "button:has-text('发布')",
@@ -708,6 +842,7 @@ async function postComment(body) {
 async function likeFeed(body) {
   const post = await getFeedDetail(body);
   const page = await servicePage();
+  await humanDelay("like:before-click", 550, 1_600);
   const clicked = await clickFirstVisible(page, [
     "[aria-label*='点赞']",
     "button:has-text('点赞')",
@@ -813,6 +948,7 @@ async function focusCommentEditor(page) {
   for (const selector of selectors) {
     const locator = page.locator(selector).last();
     if ((await locator.count()) > 0 && (await locator.isVisible().catch(() => false))) {
+      await humanDelay("focus:comment-editor", BROWSER_ACTION_DELAY_MIN_MS, BROWSER_ACTION_DELAY_MAX_MS);
       await locator.click();
       return;
     }
@@ -824,6 +960,7 @@ async function clickFirstVisible(page, selectors) {
   for (const selector of selectors) {
     const locator = page.locator(selector).last();
     if ((await locator.count()) > 0 && (await locator.isVisible().catch(() => false))) {
+      await humanDelay("click:visible", BROWSER_ACTION_DELAY_MIN_MS, BROWSER_ACTION_DELAY_MAX_MS);
       await locator.click({ timeout: 5_000 }).catch(() => undefined);
       return true;
     }
@@ -860,12 +997,142 @@ async function scrapePosts(page) {
 
 async function getFeedComments(body, limit, options = {}) {
   return withBrowserRecovery("getFeedComments", async () => {
+    const detailInput = normalizeDetailInput(body);
+    const index = normalizeCursorIndex(options.index, options.cursor, 0);
+    serviceLog("info", "comments", "Note comments requested.", {
+      id: detailInput.id,
+      hasXsecToken: Boolean(detailInput.xsecToken),
+      limit,
+      index
+    });
     await getFeedDetail(body);
     const page = await servicePage();
-    const index = normalizeCursorIndex(options.index, options.cursor, 0);
+    await humanDelay("comments:before-scroll", 700, 1_800);
     await autoScroll(page, Math.max(3, index + 3));
-    return uniqueComments(await scrapeComments(page), limit, index * limit);
+    const scraped = await scrapeComments(page);
+    const comments = uniqueComments(scraped, limit, index * limit);
+    serviceLog("info", "comments", "Note comments completed.", {
+      id: detailInput.id,
+      index,
+      scraped: scraped.length,
+      returned: comments.length,
+      currentUrl: safeLogUrl(page.url())
+    });
+    return comments;
   });
+}
+
+function startPostResponseCapture(page) {
+  const posts = [];
+  const jobs = [];
+  const handler = (response) => {
+    const url = response.url();
+    if (!isLikelyXhsJsonResponse(url)) return;
+    const job = (async () => {
+      try {
+        const payload = await response.json();
+        posts.push(...extractPostsFromPayload(payload));
+      } catch {
+        // Non-JSON or already-consumed responses are expected on some XHS resources.
+      }
+    })();
+    jobs.push(job);
+  };
+  page.on("response", handler);
+  return {
+    async stop() {
+      page.off("response", handler);
+      await Promise.allSettled(jobs);
+      return posts;
+    }
+  };
+}
+
+function isLikelyXhsJsonResponse(url) {
+  return /xiaohongshu\.com|xhscdn\.com|edith\.xiaohongshu\.com/i.test(url) && /\/api\/|search|feed|note/i.test(url);
+}
+
+function extractPostsFromPayload(payload) {
+  const result = [];
+  const seen = new Set();
+  walkPayload(payload, (item) => {
+    const post = postFromPayloadItem(item);
+    if (!post?.id || seen.has(post.id)) return;
+    seen.add(post.id);
+    result.push(post);
+  });
+  return result.slice(0, 300);
+}
+
+function walkPayload(value, visit, seen = new Set(), depth = 0) {
+  if (!value || typeof value !== "object" || depth > 10 || seen.has(value)) return;
+  seen.add(value);
+  if (!Array.isArray(value)) visit(value);
+  const children = Array.isArray(value) ? value : Object.values(value);
+  for (const child of children) walkPayload(child, visit, seen, depth + 1);
+}
+
+function postFromPayloadItem(item) {
+  const noteCard = objectValue(item.note_card) || objectValue(item.noteCard);
+  const note = objectValue(item.note) || noteCard || item;
+  const user = objectValue(note.user) || objectValue(item.user) || {};
+  const interactInfo =
+    objectValue(note.interact_info) ||
+    objectValue(note.interactInfo) ||
+    objectValue(item.interact_info) ||
+    objectValue(item.interactInfo) ||
+    {};
+  const id = firstText(
+    item.id,
+    item.note_id,
+    item.noteId,
+    item.feed_id,
+    item.feedId,
+    note.note_id,
+    note.noteId,
+    note.id
+  );
+  const xsecToken = firstText(item.xsec_token, item.xsecToken, note.xsec_token, note.xsecToken);
+  const title = firstText(
+    item.title,
+    item.display_title,
+    item.displayTitle,
+    note.title,
+    note.display_title,
+    note.displayTitle,
+    noteCard?.display_title,
+    noteCard?.displayTitle
+  );
+  const snippet = firstText(item.desc, item.description, item.content, note.desc, note.description, title);
+  const url = normalizeXhsDetailUrl(firstText(item.url, item.link, note.url, note.link), id, xsecToken);
+  if (!id || (!title && !snippet && !xsecToken)) return null;
+  return {
+    id,
+    url,
+    title: title || snippet || "小红书笔记",
+    snippet: snippet || title || "",
+    author: firstText(user.nickname, user.nickName, user.name, item.author),
+    xsecToken: xsecToken || undefined,
+    likeCount: toOptionalCount(interactInfo.liked_count ?? interactInfo.likedCount ?? interactInfo.like_count ?? interactInfo.likeCount),
+    commentCount: toOptionalCount(interactInfo.comment_count ?? interactInfo.commentCount)
+  };
+}
+
+function objectValue(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+}
+
+function firstText(...values) {
+  for (const value of values) {
+    const text = String(value ?? "").trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function toOptionalCount(value) {
+  const numberValue = Number(String(value ?? "").replace(/[^\d.]/g, ""));
+  return Number.isFinite(numberValue) ? numberValue : undefined;
 }
 
 async function scrapeComments(page) {
@@ -994,27 +1261,53 @@ function uniqueComments(comments, limit, offset = 0) {
 
 async function autoScroll(page, steps) {
   for (let i = 0; i < steps; i += 1) {
-    await page.mouse.wheel(0, 900).catch(() => undefined);
-    await page.waitForTimeout(800);
+    await humanDelay("scroll:pre", 180, 620);
+    await page.mouse.wheel(randomBetween(-18, 18), randomBetween(520, 1_180)).catch(() => undefined);
+    await humanDelay("scroll:settle", 650, 1_650);
+  }
+}
+
+async function humanType(page, content) {
+  const delayMs = randomBetween(BROWSER_TYPE_DELAY_MIN_MS, BROWSER_TYPE_DELAY_MAX_MS);
+  try {
+    await page.keyboard.type(content, { delay: delayMs });
+  } catch {
+    await page.keyboard.insertText(content);
   }
 }
 
 function uniquePosts(posts) {
-  const seen = new Set();
+  const byId = new Map();
   const result = [];
   for (const post of posts) {
-    if (!post.id || !post.url || seen.has(post.id)) continue;
-    seen.add(post.id);
-    result.push({
+    if (!post.id || !post.url) continue;
+    const normalizedUrl = normalizeXhsDetailUrl(post.url, post.id, post.xsecToken);
+    const parsed = postFromUrl(normalizedUrl);
+    const normalized = {
       id: post.id,
-      url: post.url,
+      url: normalizedUrl,
       title: post.title || "小红书笔记",
       snippet: post.snippet || post.title || "",
       author: post.author || undefined,
-      xsecToken: post.xsecToken || undefined,
+      xsecToken: post.xsecToken || parsed.xsecToken || undefined,
       likeCount: post.likeCount,
       commentCount: post.commentCount
-    });
+    };
+    const existing = byId.get(post.id);
+    if (!existing) {
+      byId.set(post.id, normalized);
+      result.push(normalized);
+      continue;
+    }
+    if (!existing.xsecToken && normalized.xsecToken) {
+      existing.xsecToken = normalized.xsecToken;
+      existing.url = normalizeXhsDetailUrl(existing.url || normalized.url, existing.id, normalized.xsecToken);
+    }
+    if ((!existing.title || existing.title === "小红书笔记") && normalized.title) existing.title = normalized.title;
+    if (!existing.snippet && normalized.snippet) existing.snippet = normalized.snippet;
+    if (!existing.author && normalized.author) existing.author = normalized.author;
+    if (existing.likeCount == null && normalized.likeCount != null) existing.likeCount = normalized.likeCount;
+    if (existing.commentCount == null && normalized.commentCount != null) existing.commentCount = normalized.commentCount;
   }
   return result;
 }
@@ -1034,7 +1327,7 @@ async function loadCookies(context) {
       const cookies = JSON.parse(text);
       if (Array.isArray(cookies) && cookies.length) {
         await context.addCookies(cookies);
-        console.error(`Loaded ${cookies.length} XHS cookies from ${cookiesPath}`);
+        serviceLog("info", "cookies", `Loaded ${cookies.length} XHS cookies.`, { cookiesPath });
         if (cookiesPath !== COOKIES_PATH) await persistCookies(cookies, "migrate");
         return;
       }
@@ -1042,7 +1335,7 @@ async function loadCookies(context) {
       // try next cookie path
     }
   }
-  console.error(`No exported XHS cookies found in ${COOKIE_FALLBACK_PATHS.join(", ")}`);
+  serviceLog("warn", "cookies", "No exported XHS cookies found.", { paths: COOKIE_FALLBACK_PATHS });
 }
 
 async function persistContextCookies(context, reason = "auto") {
@@ -1066,7 +1359,7 @@ async function persistCookies(cookies, reason = "manual") {
       }
     })
   );
-  console.error(`Persisted ${cookies.length} XHS cookies (${reason}) to ${COOKIES_PATH}`);
+  serviceLog("info", "cookies", `Persisted ${cookies.length} XHS cookies.`, { reason, cookiesPath: COOKIES_PATH });
 }
 
 function startCookieAutoPersist(context) {
@@ -1074,7 +1367,7 @@ function startCookieAutoPersist(context) {
   cookiePersistTimer = setInterval(() => {
     persistContextCookies(context, "auto").catch((error) => {
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`Cookie auto persist failed: ${message}`);
+      serviceLog("warn", "cookies", `Cookie auto persist failed: ${message}`);
     });
   }, 15_000);
   cookiePersistTimer.unref?.();
@@ -1255,7 +1548,7 @@ async function connectBrowserOverCdp() {
     } catch (error) {
       lastError = error;
       const message = error instanceof Error ? error.message : String(error);
-      console.error(`CDP connect attempt ${attempt}/${CDP_CONNECT_ATTEMPTS} failed: ${message}`);
+      serviceLog("warn", "cdp", `CDP connect attempt ${attempt}/${CDP_CONNECT_ATTEMPTS} failed: ${message}`);
       if (attempt < CDP_CONNECT_ATTEMPTS) await delay(1_000 * attempt);
     }
   }
@@ -1294,6 +1587,22 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function humanDelay(label, minMs = BROWSER_ACTION_DELAY_MIN_MS, maxMs = BROWSER_ACTION_DELAY_MAX_MS, options = {}) {
+  if (!HUMAN_DELAY_ENABLED) return 0;
+  const durationMs = randomBetween(minMs, maxMs);
+  if (durationMs <= 0) return 0;
+  if (options.log) serviceLog("info", "human-delay", `Waiting before ${label}.`, { durationMs });
+  await delay(durationMs);
+  return durationMs;
+}
+
+function randomBetween(minMs, maxMs) {
+  const min = Math.max(0, Math.floor(Number(minMs) || 0));
+  const max = Math.max(min, Math.floor(Number(maxMs) || min));
+  if (max <= min) return min;
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
 function withTimeout(promise, timeoutMs, message) {
   if (!promise) return Promise.resolve(undefined);
   let timer;
@@ -1305,11 +1614,11 @@ function withTimeout(promise, timeoutMs, message) {
 
 function terminateProcess(processRef, reason) {
   if (!processRef || processRef.killed) return;
-  console.error(`Terminating Chromium process: ${reason}`);
+  serviceLog("warn", "chrome", `Terminating Chromium process: ${reason}`);
   processRef.kill("SIGTERM");
   setTimeout(() => {
     if (processRef.exitCode === null && processRef.signalCode === null) {
-      console.error("Chromium did not exit after SIGTERM; sending SIGKILL");
+      serviceLog("error", "chrome", "Chromium did not exit after SIGTERM; sending SIGKILL.");
       processRef.kill("SIGKILL");
     }
   }, PROCESS_EXIT_GRACE_MS).unref();
@@ -1330,6 +1639,16 @@ function normalizePositiveEnv(name, fallback) {
   const value = Number(process.env[name] || fallback);
   if (!Number.isFinite(value) || value <= 0) return fallback;
   return Math.floor(value);
+}
+
+function normalizeNonNegativeEnv(name, fallback) {
+  const value = Number(process.env[name] ?? fallback);
+  if (!Number.isFinite(value) || value < 0) return fallback;
+  return Math.floor(value);
+}
+
+function normalizeDelayMax(name, fallback, min) {
+  return Math.max(min, normalizeNonNegativeEnv(name, fallback));
 }
 
 function detectChromeVersion() {
@@ -1365,9 +1684,9 @@ function startCdpProxy() {
     client.on("error", close);
     upstream.on("error", close);
   });
-  proxy.on("error", (error) => console.error(`CDP proxy error: ${error.message}`));
+  proxy.on("error", (error) => serviceLog("error", "cdp", `CDP proxy error: ${error.message}`));
   proxy.listen(CDP_PORT, "127.0.0.1", () => {
-    console.log(`CDP proxy listening on 127.0.0.1:${CDP_PORT} -> 127.0.0.1:${INTERNAL_CDP_PORT}`);
+    serviceLog("info", "cdp", `CDP proxy listening on 127.0.0.1:${CDP_PORT} -> 127.0.0.1:${INTERNAL_CDP_PORT}`);
   });
 }
 

@@ -122,6 +122,9 @@ test("serverx-compatible XHS API exposes search and detail payloads", async () =
     assert.equal(search.payload.data.length, 1);
     assert.equal(search.payload.data[0].note_id, "post-1");
     assert.equal(search.payload.data[0].xsec_token, "token-1");
+    assert.equal(new URL(search.payload.data[0].url).searchParams.get("xsec_token"), "token-1");
+    assert.equal(new URL(search.payload.data[0].source_url).searchParams.get("xsec_token"), "token-1");
+    assert.equal(search.payload.data[0].note.xsec_token, "token-1");
     assert.equal(search.payload.data[0].user.nickname, "作者A");
     assert.deepEqual(search.payload.data[0].comments, []);
 
@@ -135,6 +138,8 @@ test("serverx-compatible XHS API exposes search and detail payloads", async () =
     assert.equal(detail.status, 200);
     assert.equal(detail.payload.success, true);
     assert.equal(detail.payload.data.note_id, "post-1");
+    assert.equal(detail.payload.data.xsec_token, "token-1");
+    assert.equal(new URL(detail.payload.data.url).searchParams.get("xsec_token"), "token-1");
     assert.equal(detail.payload.data.desc, "这里讨论 AI工具 和效率工作流");
     assert.equal(detail.payload.data.comment_count, 2);
   } finally {

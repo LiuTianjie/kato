@@ -55,6 +55,38 @@ test("http adapter parses XHS browser service REST search data.feeds responses",
   }
 });
 
+test("http adapter derives xsec_token from post URL when field is omitted", async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        success: true,
+        data: {
+          feeds: [
+            {
+              id: "feed-url-token",
+              url: "https://www.xiaohongshu.com/explore/feed-url-token?xsec_token=url-token",
+              noteCard: {
+                displayTitle: "URL token result"
+              }
+            }
+          ]
+        }
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+
+  try {
+    const adapter = createXhsAdapter(httpConfig());
+    const posts = await adapter.searchPosts("AI工具", 5);
+    assert.equal(posts[0].xsecToken, "url-token");
+    assert.equal(new URL(posts[0].url).searchParams.get("xsec_token"), "url-token");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("http adapter publishes plain comment text through REST without related note metadata", async () => {
   const originalFetch = globalThis.fetch;
   const calls: Array<{ url: string; body: Record<string, unknown> }> = [];

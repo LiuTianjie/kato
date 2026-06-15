@@ -703,8 +703,9 @@ function normalizePostShape(item: Partial<XhsPost> & Record<string, unknown>): P
     | Record<string, unknown>
     | undefined;
   const id = String(item.id ?? note?.noteId ?? item.noteId ?? "");
-  const xsecToken = String(item.xsecToken ?? note?.xsecToken ?? item.xsec_token ?? "");
-  const url = normalizeXhsUrl(String(item.url ?? ""), id, xsecToken);
+  const rawUrl = String(item.url ?? "");
+  const xsecToken = String(item.xsecToken ?? note?.xsecToken ?? item.xsec_token ?? extractXsecToken(rawUrl) ?? "");
+  const url = normalizeXhsUrl(rawUrl, id, xsecToken);
   return {
     ...item,
     id,
@@ -742,6 +743,14 @@ function normalizeXhsUrl(rawUrl: string, id: string, xsecToken: string): string 
     return url.toString();
   } catch {
     return fallback;
+  }
+}
+
+function extractXsecToken(rawUrl: string): string {
+  try {
+    return new URL(normalizeUrlCandidate(rawUrl.trim())).searchParams.get("xsec_token") ?? "";
+  } catch {
+    return "";
   }
 }
 
