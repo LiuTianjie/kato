@@ -1,3 +1,0 @@
-services:
-  kato:
-    platform: linux/arm64

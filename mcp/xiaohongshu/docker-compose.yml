@@ -4,6 +4,7 @@ services:
       context: ../..
       dockerfile: Dockerfile
     image: local/kato:latest
+    platform: linux/amd64
     container_name: kato
     restart: unless-stopped
     tty: true
