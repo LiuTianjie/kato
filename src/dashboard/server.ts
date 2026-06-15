@@ -608,21 +608,31 @@ function ensureGeneratedPersona(profileName?: string, logger?: { log(message: st
 
 async function fetchMcpJson(endpoint: string): Promise<unknown> {
   const base = config.xhs.mcp?.url ? new URL(config.xhs.mcp.url).origin : "http://localhost:18060";
-  const response = await fetch(`${base}${endpoint}`);
+  const response = await fetchWithTimeout(`${base}${endpoint}`, {}, 20_000);
   return response.json();
 }
 
 async function postMcpJson(endpoint: string, body: Record<string, unknown>): Promise<unknown> {
   const base = config.xhs.mcp?.url ? new URL(config.xhs.mcp.url).origin : "http://localhost:18060";
-  const response = await fetch(`${base}${endpoint}`, {
+  const response = await fetchWithTimeout(`${base}${endpoint}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
-  });
+  }, 35_000);
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
   if (!response.ok) throw new Error(`MCP ${endpoint} failed: HTTP ${response.status}`);
   return data;
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function contentType(filePath: string): string {

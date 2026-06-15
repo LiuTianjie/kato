@@ -14,6 +14,10 @@ const INTERNAL_CDP_PORT = Number(process.env.XHS_INTERNAL_CDP_PORT || CDP_PORT +
 const PROFILE_DIR = process.env.XHS_PROFILE_DIR || "/app/data/profile";
 const COOKIES_PATH = process.env.COOKIES_PATH || "/app/data/cookies.json";
 const CHROMIUM_HEADLESS = process.env.XHS_CHROMIUM_HEADLESS === "1";
+const CDP_CONNECT_TIMEOUT_MS = normalizePositiveEnv("XHS_CDP_CONNECT_TIMEOUT_MS", 12_000);
+const BROWSER_STATUS_TIMEOUT_MS = normalizePositiveEnv("XHS_BROWSER_STATUS_TIMEOUT_MS", 2_000);
+const BROWSER_RESTART_TIMEOUT_MS = normalizePositiveEnv("XHS_BROWSER_RESTART_TIMEOUT_MS", 25_000);
+const PROCESS_EXIT_GRACE_MS = normalizePositiveEnv("XHS_PROCESS_EXIT_GRACE_MS", 2_000);
 const XHS_HOME_URL = "https://www.xiaohongshu.com/explore";
 const XHS_CREATOR_URL = "https://creator.xiaohongshu.com";
 
@@ -148,7 +152,7 @@ async function shutdown() {
 async function browserSummary() {
   if (!contextPromise) return { running: false, cdpUrl: cdpUrl() };
   try {
-    const context = await contextPromise;
+    const context = await withTimeout(contextPromise, BROWSER_STATUS_TIMEOUT_MS, "Browser status timed out.");
     return { running: true, pages: context.pages().length, cdpUrl: cdpUrl() };
   } catch (error) {
     return {
@@ -206,15 +210,25 @@ async function launchContext() {
     }
   });
 
-  startCdpProxy();
-  await waitForCdpHttp();
-  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${INTERNAL_CDP_PORT}`);
-  const context = browser.contexts()[0] || (await browser.newContext({ viewport: { width: 1440, height: 980 }, locale: "zh-CN" }));
-  await loadCookies(context);
-  context.on("page", (page) => {
-    page.setDefaultTimeout(30_000);
-  });
-  return context;
+  try {
+    startCdpProxy();
+    await waitForCdpHttp();
+    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${INTERNAL_CDP_PORT}`, {
+      timeout: CDP_CONNECT_TIMEOUT_MS
+    });
+    const context = browser.contexts()[0] || (await browser.newContext({ viewport: { width: 1440, height: 980 }, locale: "zh-CN" }));
+    await loadCookies(context);
+    context.on("page", (page) => {
+      page.setDefaultTimeout(30_000);
+    });
+    return context;
+  } catch (error) {
+    if (browserProcess === spawned) {
+      terminateProcess(spawned, "launch failed");
+      browserProcess = undefined;
+    }
+    throw error;
+  }
 }
 
 async function clearStaleProfileLocks() {
@@ -244,32 +258,32 @@ async function servicePage() {
 
 async function restartBrowser(reason = "manual") {
   if (restartPromise) return restartPromise;
-  restartPromise = (async () => {
+  restartPromise = withTimeout((async () => {
     console.error(`Restarting Chromium: ${reason}`);
     const oldContextPromise = contextPromise;
     const oldProcess = browserProcess;
     contextPromise = undefined;
     servicePagePromise = undefined;
-    try {
-      const context = oldContextPromise ? await oldContextPromise.catch(() => undefined) : undefined;
-      await context?.browser()?.close().catch(() => undefined);
-    } finally {
-      if (oldProcess && !oldProcess.killed) {
-        oldProcess.kill("SIGTERM");
-        setTimeout(() => {
-          if (oldProcess.exitCode === null && oldProcess.signalCode === null) oldProcess.kill("SIGKILL");
-        }, 2_000).unref();
-      }
-      if (browserProcess === oldProcess) browserProcess = undefined;
+
+    if (oldProcess) {
+      terminateProcess(oldProcess, reason);
+      await waitForProcessExit(oldProcess, PROCESS_EXIT_GRACE_MS + 500).catch(() => undefined);
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    if (browserProcess === oldProcess) browserProcess = undefined;
+
+    if (oldContextPromise) {
+      const context = await withTimeout(oldContextPromise, 1_500, "Old browser context close timed out.").catch(() => undefined);
+      await withTimeout(context?.browser()?.close(), 1_500, "Old browser close timed out.").catch(() => undefined);
+    }
+
+    await delay(500);
     await ensureContext();
     return {
       restarted: true,
       reason,
       browser: await browserSummary()
     };
-  })().finally(() => {
+  })(), BROWSER_RESTART_TIMEOUT_MS, "Browser restart timed out.").finally(() => {
     restartPromise = undefined;
   });
   return restartPromise;
@@ -288,28 +302,32 @@ async function withBrowserRecovery(label, task) {
 
 function isRecoverableBrowserError(error) {
   const message = error instanceof Error ? error.message : String(error);
-  return /Page crashed|Page\.getLayoutMetrics|Target closed|Browser has been closed|Execution context was destroyed|Protocol error|CDP/i.test(
+  return /Page crashed|Page\.getLayoutMetrics|Target closed|Browser has been closed|Execution context was destroyed|Protocol error|connectOverCDP|CDP|timed out/i.test(
     message
   );
 }
 
 async function openLoginPage() {
-  const page = await servicePage();
-  await page.goto(XHS_HOME_URL, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
-  await page.bringToFront().catch(() => undefined);
+  return withBrowserRecovery("openLoginPage", async () => {
+    const page = await servicePage();
+    await page.goto(XHS_HOME_URL, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
+    await page.bringToFront().catch(() => undefined);
+  });
 }
 
 async function loginStatus() {
-  const context = await ensureContext();
-  const cookies = await context.cookies();
-  const xhsCookies = cookies.filter((cookie) => /xiaohongshu|xhs|rednote/i.test(cookie.domain));
-  await persistCookies(xhsCookies);
-  return {
-    is_logged_in: xhsCookies.some((cookie) => ["web_session", "id_token"].includes(cookie.name) && cookie.value),
-    username: await readVisibleUsername().catch(() => ""),
-    cookie_count: xhsCookies.length,
-    cdp_url: cdpUrl()
-  };
+  return withBrowserRecovery("loginStatus", async () => {
+    const context = await ensureContext();
+    const cookies = await context.cookies();
+    const xhsCookies = cookies.filter((cookie) => /xiaohongshu|xhs|rednote/i.test(cookie.domain));
+    await persistCookies(xhsCookies);
+    return {
+      is_logged_in: xhsCookies.some((cookie) => ["web_session", "id_token"].includes(cookie.name) && cookie.value),
+      username: await readVisibleUsername().catch(() => ""),
+      cookie_count: xhsCookies.length,
+      cdp_url: cdpUrl()
+    };
+  });
 }
 
 async function currentUserSummary() {
@@ -822,6 +840,48 @@ async function waitForCdpHttp(timeoutMs = 15_000) {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(`Chromium CDP port ${INTERNAL_CDP_PORT} did not become ready.`);
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  if (!promise) return Promise.resolve(undefined);
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function terminateProcess(processRef, reason) {
+  if (!processRef || processRef.killed) return;
+  console.error(`Terminating Chromium process: ${reason}`);
+  processRef.kill("SIGTERM");
+  setTimeout(() => {
+    if (processRef.exitCode === null && processRef.signalCode === null) {
+      console.error("Chromium did not exit after SIGTERM; sending SIGKILL");
+      processRef.kill("SIGKILL");
+    }
+  }, PROCESS_EXIT_GRACE_MS).unref();
+}
+
+function waitForProcessExit(processRef, timeoutMs) {
+  if (!processRef || processRef.exitCode !== null || processRef.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timeout = setTimeout(resolve, timeoutMs);
+    processRef.once("exit", () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+  });
+}
+
+function normalizePositiveEnv(name, fallback) {
+  const value = Number(process.env[name] || fallback);
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.floor(value);
 }
 
 function startCdpProxy() {

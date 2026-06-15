@@ -53,7 +53,7 @@ RUN chmod +x ./scripts/start-kato.sh /usr/local/bin/kato-chromium \
 EXPOSE 4173 18060 9223
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 4173) + '/api/dashboard').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+  CMD node -e "const urls=['http://127.0.0.1:'+(process.env.PORT||4173)+'/api/dashboard','http://127.0.0.1:'+(process.env.XHS_SERVICE_PORT||18060)+'/health']; Promise.all(urls.map((url)=>fetch(url,{signal:AbortSignal.timeout(4000)}).then((r)=>{if(!r.ok) throw new Error(url+' '+r.status)}))).then(()=>process.exit(0)).catch((e)=>{console.error(e.message);process.exit(1)})"
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["./scripts/start-kato.sh"]

@@ -1,4 +1,4 @@
-import { getDefaultCdpPort, openCdpLoginWindow } from "./cdpLogin.js";
+import { getDefaultCdpPort, openCdpLoginWindow, restartContainerBrowser } from "./cdpLogin.js";
 import type { AppConfig } from "../config.js";
 
 const DEFAULT_HOST = "127.0.0.1";
@@ -41,7 +41,7 @@ export async function getCdpLoginTarget(
   if (options.ensure && !(await isCdpOpen(port))) {
     await openCdpLoginWindow(config, { port });
   }
-  const target = await findPageTarget(port, true);
+  const target = await findUsablePageTarget(config, port, options.ensure === true);
   const viewport = await getViewport(target.webSocketDebuggerUrl);
   return {
     id: target.id ?? "",
@@ -60,7 +60,7 @@ export async function captureCdpLoginFrame(
   if (options.ensure && !(await isCdpOpen(port))) {
     await openCdpLoginWindow(config, { port });
   }
-  const target = await findPageTarget(port, true);
+  const target = await findUsablePageTarget(config, port, options.ensure === true);
   if (options.width || options.height) {
     await setViewport(target.webSocketDebuggerUrl, options.width, options.height);
   }
@@ -196,7 +196,7 @@ export async function streamCdpBrowserFrames(config: AppConfig, options: Screenc
   if (options.ensure && !(await isCdpOpen(port))) {
     await openCdpLoginWindow(config, { port });
   }
-  let target = await findPageTarget(port, true);
+  let target = await findUsablePageTarget(config, port, options.ensure === true);
   if (options.width || options.height) {
     await setViewport(target.webSocketDebuggerUrl, options.width, options.height);
   }
@@ -297,6 +297,24 @@ async function isCdpOpen(port: number): Promise<boolean> {
   return Boolean(response?.ok);
 }
 
+async function findUsablePageTarget(
+  config: AppConfig,
+  port: number,
+  allowRestart: boolean
+): Promise<Required<Pick<CdpTarget, "webSocketDebuggerUrl">> & CdpTarget> {
+  try {
+    const target = await findPageTarget(port, true);
+    await getViewport(target.webSocketDebuggerUrl);
+    return target;
+  } catch (error) {
+    if (!allowRestart || !isRecoverableCdpError(error)) throw error;
+    await restartContainerBrowser(config, `cdp-remote: ${errorMessage(error).slice(0, 180)}`, port);
+    const target = await findPageTarget(port, true);
+    await getViewport(target.webSocketDebuggerUrl);
+    return target;
+  }
+}
+
 async function findPageTarget(port: number, createIfMissing: boolean): Promise<Required<Pick<CdpTarget, "webSocketDebuggerUrl">> & CdpTarget> {
   const targets = await fetchTargets(port);
   let page =
@@ -312,6 +330,16 @@ async function findPageTarget(port: number, createIfMissing: boolean): Promise<R
 
   if (!page?.webSocketDebuggerUrl) throw new Error("找不到可视化用的容器 Chromium 页面。");
   return { ...page, webSocketDebuggerUrl: normalizeWebSocketUrl(page.webSocketDebuggerUrl) };
+}
+
+function isRecoverableCdpError(error: unknown): boolean {
+  return /Target page, context or browser has been closed|Target closed|Page\.getLayoutMetrics|CDP .*超时|WebSocket|ECONNREFUSED|Failed to fetch|已关闭|closed|timeout/i.test(
+    errorMessage(error)
+  );
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function fetchTargets(port: number): Promise<CdpTarget[]> {

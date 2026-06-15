@@ -43,8 +43,7 @@ export async function openCdpLoginWindow(config: AppConfig, options: CdpLoginOpt
   let restarted = false;
 
   if (alreadyRunning && options.restart) {
-    await closeBrowser(port);
-    await waitForCdp(port, false, 5_000);
+    await restartContainerBrowser(config, "cdp-login", port);
     alreadyRunning = false;
     restarted = true;
   }
@@ -78,6 +77,28 @@ export async function openCdpLoginWindow(config: AppConfig, options: CdpLoginOpt
   }
 
   return result;
+}
+
+export async function restartContainerBrowser(config: AppConfig, reason = "manual", port = getDefaultCdpPort()): Promise<unknown> {
+  const mcpBaseUrl = getMcpRestBaseUrl(config);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30_000);
+  try {
+    const response = await fetch(`${mcpBaseUrl}/api/v1/browser/restart`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+      signal: controller.signal
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(`Kato 容器浏览器重启失败：HTTP ${response.status} ${JSON.stringify(payload)}`);
+    }
+    await waitForCdp(port, true, 15_000);
+    return payload;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export async function syncCdpCookiesToMcp(
