@@ -59,7 +59,7 @@ const server = createServer(async (req, res) => {
       const body = await readJson(req);
       const status = await ensureRuntimeReady();
       const targetUrl = normalizeViewerUrl(String(body.url || ""));
-      if (targetUrl) await navigateWithXdotool(targetUrl);
+      if (targetUrl) await navigateViewerUrl(targetUrl);
       sendJson(res, 200, {
         success: true,
         data: {
@@ -296,7 +296,7 @@ async function restartBrowser(reason = "manual") {
 async function runBrowserAction(body) {
   const action = String(body.action || "");
   if (action === "navigate") {
-    await navigateWithXdotool(normalizeViewerUrl(String(body.url || "")));
+    await navigateViewerUrl(normalizeViewerUrl(String(body.url || "")));
     return;
   }
   if (action === "back") {
@@ -312,6 +312,37 @@ async function runBrowserAction(body) {
     return;
   }
   throw new Error("Unsupported browser action.");
+}
+
+async function navigateViewerUrl(url) {
+  if (!url) return;
+  try {
+    await navigateWithCdp(url);
+    return;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    serviceLog("warn", "browser", `CDP viewer navigation failed; falling back to keyboard navigation: ${message}`, { url });
+  }
+  await navigateWithXdotool(url);
+}
+
+async function navigateWithCdp(url) {
+  const targets = await fetchJson(`http://127.0.0.1:${CDP_PORT}/json/list`);
+  const pages = Array.isArray(targets) ? targets.filter((item) => item?.type === "page" && item.webSocketDebuggerUrl) : [];
+  const page = pickViewerPageTarget(pages);
+  if (!page?.webSocketDebuggerUrl) throw new Error("No Chrome page target is available.");
+  await sendCdpCommand(page.webSocketDebuggerUrl, "Page.enable", {}).catch(() => undefined);
+  await sendCdpCommand(page.webSocketDebuggerUrl, "Page.bringToFront", {}).catch(() => undefined);
+  await sendCdpCommand(page.webSocketDebuggerUrl, "Page.navigate", { url });
+  serviceLog("info", "browser", "Navigated viewer page via internal CDP.", { url });
+}
+
+function pickViewerPageTarget(pages) {
+  const normalPages = pages.filter((page) => {
+    const value = String(page.url || "");
+    return !value.startsWith("devtools://") && !value.startsWith("chrome-extension://");
+  });
+  return normalPages.at(-1) || pages.at(-1);
 }
 
 async function navigateWithXdotool(url) {
