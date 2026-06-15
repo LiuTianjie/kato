@@ -195,7 +195,30 @@ curl -X POST https://kato.itool.tech/note_comments \
   -d '{"note_id":"笔记ID","url":"https://www.xiaohongshu.com/explore/笔记ID","xsec_token":"搜索结果中的 token","limit":50}'
 ```
 
-`note_sub_comments` 预留给 `serverx` 的子评论接口契约；当前返回空数组。Kato 会在抓取一级评论时尽力从页面中识别已展开的父子评论关系。
+`note_sub_comments` 用于 `serverx` 的子评论接口契约。Kato 会尽力从页面中识别已展开的父子评论关系；页面无法识别父子关系时，会按当前可见评论做分页切片返回。
+
+## TikHub 路径兼容
+
+Kato 也支持 `serverx` 原 TikHub 小红书 App V2 路径，方便按官方文档参数调用。返回仍使用 Kato envelope：`{ "success": true, "data": ... }`。
+
+```text
+GET /api/v1/xiaohongshu/app_v2/search_notes
+GET /api/v1/xiaohongshu/app_v2/get_image_note_detail
+GET /api/v1/xiaohongshu/app_v2/get_video_note_detail
+GET /api/v1/xiaohongshu/app_v2/get_note_comments
+GET /api/v1/xiaohongshu/app_v2/get_note_sub_comments
+```
+
+分页参数支持：
+
+| 用途 | 支持参数 | 说明 |
+| --- | --- | --- |
+| 搜索笔记 | `keyword`, `page`, `sort_type`, `note_type`, `time_filter`, `search_id`, `search_session_id` | `page` 会用于翻页；筛选参数会被接收并回显。Kato 当前基于浏览器页面搜索，无法保证与 TikHub App V2 排序完全一致。 |
+| 图文/视频详情 | `note_id`, `share_text` | 两个详情路径映射到同一套 Kato 笔记详情读取能力。 |
+| 一级评论 | `note_id`, `share_text`, `cursor`, `index`, `pageArea`, `sort_strategy` | `index`/`cursor=offset:N` 用于翻页，响应返回下一页 `cursor.index` 和 `cursor.cursor`。 |
+| 二级评论 | `note_id`, `share_text`, `comment_id`, `cursor`, `index` | 会优先返回已识别父评论下的回复；页面无法识别父子关系时返回当前可见评论切片。 |
+
+Kato 的分页是浏览器页面滚动后的 offset 分页，不是 TikHub App V2 的原生后端游标；对 `serverx` 舆情扫描足够用，但如果后续需要严格复刻 TikHub 的全量游标语义，需要再补基于小红书内部接口的网络响应解析。
 
 ## 幂等语义
 

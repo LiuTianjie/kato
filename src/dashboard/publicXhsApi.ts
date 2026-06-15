@@ -44,7 +44,7 @@ export async function handlePublicXhsApi(
 
   try {
     assertAuthorized(req);
-    const body = req.method === "POST" ? await readJson(req) : {};
+    const body = req.method === "POST" ? await readJson(req) : Object.fromEntries(url.searchParams.entries());
     const data = await routePublicXhsApi(req, url, body, context);
     sendApiSuccess(res, data);
   } catch (error) {
@@ -62,6 +62,23 @@ async function routePublicXhsApi(
 ): Promise<unknown> {
   const path = url.pathname;
   const serverxPath = normalizeServerxPath(path);
+  const tikhubPath = normalizeTikHubPath(path);
+
+  if (req.method === "GET" && tikhubPath === "/search_notes") {
+    return searchNotesForTikHub(context.config, body);
+  }
+
+  if (req.method === "GET" && (tikhubPath === "/get_image_note_detail" || tikhubPath === "/get_video_note_detail")) {
+    return noteDetailForTikHub(context.config, body);
+  }
+
+  if (req.method === "GET" && tikhubPath === "/get_note_comments") {
+    return noteCommentsForTikHub(context.config, body);
+  }
+
+  if (req.method === "GET" && tikhubPath === "/get_note_sub_comments") {
+    return noteSubCommentsForTikHub(context.config, body);
+  }
 
   if (req.method === "POST" && serverxPath === "/search_notes") {
     return searchNotesForServerx(context.config, body);
@@ -122,15 +139,21 @@ async function routePublicXhsApi(
 }
 
 export function isPublicXhsApiPath(pathname: string): boolean {
-  return pathname.startsWith("/api/v1/xhs/") || SERVERX_ROOT_PATHS.has(pathname);
+  return pathname.startsWith("/api/v1/xhs/") || pathname.startsWith(`${TIKHUB_PREFIX}/`) || SERVERX_ROOT_PATHS.has(pathname);
 }
 
 const SERVERX_ROOT_PATHS = new Set(["/search_notes", "/note_detail", "/note_comments", "/note_sub_comments"]);
+const TIKHUB_PREFIX = "/api/v1/xiaohongshu/app_v2";
 
 function normalizeServerxPath(pathname: string): string {
   if (SERVERX_ROOT_PATHS.has(pathname)) return pathname;
   const prefix = "/api/v1/xhs/serverx";
   if (pathname.startsWith(`${prefix}/`)) return pathname.slice(prefix.length);
+  return "";
+}
+
+function normalizeTikHubPath(pathname: string): string {
+  if (pathname.startsWith(`${TIKHUB_PREFIX}/`)) return pathname.slice(TIKHUB_PREFIX.length);
   return "";
 }
 
@@ -177,16 +200,67 @@ async function searchNotesForServerx(config: AppConfig, body: Record<string, unk
   return posts;
 }
 
+async function searchNotesForTikHub(config: AppConfig, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const page = normalizePositiveInt(body.page, 1);
+  const pageSize = normalizeLimit(body.limit ?? body.page_size ?? body.pageSize, 20);
+  const keyword = String(body.keyword ?? body.query ?? "").trim();
+  const result = await searchOnlyPosts(config, { keywords: keyword ? [keyword] : normalizeKeywords(body), limit: page * pageSize });
+  const start = (page - 1) * pageSize;
+  const posts = result.posts.slice(start, start + pageSize).map((post) => toServerxPost(post));
+  return {
+    data: posts,
+    items: posts,
+    notes: posts,
+    cursor: {
+      page: page + 1,
+      search_id: String(body.search_id ?? ""),
+      search_session_id: String(body.search_session_id ?? "")
+    },
+    has_more: result.posts.length > start + posts.length,
+    page,
+    page_size: pageSize,
+    sort_type: body.sort_type ?? "general",
+    note_type: body.note_type ?? "不限",
+    time_filter: body.time_filter ?? "不限"
+  };
+}
+
 async function noteDetailForServerx(config: AppConfig, body: Record<string, unknown>): Promise<Record<string, unknown>> {
   const post = await getPostDetail(config, normalizeServerxPostInput(body));
   const comments = await safeGetComments(config, post, normalizeLimit(body.max_comments, 50));
   return toServerxPost(post, comments);
 }
 
+async function noteDetailForTikHub(config: AppConfig, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  return noteDetailForServerx(config, body);
+}
+
 async function noteCommentsForServerx(config: AppConfig, body: Record<string, unknown>): Promise<Record<string, unknown>[]> {
   const post = normalizePostInput(normalizeServerxPostInput(body));
   const comments = await safeGetComments(config, post, normalizeLimit(body.max_comments ?? body.limit, 50));
   return comments.map(toServerxComment);
+}
+
+async function noteCommentsForTikHub(config: AppConfig, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const page = normalizeCursorPage(body.index, body.cursor, 0);
+  const pageSize = normalizeLimit(body.limit ?? body.max_comments ?? body.page_size, 50);
+  const comments = await noteCommentsForServerx(config, { ...body, max_comments: (page + 1) * pageSize });
+  const start = page * pageSize;
+  const items = comments.slice(start, start + pageSize);
+  const nextIndex = page + 1;
+  return {
+    data: items,
+    items,
+    comments: items,
+    cursor: {
+      cursor: items.length ? `offset:${nextIndex}` : "",
+      index: nextIndex,
+      pageArea: body.pageArea ?? body.page_area ?? "UNFOLDED"
+    },
+    has_more: comments.length > start + items.length,
+    pageArea: body.pageArea ?? body.page_area ?? "UNFOLDED",
+    sort_strategy: body.sort_strategy ?? "latest_v2"
+  };
 }
 
 async function noteSubCommentsForServerx(config: AppConfig, body: Record<string, unknown>): Promise<Record<string, unknown>[]> {
@@ -199,6 +273,26 @@ async function noteSubCommentsForServerx(config: AppConfig, body: Record<string,
     parent_comment_id: parentId || comment.parentId || "",
     parent_id: parentId || comment.parentId || ""
   }));
+}
+
+async function noteSubCommentsForTikHub(config: AppConfig, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const page = Math.max(normalizeCursorPage(body.index, body.cursor, 1) - 1, 0);
+  const pageSize = normalizeLimit(body.limit ?? body.max_comments ?? body.page_size, 20);
+  const comments = await noteSubCommentsForServerx(config, { ...body, max_comments: (page + 1) * pageSize });
+  const start = page * pageSize;
+  const items = comments.slice(start, start + pageSize);
+  const nextIndex = page + 2;
+  return {
+    data: items,
+    items,
+    comments: items,
+    cursor: {
+      cursor: items.length ? `offset:${nextIndex}` : "",
+      index: nextIndex
+    },
+    has_more: comments.length > start + items.length,
+    comment_id: body.comment_id ?? body.parent_comment_id ?? body.parent_id ?? ""
+  };
 }
 
 async function safeGetComments(config: AppConfig, post: XhsPost, limit: number): Promise<XhsComment[]> {
@@ -273,6 +367,21 @@ function normalizeLimit(value: unknown, fallback: number): number {
   const numberValue = Number(value ?? fallback);
   if (!Number.isFinite(numberValue)) return fallback;
   return Math.max(1, Math.min(100, Math.floor(numberValue)));
+}
+
+function normalizePositiveInt(value: unknown, fallback: number): number {
+  const numberValue = Number(value ?? fallback);
+  if (!Number.isFinite(numberValue)) return fallback;
+  return Math.max(1, Math.floor(numberValue));
+}
+
+function normalizeCursorPage(indexValue: unknown, cursorValue: unknown, fallback: number): number {
+  const cursorText = String(cursorValue ?? "");
+  const offset = /^offset:(\d+)$/.exec(cursorText);
+  if (offset) return Number(offset[1]);
+  const index = Number(indexValue ?? fallback);
+  if (!Number.isFinite(index)) return fallback;
+  return Math.max(0, Math.floor(index));
 }
 
 function normalizePostInput(body: Record<string, unknown>): XhsPost {

@@ -158,6 +158,49 @@ test("public XHS API accepts deploy default token when env token is omitted", as
   }
 });
 
+test("TikHub-compatible XHS API accepts official pagination parameters", async () => {
+  const fixture = createFixture();
+  const originalToken = process.env.XHS_API_TOKEN;
+  process.env.XHS_API_TOKEN = "secret-token";
+  try {
+    const search = await callApi(fixture.config, fixture.db, {
+      method: "GET",
+      pathname: "/api/v1/xiaohongshu/app_v2/search_notes?keyword=AI%E5%B7%A5%E5%85%B7&page=1&sort_type=general&note_type=%E4%B8%8D%E9%99%90&time_filter=%E4%B8%8D%E9%99%90",
+      token: "secret-token"
+    });
+    assert.equal(search.status, 200);
+    assert.equal(search.payload.success, true);
+    assert.equal(search.payload.data.data[0].note_id, "post-1");
+    assert.equal(search.payload.data.cursor.page, 2);
+    assert.equal(search.payload.data.sort_type, "general");
+
+    const comments = await callApi(fixture.config, fixture.db, {
+      method: "GET",
+      pathname: "/api/v1/xiaohongshu/app_v2/get_note_comments?note_id=post-1&cursor=&index=0&pageArea=UNFOLDED&sort_strategy=latest_v2",
+      token: "secret-token"
+    });
+    assert.equal(comments.status, 200);
+    assert.equal(comments.payload.success, true);
+    assert.deepEqual(comments.payload.data.comments, []);
+    assert.equal(comments.payload.data.cursor.index, 1);
+    assert.equal(comments.payload.data.cursor.pageArea, "UNFOLDED");
+
+    const subComments = await callApi(fixture.config, fixture.db, {
+      method: "GET",
+      pathname: "/api/v1/xiaohongshu/app_v2/get_note_sub_comments?note_id=post-1&comment_id=comment-1&cursor=&index=1",
+      token: "secret-token"
+    });
+    assert.equal(subComments.status, 200);
+    assert.equal(subComments.payload.success, true);
+    assert.deepEqual(subComments.payload.data.comments, []);
+    assert.equal(subComments.payload.data.cursor.index, 2);
+    assert.equal(subComments.payload.data.comment_id, "comment-1");
+  } finally {
+    restoreEnv("XHS_API_TOKEN", originalToken);
+    cleanupFixture(fixture);
+  }
+});
+
 async function postJson(config: AppConfig, db: Db, pathname: string, body: unknown, token: string): Promise<{ status: number; payload: any }> {
   return callApi(config, db, {
     method: "POST",

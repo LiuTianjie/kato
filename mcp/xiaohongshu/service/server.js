@@ -50,7 +50,9 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/api/v1/feeds/search") {
       const keyword = url.searchParams.get("keyword") || url.searchParams.get("query") || "";
       const limit = normalizeLimit(url.searchParams.get("limit"), 20);
-      sendJson(res, 200, { success: true, data: { feeds: await searchFeeds(keyword, limit) } });
+      const page = normalizePositiveInt(url.searchParams.get("page"), 1);
+      const feeds = await searchFeeds(keyword, limit, { page });
+      sendJson(res, 200, { success: true, data: pagedPayload("feeds", feeds, { page, limit }) });
       return;
     }
 
@@ -58,7 +60,9 @@ const server = createServer(async (req, res) => {
       const body = await readJson(req);
       const keyword = String(body.keyword || body.query || "");
       const limit = normalizeLimit(body.limit, 20);
-      sendJson(res, 200, { success: true, data: { feeds: await searchFeeds(keyword, limit) } });
+      const page = normalizePositiveInt(body.page, 1);
+      const feeds = await searchFeeds(keyword, limit, { page });
+      sendJson(res, 200, { success: true, data: pagedPayload("feeds", feeds, { page, limit }) });
       return;
     }
 
@@ -72,8 +76,21 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/v1/feeds/comments") {
       const body = await readJson(req);
       const limit = normalizeLimit(body.limit || body.max_comments || body.max_comment_items, 50);
-      const comments = await getFeedComments(body, limit);
-      sendJson(res, 200, { success: true, data: { comments, items: comments } });
+      const index = normalizeCursorIndex(body.index, body.cursor, 0);
+      const comments = await getFeedComments(body, limit, { index });
+      sendJson(res, 200, {
+        success: true,
+        data: {
+          comments,
+          items: comments,
+          cursor: {
+            cursor: comments.length ? `offset:${index + 1}` : "",
+            index: index + 1,
+            pageArea: body.pageArea || body.page_area || "UNFOLDED"
+          },
+          has_more: comments.length >= limit
+        }
+      });
       return;
     }
 
@@ -224,17 +241,19 @@ async function currentUserSummary() {
   };
 }
 
-async function searchFeeds(keyword, limit) {
+async function searchFeeds(keyword, limit, options = {}) {
   if (!keyword.trim()) return [];
+  const pageNumber = normalizePositiveInt(options.page, 1);
   const page = await servicePage();
   const url = new URL("https://www.xiaohongshu.com/search_result");
   url.searchParams.set("keyword", keyword);
   url.searchParams.set("source", "web_search_result_notes");
   await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: 60_000 });
   await page.waitForTimeout(3_000);
-  await autoScroll(page, 2);
+  await autoScroll(page, Math.max(2, pageNumber + 1));
   const posts = await scrapePosts(page);
-  return uniquePosts(posts).slice(0, limit);
+  const start = (pageNumber - 1) * limit;
+  return uniquePosts(posts).slice(start, start + limit);
 }
 
 async function getFeedDetail(body) {
@@ -347,15 +366,24 @@ async function callTool(params) {
   const name = String(params.name || "");
   const args = params.arguments || {};
   if (name === "search_feeds") {
-    const feeds = await searchFeeds(String(args.keyword || args.query || ""), normalizeLimit(args.limit, 20));
-    return toolJson({ feeds });
+    const limit = normalizeLimit(args.limit, 20);
+    const page = normalizePositiveInt(args.page, 1);
+    const feeds = await searchFeeds(String(args.keyword || args.query || ""), limit, { page });
+    return toolJson(pagedPayload("feeds", feeds, { page, limit }));
   }
   if (name === "get_feed_detail") {
     return toolJson(await getFeedDetail(args));
   }
   if (name === "get_feed_comments") {
-    const comments = await getFeedComments(args, normalizeLimit(args.limit || args.max_comments || args.max_comment_items, 50));
-    return toolJson({ comments, items: comments });
+    const limit = normalizeLimit(args.limit || args.max_comments || args.max_comment_items, 50);
+    const index = normalizeCursorIndex(args.index, args.cursor, 0);
+    const comments = await getFeedComments(args, limit, { index });
+    return toolJson({
+      comments,
+      items: comments,
+      cursor: { cursor: comments.length ? `offset:${index + 1}` : "", index: index + 1, pageArea: args.pageArea || "UNFOLDED" },
+      has_more: comments.length >= limit
+    });
   }
   if (name === "post_comment_to_feed") {
     await postComment(args);
@@ -440,11 +468,12 @@ async function scrapePosts(page) {
   });
 }
 
-async function getFeedComments(body, limit) {
+async function getFeedComments(body, limit, options = {}) {
   await getFeedDetail(body);
   const page = await servicePage();
-  await autoScroll(page, 3);
-  return uniqueComments(await scrapeComments(page), limit);
+  const index = normalizeCursorIndex(options.index, options.cursor, 0);
+  await autoScroll(page, Math.max(3, index + 3));
+  return uniqueComments(await scrapeComments(page), limit, index * limit);
 }
 
 async function scrapeComments(page) {
@@ -542,15 +571,20 @@ async function scrapeComments(page) {
   });
 }
 
-function uniqueComments(comments, limit) {
+function uniqueComments(comments, limit, offset = 0) {
   const seen = new Set();
   const result = [];
+  let skipped = 0;
   for (const comment of comments) {
     const content = String(comment.content || comment.text || "").trim();
     if (!content) continue;
     const key = String(comment.id || comment.comment_id || content);
     if (seen.has(key)) continue;
     seen.add(key);
+    if (skipped < offset) {
+      skipped += 1;
+      continue;
+    }
     result.push({
       id: key,
       comment_id: key,
@@ -663,6 +697,32 @@ function normalizeLimit(value, fallback) {
   const numberValue = Number(value || fallback);
   if (!Number.isFinite(numberValue)) return fallback;
   return Math.max(1, Math.min(100, Math.floor(numberValue)));
+}
+
+function normalizePositiveInt(value, fallback) {
+  const numberValue = Number(value || fallback);
+  if (!Number.isFinite(numberValue)) return fallback;
+  return Math.max(1, Math.floor(numberValue));
+}
+
+function normalizeCursorIndex(indexValue, cursorValue, fallback) {
+  const cursorText = String(cursorValue || "");
+  const offset = /^offset:(\d+)$/.exec(cursorText);
+  if (offset) return Number(offset[1]);
+  const numberValue = Number(indexValue ?? fallback);
+  if (!Number.isFinite(numberValue)) return fallback;
+  return Math.max(0, Math.floor(numberValue));
+}
+
+function pagedPayload(key, items, { page, limit }) {
+  return {
+    [key]: items,
+    items,
+    cursor: { page: page + 1 },
+    has_more: items.length >= limit,
+    page,
+    limit
+  };
 }
 
 function cdpUrl() {
