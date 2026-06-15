@@ -90,6 +90,7 @@ interface ToolNames {
 class HttpMcpXhsAdapter implements XhsAdapter {
   private readonly client: JsonRpcHttpClient;
   private readonly restBaseUrl: string;
+  private readonly restTimeoutMs = normalizePositiveEnv("XHS_REST_TIMEOUT_MS", 90_000);
   private readonly tools: ToolNames;
   private initialized = false;
 
@@ -199,7 +200,7 @@ class HttpMcpXhsAdapter implements XhsAdapter {
   }
 
   private async postCommentRest(post: XhsPost, comment: string): Promise<void> {
-    const response = await fetch(new URL("/api/v1/feeds/comment", this.restBaseUrl), {
+    const response = await fetchWithTimeout(new URL("/api/v1/feeds/comment", this.restBaseUrl), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -207,14 +208,14 @@ class HttpMcpXhsAdapter implements XhsAdapter {
         xsec_token: post.xsecToken,
         content: comment
       })
-    });
+    }, this.restTimeoutMs);
     if (!response.ok) {
       throw new Error(`XHS REST comment failed: HTTP ${response.status} ${await response.text()}`);
     }
   }
 
   private async likeFeedRest(post: XhsPost): Promise<void> {
-    const response = await fetch(new URL("/api/v1/feeds/like", this.restBaseUrl), {
+    const response = await fetchWithTimeout(new URL("/api/v1/feeds/like", this.restBaseUrl), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -222,7 +223,7 @@ class HttpMcpXhsAdapter implements XhsAdapter {
         xsec_token: post.xsecToken,
         unlike: false
       })
-    });
+    }, this.restTimeoutMs);
     if (!response.ok) {
       throw new Error(`XHS REST like failed: HTTP ${response.status} ${await response.text()}`);
     }
@@ -251,7 +252,7 @@ class HttpMcpXhsAdapter implements XhsAdapter {
   private async searchFeedsRest(query: string, limit: number): Promise<XhsPost[]> {
     const url = new URL("/api/v1/feeds/search", this.restBaseUrl);
     url.searchParams.set("keyword", query);
-    const response = await fetch(url);
+    const response = await fetchWithTimeout(url, {}, this.restTimeoutMs);
     if (!response.ok) {
       throw new Error(`XHS REST search failed: HTTP ${response.status} ${await response.text()}`);
     }
@@ -259,7 +260,7 @@ class HttpMcpXhsAdapter implements XhsAdapter {
   }
 
   private async getFeedDetailRest(post: XhsPost): Promise<XhsPost | null> {
-    const response = await fetch(new URL("/api/v1/feeds/detail", this.restBaseUrl), {
+    const response = await fetchWithTimeout(new URL("/api/v1/feeds/detail", this.restBaseUrl), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -271,7 +272,7 @@ class HttpMcpXhsAdapter implements XhsAdapter {
           scroll_speed: "normal"
         }
       })
-    });
+    }, this.restTimeoutMs);
     if (!response.ok) {
       throw new Error(`XHS REST detail failed: HTTP ${response.status} ${await response.text()}`);
     }
@@ -279,7 +280,7 @@ class HttpMcpXhsAdapter implements XhsAdapter {
   }
 
   private async getFeedCommentsRest(post: XhsPost, limit: number): Promise<XhsComment[]> {
-    const response = await fetch(new URL("/api/v1/feeds/comments", this.restBaseUrl), {
+    const response = await fetchWithTimeout(new URL("/api/v1/feeds/comments", this.restBaseUrl), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -288,7 +289,7 @@ class HttpMcpXhsAdapter implements XhsAdapter {
         url: post.url,
         limit
       })
-    });
+    }, this.restTimeoutMs);
     if (!response.ok) {
       throw new Error(`XHS REST comments failed: HTTP ${response.status} ${await response.text()}`);
     }
@@ -579,6 +580,22 @@ class JsonRpcStdioClient extends EventEmitter {
 
 function normalize(value: string): string {
   return value.toLowerCase().replace(/\s+/g, "");
+}
+
+async function fetchWithTimeout(url: URL, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function normalizePositiveEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name] || fallback);
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.floor(value);
 }
 
 function coercePosts(value: unknown): XhsPost[] {

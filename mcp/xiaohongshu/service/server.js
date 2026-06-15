@@ -18,6 +18,7 @@ const CDP_CONNECT_TIMEOUT_MS = normalizePositiveEnv("XHS_CDP_CONNECT_TIMEOUT_MS"
 const BROWSER_STATUS_TIMEOUT_MS = normalizePositiveEnv("XHS_BROWSER_STATUS_TIMEOUT_MS", 2_000);
 const BROWSER_RESTART_TIMEOUT_MS = normalizePositiveEnv("XHS_BROWSER_RESTART_TIMEOUT_MS", 25_000);
 const PROCESS_EXIT_GRACE_MS = normalizePositiveEnv("XHS_PROCESS_EXIT_GRACE_MS", 2_000);
+const HEALTH_ENSURE_TIMEOUT_MS = normalizePositiveEnv("XHS_HEALTH_ENSURE_TIMEOUT_MS", 8_000);
 const XHS_HOME_URL = "https://www.xiaohongshu.com/explore";
 const XHS_CREATOR_URL = "https://creator.xiaohongshu.com";
 
@@ -32,7 +33,10 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
 
     if (req.method === "GET" && url.pathname === "/health") {
-      sendJson(res, 200, { ok: true, service: "kato-xhs-browser", browser: await browserSummary() });
+      const ensure = url.searchParams.get("ensure") === "1";
+      const browser = await healthBrowserSummary({ ensure });
+      const ok = ensure ? browser.running === true : true;
+      sendJson(res, ok ? 200 : 503, { ok, service: "kato-xhs-browser", browser });
       return;
     }
 
@@ -161,6 +165,20 @@ async function browserSummary() {
       error: error instanceof Error ? error.message : String(error)
     };
   }
+}
+
+async function healthBrowserSummary({ ensure = false } = {}) {
+  if (!ensure) return browserSummary();
+  try {
+    await withTimeout(ensureContext(), HEALTH_ENSURE_TIMEOUT_MS, "Browser health ensure timed out.");
+  } catch (error) {
+    return {
+      running: false,
+      cdpUrl: cdpUrl(),
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+  return browserSummary();
 }
 
 async function ensureContext() {

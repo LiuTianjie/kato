@@ -33,6 +33,7 @@ class PublicApiError extends Error {
 
 const idempotencyResults = new Map<string, Promise<unknown>>();
 const DEFAULT_XHS_API_TOKEN = "LiuTao0.1";
+const MCP_FETCH_TIMEOUT_MS = normalizePositiveEnv("XHS_PUBLIC_MCP_FETCH_TIMEOUT_MS", 90_000);
 
 export async function handlePublicXhsApi(
   req: IncomingMessage,
@@ -369,6 +370,12 @@ function normalizeLimit(value: unknown, fallback: number): number {
   return Math.max(1, Math.min(100, Math.floor(numberValue)));
 }
 
+function normalizePositiveEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name] || fallback);
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.floor(value);
+}
+
 function normalizePositiveInt(value: unknown, fallback: number): number {
   const numberValue = Number(value ?? fallback);
   if (!Number.isFinite(numberValue)) return fallback;
@@ -483,11 +490,21 @@ async function runIdempotent(key: string, task: () => Promise<unknown>): Promise
 
 async function fetchMcpJson(config: AppConfig, endpoint: string): Promise<unknown> {
   const base = config.xhs.mcp?.url ? new URL(config.xhs.mcp.url).origin : "http://localhost:18060";
-  const response = await fetch(`${base}${endpoint}`);
+  const response = await fetchWithTimeout(`${base}${endpoint}`, {}, MCP_FETCH_TIMEOUT_MS);
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
   if (!response.ok) throw new PublicApiError(502, "MCP_ERROR", `MCP ${endpoint} failed: HTTP ${response.status}`);
   return data;
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
