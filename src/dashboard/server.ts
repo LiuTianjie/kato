@@ -438,6 +438,16 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     return;
   }
 
+  if (req.method === "GET" && url.pathname === "/api/mcp/browser/logs") {
+    sendJson(res, 200, await fetchMcpJson(`/api/v1/browser/logs${url.search}`));
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/browser-runtime/logs") {
+    sendJson(res, 200, await fetchRuntimeJson(`/browser/logs${url.search}`));
+    return;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/browser-viewer/open") {
     const body = await readJson(req);
     const platform = getPlatformSpec(body.platform);
