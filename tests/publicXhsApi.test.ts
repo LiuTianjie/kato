@@ -148,6 +148,189 @@ test("serverx-compatible XHS API exposes search and detail payloads", async () =
   }
 });
 
+test("serverx-compatible search keeps posts when comment enrichment fails", async () => {
+  const fixture = createFixture();
+  const originalToken = process.env.XHS_API_TOKEN;
+  const originalFetch = globalThis.fetch;
+  const calls: string[] = [];
+  process.env.XHS_API_TOKEN = "secret-token";
+  fixture.config.xhs = {
+    provider: "http",
+    mcp: { url: "http://fake.local/mcp" }
+  };
+  globalThis.fetch = async (input) => {
+    const requestUrl = String(input);
+    calls.push(requestUrl);
+    if (requestUrl.includes("/api/v1/feeds/search")) {
+      return new Response(
+        JSON.stringify({
+          success: true,
+          data: {
+            feeds: [
+              {
+                id: "post-1",
+                url: "https://www.xiaohongshu.com/explore/post-1?xsec_token=token-1",
+                xsecToken: "token-1",
+                noteCard: {
+                  displayTitle: "AI工具真实搜索结果",
+                  user: { nickname: "作者A" }
+                }
+              }
+            ]
+          }
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    if (requestUrl.includes("/api/v1/feeds/comments")) {
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: {
+            code: "INTERNAL_ERROR",
+            message: "page.goto: net::ERR_ABORTED at xhsdiscover://user/68c41c3a000000001a0087e3"
+          }
+        }),
+        { status: 500, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    throw new Error(`Unexpected fetch: ${requestUrl}`);
+  };
+
+  try {
+    const search = await postJson(
+      fixture.config,
+      fixture.db,
+      "/search_notes",
+      { keyword: "AI工具", limit: 1, max_comments: 20 },
+      "secret-token"
+    );
+    assert.equal(search.status, 200);
+    assert.equal(search.payload.success, true);
+    assert.equal(search.payload.data[0].note_id, "post-1");
+    assert.deepEqual(search.payload.data[0].comments, []);
+    assert.equal(calls.some((item) => item.includes("/api/v1/feeds/comments")), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("XHS_API_TOKEN", originalToken);
+    cleanupFixture(fixture);
+  }
+});
+
+test("serverx-compatible search can skip comment enrichment", async () => {
+  const fixture = createFixture();
+  const originalToken = process.env.XHS_API_TOKEN;
+  const originalFetch = globalThis.fetch;
+  const calls: string[] = [];
+  process.env.XHS_API_TOKEN = "secret-token";
+  fixture.config.xhs = {
+    provider: "http",
+    mcp: { url: "http://fake.local/mcp" }
+  };
+  globalThis.fetch = async (input) => {
+    const requestUrl = String(input);
+    calls.push(requestUrl);
+    if (requestUrl.includes("/api/v1/feeds/search")) {
+      return new Response(
+        JSON.stringify({
+          success: true,
+          data: {
+            feeds: [
+              {
+                id: "post-1",
+                url: "https://www.xiaohongshu.com/explore/post-1?xsec_token=token-1",
+                xsecToken: "token-1",
+                noteCard: { displayTitle: "AI工具真实搜索结果" }
+              }
+            ]
+          }
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    throw new Error(`Unexpected fetch: ${requestUrl}`);
+  };
+
+  try {
+    const search = await postJson(
+      fixture.config,
+      fixture.db,
+      "/search_notes",
+      { keyword: "AI工具", limit: 1, include_comments: false },
+      "secret-token"
+    );
+    assert.equal(search.status, 200);
+    assert.equal(search.payload.success, true);
+    assert.deepEqual(search.payload.data[0].comments, []);
+    assert.equal(calls.some((item) => item.includes("/api/v1/feeds/comments")), false);
+
+    const searchWithZeroComments = await postJson(
+      fixture.config,
+      fixture.db,
+      "/search_notes",
+      { keyword: "AI工具", limit: 1, max_comments: 0 },
+      "secret-token"
+    );
+    assert.equal(searchWithZeroComments.status, 200);
+    assert.equal(searchWithZeroComments.payload.success, true);
+    assert.deepEqual(searchWithZeroComments.payload.data[0].comments, []);
+    assert.equal(calls.some((item) => item.includes("/api/v1/feeds/comments")), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("XHS_API_TOKEN", originalToken);
+    cleanupFixture(fixture);
+  }
+});
+
+test("serverx-compatible direct comments does not classify page ERR_ABORTED as client close", async () => {
+  const fixture = createFixture();
+  const originalToken = process.env.XHS_API_TOKEN;
+  const originalFetch = globalThis.fetch;
+  process.env.XHS_API_TOKEN = "secret-token";
+  fixture.config.xhs = {
+    provider: "http",
+    mcp: { url: "http://fake.local/mcp" }
+  };
+  globalThis.fetch = async (input) => {
+    const requestUrl = String(input);
+    if (requestUrl.includes("/api/v1/feeds/comments")) {
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: {
+            code: "INTERNAL_ERROR",
+            message: "page.goto: net::ERR_ABORTED at xhsdiscover://user/68c41c3a000000001a0087e3"
+          }
+        }),
+        { status: 500, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    throw new Error(`Unexpected fetch: ${requestUrl}`);
+  };
+
+  try {
+    const comments = await postJson(
+      fixture.config,
+      fixture.db,
+      "/note_comments",
+      {
+        note_id: "post-1",
+        url: "https://www.xiaohongshu.com/explore/post-1?xsec_token=token-1",
+        xsec_token: "token-1"
+      },
+      "secret-token"
+    );
+    assert.equal(comments.status, 500);
+    assert.equal(comments.payload.success, false);
+    assert.equal(comments.payload.error.code, "INTERNAL_ERROR");
+    assert.match(comments.payload.error.message, /ERR_ABORTED/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("XHS_API_TOKEN", originalToken);
+    cleanupFixture(fixture);
+  }
+});
+
 test("public XHS API accepts deploy default token when env token is omitted", async () => {
   const fixture = createFixture();
   const originalToken = process.env.XHS_API_TOKEN;

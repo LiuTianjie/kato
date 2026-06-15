@@ -5,21 +5,20 @@ import { randomUUID } from "node:crypto";
 import type { AppConfig, XhsConfig } from "../config.js";
 import { resolveFromRoot } from "../config.js";
 import type { XhsComment, XhsPost } from "../domain/types.js";
+import type { PlatformRequestOptions, WritablePlatformAdapter } from "../platforms/types.js";
 
-export interface XhsAdapter {
+export interface XhsAdapter extends WritablePlatformAdapter<XhsPost, XhsComment> {
+  readonly platformId: "xhs";
   searchPosts(query: string, limit: number, options?: XhsAdapterRequestOptions): Promise<XhsPost[]>;
   getPost(post: XhsPost | string, options?: XhsAdapterRequestOptions): Promise<XhsPost | null>;
   getComments?(post: XhsPost | string, limit: number, options?: XhsAdapterRequestOptions): Promise<XhsComment[]>;
-  openPost(url: string): Promise<void>;
-  prefillComment(url: string, comment: string): Promise<boolean>;
+  openPost(url: string, options?: XhsAdapterRequestOptions): Promise<void>;
+  prefillComment(url: string, comment: string, options?: XhsAdapterRequestOptions): Promise<boolean>;
   publishComment(post: XhsPost, comment: string, options?: XhsAdapterRequestOptions): Promise<boolean>;
   likePost?(post: XhsPost, options?: XhsAdapterRequestOptions): Promise<boolean>;
-  close?(): Promise<void>;
 }
 
-export interface XhsAdapterRequestOptions {
-  signal?: AbortSignal;
-}
+export type XhsAdapterRequestOptions = PlatformRequestOptions;
 
 export function createXhsAdapter(config: AppConfig): XhsAdapter {
   if (config.xhs.provider === "http") {
@@ -34,6 +33,7 @@ export function createXhsAdapter(config: AppConfig): XhsAdapter {
 }
 
 class FixtureXhsAdapter implements XhsAdapter {
+  readonly platformId = "xhs" as const;
   private readonly posts: XhsPost[];
 
   constructor(config: AppConfig) {
@@ -92,6 +92,7 @@ interface ToolNames {
 }
 
 class HttpMcpXhsAdapter implements XhsAdapter {
+  readonly platformId = "xhs" as const;
   private readonly client: JsonRpcHttpClient;
   private readonly restBaseUrl: string;
   private readonly restTimeoutMs = normalizePositiveEnv("XHS_REST_TIMEOUT_MS", 90_000);
@@ -302,6 +303,7 @@ class HttpMcpXhsAdapter implements XhsAdapter {
 }
 
 class StdioMcpXhsAdapter implements XhsAdapter {
+  readonly platformId = "xhs" as const;
   private readonly client: JsonRpcStdioClient;
   private readonly tools: ToolNames;
   private initialized = false;
@@ -747,6 +749,7 @@ function normalizeXhsUrl(rawUrl: string, id: string, xsecToken: string): string 
   if (!value) return fallback;
   try {
     const url = new URL(normalizeUrlCandidate(value));
+    if (!isAllowedXhsHttpUrl(url)) return fallback;
     if (xsecToken && isXhsExploreUrl(url) && !url.searchParams.get("xsec_token")) {
       url.searchParams.set("xsec_token", xsecToken);
     }
@@ -758,7 +761,9 @@ function normalizeXhsUrl(rawUrl: string, id: string, xsecToken: string): string 
 
 function extractXsecToken(rawUrl: string): string {
   try {
-    return new URL(normalizeUrlCandidate(rawUrl.trim())).searchParams.get("xsec_token") ?? "";
+    const url = new URL(normalizeUrlCandidate(rawUrl.trim()));
+    if (!isAllowedXhsHttpUrl(url)) return "";
+    return url.searchParams.get("xsec_token") ?? "";
   } catch {
     return "";
   }
@@ -768,12 +773,17 @@ function normalizeUrlCandidate(value: string): string {
   if (/^https?:\/\//i.test(value)) return value;
   if (value.startsWith("//")) return `https:${value}`;
   if (value.startsWith("/")) return `https://www.xiaohongshu.com${value}`;
-  if (/^(www\.)?xiaohongshu\.com(\/|$)/i.test(value)) return `https://${value}`;
+  if (/^(www\.)?(xiaohongshu|xhslink)\.com(\/|$)/i.test(value)) return `https://${value}`;
   return value;
 }
 
 function isXhsExploreUrl(url: URL): boolean {
   return /(^|\.)xiaohongshu\.com$/i.test(url.hostname) && url.pathname.split("/").includes("explore");
+}
+
+function isAllowedXhsHttpUrl(url: URL): boolean {
+  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+  return /(^|\.)xiaohongshu\.com$/i.test(url.hostname) || /(^|\.)xhslink\.com$/i.test(url.hostname);
 }
 
 function urlToPost(value: string): XhsPost {

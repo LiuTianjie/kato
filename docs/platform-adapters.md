@@ -24,12 +24,21 @@ mcp/
 
 src/
   adapters/
+    platform.ts
     xhsMcp.ts
     bilibili.ts
     douyin.ts
   platforms/
+    registry.ts
     types.ts
 ```
+
+当前已经落地的通用入口：
+
+- `src/platforms/types.ts` 定义平台统一只读/写入 adapter 契约。
+- `src/platforms/registry.ts` 定义 XHS、B站、抖音的平台 metadata、默认主页、搜索 URL、cookie 域和实现状态。
+- `src/adapters/platform.ts` 是平台 adapter factory；当前只有 `xhs` 返回真实实现，`bilibili`/`douyin` 会明确报未实现。
+- `src/adapters/xhsMcp.ts` 已实现 `WritablePlatformAdapter<XhsPost, XhsComment>`，是第一个平台实现。
 
 不要把 B 站或抖音逻辑放进 `mcp/xiaohongshu/service/server.js`。新的平台 service 可以直接调用 `BROWSER_RUNTIME_URL=http://127.0.0.1:18100`，再通过内部 CDP 连接同一个 runtime。
 
@@ -67,7 +76,7 @@ export interface PlatformAdapter {
 }
 ```
 
-如果平台要支持写操作，再单独扩展 `publishComment`、`likePost`。读数据平台不要先暴露写能力。
+代码里已经拆成 `ReadOnlyPlatformAdapter` 和 `WritablePlatformAdapter`。如果平台要支持写操作，再单独扩展 `publishComment`、`likePost`。读数据平台不要先暴露写能力。
 
 ## 平台 Service 最小接口
 
@@ -136,6 +145,6 @@ B 站建议先做只读：
 2. 实现搜索、详情、评论的 REST 最小接口，并接入任务队列、随机延迟、abort 取消和日志。
 3. 新建 `src/adapters/<platform>.ts`，把平台 service 返回值归一化为 `PlatformPost`/`PlatformComment`。
 4. 在 dashboard public API 层新增平台路由，例如 `/api/v1/bilibili/*` 或 `/api/v1/douyin/*`。
-5. 只在平台 API 稳定后，再考虑 ServerX 兼容路径。
-6. 部署前跑 `npm run build`、`npm test`、`luma validate deploy/kato.luma.yml`。
-
+5. 在 `src/platforms/registry.ts` 把平台 `implemented` 改为 `true`，并在 `src/adapters/platform.ts` 接入真实 adapter。
+6. 只在平台 API 稳定后，再考虑 ServerX 兼容路径。
+7. 部署前跑 `npm run build`、`npm test`、`luma validate deploy/kato.luma.yml`。

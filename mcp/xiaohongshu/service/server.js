@@ -1467,6 +1467,7 @@ function toNotePayload(post) {
 function postFromUrl(value) {
   try {
     const url = new URL(value);
+    if (!isAllowedXhsHttpUrl(url)) return { id: "", xsecToken: "" };
     return {
       id: url.pathname.split("/").filter(Boolean).at(-1) || value,
       xsecToken: url.searchParams.get("xsec_token") || ""
@@ -1499,12 +1500,13 @@ function normalizeXhsDetailUrl(rawUrl, id, xsecToken) {
   if (!extractedUrl) return fallback;
   try {
     const url = new URL(extractedUrl);
+    if (!isAllowedXhsHttpUrl(url)) return fallback;
     if (token && isXhsExploreUrl(url) && !url.searchParams.get("xsec_token")) {
       url.searchParams.set("xsec_token", token);
     }
     return url.toString();
   } catch {
-    return fallback || extractedUrl;
+    return fallback || "";
   }
 }
 
@@ -1519,12 +1521,17 @@ function normalizeUrlCandidate(value) {
   if (/^https?:\/\//i.test(value)) return value;
   if (value.startsWith("//")) return `https:${value}`;
   if (value.startsWith("/")) return `https://www.xiaohongshu.com${value}`;
-  if (/^(www\.)?xiaohongshu\.com(\/|$)/i.test(value)) return `https://${value}`;
+  if (/^(www\.)?(xiaohongshu|xhslink)\.com(\/|$)/i.test(value)) return `https://${value}`;
   return value;
 }
 
 function isXhsExploreUrl(url) {
   return /(^|\.)xiaohongshu\.com$/i.test(url.hostname) && url.pathname.split("/").includes("explore");
+}
+
+function isAllowedXhsHttpUrl(url) {
+  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+  return /(^|\.)xiaohongshu\.com$/i.test(url.hostname) || /(^|\.)xhslink\.com$/i.test(url.hostname);
 }
 
 function isTokenRequiredForDetailUrl(value) {

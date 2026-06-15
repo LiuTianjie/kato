@@ -87,6 +87,39 @@ test("http adapter derives xsec_token from post URL when field is omitted", asyn
   }
 });
 
+test("http adapter normalizes app deep links back to web note URLs", async () => {
+  const originalFetch = globalThis.fetch;
+
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        success: true,
+        data: {
+          feeds: [
+            {
+              id: "feed-deep-link",
+              url: "xhsdiscover://user/68c41c3a000000001a0087e3",
+              xsecToken: "deep-link-token",
+              noteCard: {
+                displayTitle: "Deep link result"
+              }
+            }
+          ]
+        }
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+
+  try {
+    const adapter = createXhsAdapter(httpConfig());
+    const posts = await adapter.searchPosts("AI工具", 5);
+    assert.equal(posts[0].url, "https://www.xiaohongshu.com/explore/feed-deep-link?xsec_token=deep-link-token");
+    assert.equal(posts[0].xsecToken, "deep-link-token");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("http adapter publishes plain comment text through REST without related note metadata", async () => {
   const originalFetch = globalThis.fetch;
   const calls: Array<{ url: string; body: Record<string, unknown> }> = [];

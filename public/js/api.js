@@ -12,6 +12,7 @@ export async function api(path, options = {}) {
 
 export const dashboardApi = {
   getDashboard: () => api("/api/dashboard"),
+  getPlatforms: () => api("/api/platforms"),
   getInteractions: (params) => api(`/api/interactions?${params}`),
   getDebugScreenshots: () => api("/api/debug-screenshots?limit=48"),
   getMcpStatus: () => api("/api/mcp/login-status"),

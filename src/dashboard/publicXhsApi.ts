@@ -216,9 +216,11 @@ async function searchNotesForServerx(
   const keywords = keyword ? [keyword] : normalizeKeywords(body);
   const limit = normalizeLimit(body.limit, 20);
   const result = await searchOnlyPosts(config, { keywords, limit, signal: options.signal });
+  const includeComments = parseBooleanFlag(body.include_comments ?? body.includeComments, true);
+  const commentLimit = includeComments ? normalizeOptionalLimit(body.max_comments ?? body.maxComments, 20) : 0;
   const posts = await Promise.all(
     result.posts.slice(0, limit).map(async (post) => {
-      const comments = await safeGetComments(config, post, normalizeLimit(body.max_comments, 20), options);
+      const comments = commentLimit > 0 ? await safeGetComments(config, post, commentLimit, options) : [];
       return toServerxPost(post, comments);
     })
   );
@@ -282,7 +284,7 @@ async function noteCommentsForServerx(
   options: RouteOptions = {}
 ): Promise<Record<string, unknown>[]> {
   const post = normalizePostInput(normalizeServerxPostInput(body));
-  const comments = await safeGetComments(config, post, normalizeLimit(body.max_comments ?? body.limit, 50), options);
+  const comments = await getCommentsStrict(config, post, normalizeLimit(body.max_comments ?? body.limit, 50), options);
   return comments.map(toServerxComment);
 }
 
@@ -319,7 +321,7 @@ async function noteSubCommentsForServerx(
 ): Promise<Record<string, unknown>[]> {
   const post = normalizePostInput(normalizeServerxPostInput(body));
   const parentId = String(body.comment_id ?? body.parent_comment_id ?? body.parent_id ?? "").trim();
-  const comments = await safeGetComments(config, post, normalizeLimit(body.max_comments ?? body.limit, 20), options);
+  const comments = await getCommentsStrict(config, post, normalizeLimit(body.max_comments ?? body.limit, 20), options);
   const subComments = parentId ? comments.filter((comment) => comment.parentId === parentId) : comments;
   return (subComments.length ? subComments : comments).map((comment) => ({
     ...toServerxComment(comment),
@@ -360,6 +362,16 @@ async function safeGetComments(config: AppConfig, post: XhsPost, limit: number, 
   } catch (error) {
     if (isAbortLikeError(error)) throw error;
     return [];
+  } finally {
+    await adapter.close?.();
+  }
+}
+
+async function getCommentsStrict(config: AppConfig, post: XhsPost, limit: number, options: RouteOptions = {}): Promise<XhsComment[]> {
+  const adapter = createXhsAdapter(config);
+  try {
+    if (!adapter.getComments) return [];
+    return await adapter.getComments(post, limit, { signal: options.signal });
   } finally {
     await adapter.close?.();
   }
@@ -425,6 +437,22 @@ function normalizeLimit(value: unknown, fallback: number): number {
   const numberValue = Number(value ?? fallback);
   if (!Number.isFinite(numberValue)) return fallback;
   return Math.max(1, Math.min(100, Math.floor(numberValue)));
+}
+
+function normalizeOptionalLimit(value: unknown, fallback: number): number {
+  if (value == null || value === "") return fallback;
+  const numberValue = Number(value);
+  if (!Number.isFinite(numberValue)) return fallback;
+  return Math.max(0, Math.min(100, Math.floor(numberValue)));
+}
+
+function parseBooleanFlag(value: unknown, fallback: boolean): boolean {
+  if (value == null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  const normalized = String(value).trim().toLowerCase();
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  return fallback;
 }
 
 function normalizePositiveEnv(name: string, fallback: number): number {
@@ -557,6 +585,7 @@ function normalizeXhsUrl(rawUrl: unknown, id: string, xsecToken: unknown): strin
   if (!value) return fallback;
   try {
     const url = new URL(normalizeUrlCandidate(value));
+    if (!isAllowedXhsHttpUrl(url)) return fallback;
     if (token && isXhsExploreUrl(url) && !url.searchParams.get("xsec_token")) {
       url.searchParams.set("xsec_token", token);
     }
@@ -570,7 +599,9 @@ function extractXsecToken(rawUrl: string): string {
   const value = extractUrl(rawUrl);
   if (!value) return "";
   try {
-    return new URL(normalizeUrlCandidate(value)).searchParams.get("xsec_token") ?? "";
+    const url = new URL(normalizeUrlCandidate(value));
+    if (!isAllowedXhsHttpUrl(url)) return "";
+    return url.searchParams.get("xsec_token") ?? "";
   } catch {
     return "";
   }
@@ -586,12 +617,17 @@ function normalizeUrlCandidate(value: string): string {
   if (/^https?:\/\//i.test(value)) return value;
   if (value.startsWith("//")) return `https:${value}`;
   if (value.startsWith("/")) return `https://www.xiaohongshu.com${value}`;
-  if (/^(www\.)?xiaohongshu\.com(\/|$)/i.test(value)) return `https://${value}`;
+  if (/^(www\.)?(xiaohongshu|xhslink)\.com(\/|$)/i.test(value)) return `https://${value}`;
   return value;
 }
 
 function isXhsExploreUrl(url: URL): boolean {
   return /(^|\.)xiaohongshu\.com$/i.test(url.hostname) && url.pathname.split("/").includes("explore");
+}
+
+function isAllowedXhsHttpUrl(url: URL): boolean {
+  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+  return /(^|\.)xiaohongshu\.com$/i.test(url.hostname) || /(^|\.)xhslink\.com$/i.test(url.hostname);
 }
 
 function assertConfirmed(body: Record<string, unknown>): void {
@@ -695,7 +731,7 @@ function isAbortLikeError(error: unknown): boolean {
   return (
     name === "AbortError" ||
     name === "PublicRequestCancelledError" ||
-    /aborted|abort|CLIENT_CLOSED_REQUEST|Client connection closed|Client request was aborted/i.test(message)
+    /CLIENT_CLOSED_REQUEST|Client connection closed|Client request was aborted|Client aborted the HTTP request|Client closed the HTTP request before completion/i.test(message)
   );
 }
 

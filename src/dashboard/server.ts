@@ -44,6 +44,7 @@ import {
   updateInteractionStatus
 } from "./queries.js";
 import { handlePublicXhsApi, isPublicXhsApiPath } from "./publicXhsApi.js";
+import { getPlatformSpec, listPlatformSpecs, normalizePlatformViewerUrl } from "../platforms/registry.js";
 
 const config = loadConfig();
 mkdirSync(config.dataDir, { recursive: true });
@@ -126,6 +127,19 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     sendJson(res, 200, {
       ...getDashboardStats(db),
       notes: listNotes(db)
+    });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/platforms") {
+    sendJson(res, 200, {
+      platforms: listPlatformSpecs().map((platform) => ({
+        id: platform.id,
+        label: platform.label,
+        implemented: platform.implemented,
+        homeUrl: platform.homeUrl,
+        capabilities: platform.capabilities
+      }))
     });
     return;
   }
@@ -425,12 +439,17 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
   }
 
   if (req.method === "POST" && url.pathname === "/api/browser-viewer/open") {
-    await postRuntimeJson("/browser/open", { url: "https://www.xiaohongshu.com/explore" }, 45_000);
+    const body = await readJson(req);
+    const platform = getPlatformSpec(body.platform);
+    const targetUrl = normalizePlatformViewerUrl(platform, String(body.url ?? body.query ?? ""));
+    await postRuntimeJson("/browser/open", { url: targetUrl }, 45_000);
     await waitForBrowserViewerReady(10_000);
     sendJson(res, 200, {
       opened: true,
+      platform: platform.id,
       viewerUrl: noVncViewerUrl,
-      loginUrl: "https://www.xiaohongshu.com/explore"
+      loginUrl: targetUrl,
+      homeUrl: platform.homeUrl
     });
     return;
   }
@@ -737,7 +756,8 @@ function unwrapMcpData(payload: unknown): unknown {
 
 async function runBrowserViewerAction(body: Record<string, unknown>): Promise<{ ok: true }> {
   const action = String(body.action ?? "");
-  const payload = action === "navigate" ? { ...body, url: normalizeViewerUrl(String(body.url ?? "")) } : body;
+  const platform = getPlatformSpec(body.platform);
+  const payload = action === "navigate" ? { ...body, url: normalizePlatformViewerUrl(platform, String(body.url ?? "")) } : body;
   await postRuntimeJson("/browser/action", payload, 20_000);
   return { ok: true };
 }
@@ -776,14 +796,6 @@ function probeTcpPort(port: number, host: string, timeoutMs: number): Promise<vo
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function normalizeViewerUrl(raw: string): string {
-  const value = raw.trim();
-  if (!value) return "https://www.xiaohongshu.com/explore";
-  if (/^https?:\/\//i.test(value)) return value;
-  if (/^[\w.-]+\.[a-z]{2,}(\/|$)/i.test(value)) return `https://${value}`;
-  return `https://www.xiaohongshu.com/search_result?keyword=${encodeURIComponent(value)}`;
 }
 
 function proxyNoVncHttp(req: IncomingMessage, res: ServerResponse, url: URL): void {
