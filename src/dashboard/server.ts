@@ -1,5 +1,8 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { connect as connectTcp } from "node:net";
+import type { Duplex } from "node:stream";
 import path from "node:path";
 import { loadConfig } from "../config.js";
 import { runGrowthAgent } from "../agent/growthAgent.js";
@@ -52,6 +55,11 @@ initSchema(db);
 const publicDir = path.join(config.rootDir, "public");
 const debugScreenshotDir = path.join(config.rootDir, "mcp", "xiaohongshu", "data", "debug");
 const port = Number(process.env.PORT ?? 4173);
+const noVncHost = process.env.XHS_NOVNC_HOST || "127.0.0.1";
+const noVncPort = Number(process.env.XHS_NOVNC_PORT || 6080);
+const browserDisplay = process.env.XHS_DISPLAY || ":99";
+const legacyCdpLoginEnabled =
+  process.env.KATO_ENABLE_LEGACY_CDP_LOGIN === "1" || process.env.XHS_LEGACY_CDP_LOGIN_ENABLED === "1";
 type OperationState = "running" | "completed" | "failed" | "cancelled";
 class OperationCancelledError extends Error {
   constructor(message = "操作已取消") {
@@ -76,6 +84,10 @@ const operations = new Map<string, Operation>();
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+    if (url.pathname.startsWith("/novnc")) {
+      proxyNoVncHttp(req, res, url);
+      return;
+    }
     if (url.pathname.startsWith("/api/") || isPublicXhsApiPath(url.pathname)) {
       await handleApi(req, res, url);
       return;
@@ -84,6 +96,15 @@ const server = createServer(async (req, res) => {
   } catch (error) {
     sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
   }
+});
+
+server.on("upgrade", (req, socket, head) => {
+  const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+  if (!url.pathname.startsWith("/novnc")) {
+    socket.destroy();
+    return;
+  }
+  proxyNoVncUpgrade(req, socket, head, url);
 });
 
 server.listen(port, () => {
@@ -398,6 +419,33 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     return;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/browser-viewer/open") {
+    await fetchMcpJson("/api/v1/login/qrcode", 45_000);
+    sendJson(res, 200, {
+      opened: true,
+      viewerUrl: "/novnc/vnc.html?autoconnect=1&resize=scale&path=websockify",
+      loginUrl: "https://www.xiaohongshu.com/explore"
+    });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/browser-viewer/action") {
+    const body = await readJson(req);
+    sendJson(res, 200, await runBrowserViewerAction(body));
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/browser-viewer/sync-cookies") {
+    const result = await postMcpJson("/api/v1/browser/sync-cookies", {}, 35_000);
+    sendJson(res, 200, unwrapMcpData(result));
+    return;
+  }
+
+  if (url.pathname.startsWith("/api/cdp-login/") && !legacyCdpLoginEnabled) {
+    sendJson(res, 410, { error: "Legacy CDP login API is disabled. Use /api/browser-viewer/* instead." });
+    return;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/cdp-login/open") {
     const body = await readJson(req);
     const result = await openCdpLoginWindow(config, {
@@ -606,10 +654,15 @@ function ensureGeneratedPersona(profileName?: string, logger?: { log(message: st
   logger?.log(`已根据账号和笔记库生成人设草稿：${persona.name}`);
 }
 
-async function fetchMcpJson(endpoint: string): Promise<unknown> {
+async function fetchMcpJson(endpoint: string, timeoutMs = 20_000): Promise<unknown> {
   const base = config.xhs.mcp?.url ? new URL(config.xhs.mcp.url).origin : "http://localhost:18060";
-  const response = await fetchWithTimeout(`${base}${endpoint}`, {}, 20_000);
-  return response.json();
+  const response = await fetchWithTimeout(`${base}${endpoint}`, {}, timeoutMs);
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!response.ok || isMcpFailure(data)) {
+    throw new Error(mcpErrorMessage(data, `MCP ${endpoint} failed: HTTP ${response.status}`));
+  }
+  return data;
 }
 
 async function postMcpJson(endpoint: string, body: Record<string, unknown>, timeoutMs = 35_000): Promise<unknown> {
@@ -621,11 +674,127 @@ async function postMcpJson(endpoint: string, body: Record<string, unknown>, time
   }, timeoutMs);
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
-  if (!response.ok) {
-    const message = typeof data?.error === "object" ? data.error.message : data?.error;
-    throw new Error(message || `MCP ${endpoint} failed: HTTP ${response.status}`);
+  if (!response.ok || isMcpFailure(data)) {
+    throw new Error(mcpErrorMessage(data, `MCP ${endpoint} failed: HTTP ${response.status}`));
   }
   return data;
+}
+
+function isMcpFailure(payload: unknown): boolean {
+  return Boolean(payload && typeof payload === "object" && "success" in payload && (payload as { success?: unknown }).success === false);
+}
+
+function mcpErrorMessage(payload: unknown, fallback: string): string {
+  if (payload && typeof payload === "object") {
+    const error = (payload as { error?: unknown; message?: unknown }).error;
+    if (typeof error === "string" && error.trim()) return error;
+    if (error && typeof error === "object") {
+      const message = (error as { message?: unknown }).message;
+      if (typeof message === "string" && message.trim()) return message;
+    }
+    const message = (payload as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message;
+  }
+  return fallback;
+}
+
+function unwrapMcpData(payload: unknown): unknown {
+  if (payload && typeof payload === "object" && "data" in payload) {
+    return (payload as { data: unknown }).data;
+  }
+  return payload;
+}
+
+async function runBrowserViewerAction(body: Record<string, unknown>): Promise<{ ok: true }> {
+  const action = String(body.action ?? "");
+  if (action === "navigate") {
+    const url = normalizeViewerUrl(String(body.url ?? ""));
+    await runXdotool(["key", "--clearmodifiers", "ctrl+l"]);
+    await runXdotool(["type", "--delay", "12", "--clearmodifiers", url]);
+    await runXdotool(["key", "--clearmodifiers", "Return"]);
+    return { ok: true };
+  }
+  if (action === "back") {
+    await runXdotool(["key", "--clearmodifiers", "Alt+Left"]);
+    return { ok: true };
+  }
+  if (action === "forward") {
+    await runXdotool(["key", "--clearmodifiers", "Alt+Right"]);
+    return { ok: true };
+  }
+  if (action === "reload") {
+    await runXdotool(["key", "--clearmodifiers", "F5"]);
+    return { ok: true };
+  }
+  throw new Error("不支持的浏览器动作。");
+}
+
+function runXdotool(args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    execFile("xdotool", args, { env: { ...process.env, DISPLAY: browserDisplay }, timeout: 10_000 }, (error, stdout, stderr) => {
+      if (error) {
+        const message = stderr?.trim() || stdout?.trim() || error.message;
+        reject(new Error(`浏览器远程操作失败：${message}`));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+function normalizeViewerUrl(raw: string): string {
+  const value = raw.trim();
+  if (!value) return "https://www.xiaohongshu.com/explore";
+  if (/^https?:\/\//i.test(value)) return value;
+  if (/^[\w.-]+\.[a-z]{2,}(\/|$)/i.test(value)) return `https://${value}`;
+  return `https://www.xiaohongshu.com/search_result?keyword=${encodeURIComponent(value)}`;
+}
+
+function proxyNoVncHttp(req: IncomingMessage, res: ServerResponse, url: URL): void {
+  const upstreamPath = stripNoVncPrefix(url);
+  const proxyReq = httpRequest(
+    {
+      hostname: noVncHost,
+      port: noVncPort,
+      method: req.method,
+      path: upstreamPath,
+      headers: { ...req.headers, host: `${noVncHost}:${noVncPort}` }
+    },
+    (proxyRes) => {
+      res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
+      proxyRes.pipe(res);
+    }
+  );
+  proxyReq.on("error", (error) => {
+    if (!res.headersSent) sendJson(res, 502, { error: `noVNC 不可用：${error.message}` });
+    else res.destroy(error);
+  });
+  req.pipe(proxyReq);
+}
+
+function proxyNoVncUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer, url: URL): void {
+  const upstreamPath = stripNoVncPrefix(url);
+  const upstream = connectTcp(noVncPort, noVncHost);
+  upstream.on("connect", () => {
+    const headers = Object.entries(req.headers)
+      .map(([key, value]) => `${key}: ${Array.isArray(value) ? value.join(", ") : value ?? ""}`)
+      .join("\r\n");
+    upstream.write(`${req.method ?? "GET"} ${upstreamPath} HTTP/${req.httpVersion}\r\n${headers}\r\n\r\n`);
+    if (head.length) upstream.write(head);
+    upstream.pipe(socket);
+    socket.pipe(upstream);
+  });
+  const close = () => {
+    socket.destroy();
+    upstream.destroy();
+  };
+  upstream.on("error", close);
+  socket.on("error", close);
+}
+
+function stripNoVncPrefix(url: URL): string {
+  const stripped = url.pathname.replace(/^\/novnc\/?/, "/") || "/";
+  return `${stripped}${url.search}`;
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {

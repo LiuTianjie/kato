@@ -1,18 +1,34 @@
 import { createServer } from "node:http";
 import { createServer as createTcpServer, connect as connectTcp } from "node:net";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { chromium } from "playwright";
+import { chromium } from "playwright-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
+
+let stealthPluginReady = false;
+try {
+  chromium.use(StealthPlugin());
+  stealthPluginReady = true;
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`Stealth plugin unavailable; using custom fingerprint fallback only: ${message}`);
+}
 
 const PORT = Number(process.env.PORT || 18060);
-const BROWSER_BIN = process.env.XHS_BROWSER_BIN || process.env.CHROME_BIN || "/usr/bin/chromium";
-const CDP_HOST = process.env.XHS_CDP_HOST || "0.0.0.0";
-const CDP_PORT = Number(process.env.XHS_CDP_PORT || 9223);
-const INTERNAL_CDP_PORT = Number(process.env.XHS_INTERNAL_CDP_PORT || CDP_PORT + 1);
+const BROWSER_BIN = process.env.XHS_BROWSER_BIN || process.env.CHROME_BIN || "/usr/bin/google-chrome-stable";
+const CDP_HOST = process.env.XHS_CDP_HOST || "127.0.0.1";
+const CDP_PORT = Number(process.env.XHS_CDP_PORT || 9224);
+const INTERNAL_CDP_PORT = Number(process.env.XHS_INTERNAL_CDP_PORT || CDP_PORT);
+const CDP_PROXY_ENABLED = process.env.XHS_CDP_PROXY_ENABLED === "1";
 const PROFILE_DIR = process.env.XHS_PROFILE_DIR || "/app/data/profile";
 const COOKIES_PATH = process.env.COOKIES_PATH || "/app/data/cookies.json";
+const COOKIE_FALLBACK_PATHS = uniquePaths([
+  COOKIES_PATH,
+  "/app/mcp/xiaohongshu/data/cookies.json",
+  "/app/data/cookies.json"
+]);
 const CHROMIUM_HEADLESS = process.env.XHS_CHROMIUM_HEADLESS === "1";
 const CDP_CONNECT_TIMEOUT_MS = normalizePositiveEnv("XHS_CDP_CONNECT_TIMEOUT_MS", 30_000);
 const BROWSER_STATUS_TIMEOUT_MS = normalizePositiveEnv("XHS_BROWSER_STATUS_TIMEOUT_MS", 2_000);
@@ -21,6 +37,35 @@ const PROCESS_EXIT_GRACE_MS = normalizePositiveEnv("XHS_PROCESS_EXIT_GRACE_MS", 
 const HEALTH_ENSURE_TIMEOUT_MS = normalizePositiveEnv("XHS_HEALTH_ENSURE_TIMEOUT_MS", 20_000);
 const CDP_CONNECT_ATTEMPTS = normalizePositiveEnv("XHS_CDP_CONNECT_ATTEMPTS", 3);
 const BROWSER_TASK_TIMEOUT_MS = normalizePositiveEnv("XHS_BROWSER_TASK_TIMEOUT_MS", 180_000);
+const STEALTH_PLUGIN_READY = stealthPluginReady;
+const BROWSER_VERSION = detectChromeVersion();
+const BROWSER_MAJOR_VERSION = process.env.XHS_BROWSER_MAJOR_VERSION || BROWSER_VERSION.major;
+const WINDOWS_USER_AGENT =
+  process.env.XHS_BROWSER_USER_AGENT ||
+  `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${BROWSER_VERSION.full} Safari/537.36`;
+const WINDOWS_ACCEPT_LANGUAGE = process.env.XHS_BROWSER_ACCEPT_LANGUAGE || "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7";
+const WINDOWS_NAVIGATOR_PLATFORM = process.env.XHS_NAVIGATOR_PLATFORM || "Win32";
+const WINDOWS_PLATFORM_VERSION = process.env.XHS_BROWSER_PLATFORM_VERSION || "10.0.0";
+const WINDOWS_UA_METADATA = {
+  brands: [
+    { brand: "Google Chrome", version: BROWSER_MAJOR_VERSION },
+    { brand: "Chromium", version: BROWSER_MAJOR_VERSION },
+    { brand: "Not/A)Brand", version: "24" }
+  ],
+  fullVersionList: [
+    { brand: "Google Chrome", version: BROWSER_VERSION.full },
+    { brand: "Chromium", version: BROWSER_VERSION.full },
+    { brand: "Not/A)Brand", version: "24.0.0.0" }
+  ],
+  fullVersion: BROWSER_VERSION.full,
+  platform: "Windows",
+  platformVersion: WINDOWS_PLATFORM_VERSION,
+  architecture: "x86",
+  bitness: "64",
+  model: "",
+  mobile: false,
+  wow64: false
+};
 const XHS_HOME_URL = "https://www.xiaohongshu.com/explore";
 const XHS_CREATOR_URL = "https://creator.xiaohongshu.com";
 
@@ -34,6 +79,7 @@ let browserTaskSeq = 0;
 let browserTaskPending = 0;
 let browserTaskActive = null;
 let browserPriorityPromise;
+let cookiePersistTimer;
 
 class BrowserTaskTimeoutError extends Error {
   constructor(message) {
@@ -62,7 +108,7 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/api/v1/login/qrcode") {
       await enqueueBrowserTask("login:qrcode", () => openLoginPage());
-      sendJson(res, 200, { success: true, data: { opened: true, loginUrl: XHS_HOME_URL, cdpUrl: cdpUrl() } });
+      sendJson(res, 200, { success: true, data: { opened: true, loginUrl: XHS_HOME_URL, viewer: "novnc" } });
       return;
     }
 
@@ -70,6 +116,18 @@ const server = createServer(async (req, res) => {
       const body = await readJson(req);
       const data = await priorityRestartBrowser(`priority:${String(body.reason || "manual")}`);
       sendJson(res, 200, { success: true, data });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/v1/browser/status") {
+      sendJson(res, 200, { success: true, data: await browserSummary() });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/v1/browser/sync-cookies") {
+      const context = await ensureContext();
+      const exportedCookies = await persistContextCookies(context, "manual-sync");
+      sendJson(res, 200, { success: true, data: { cookiesPath: COOKIES_PATH, exportedCookies } });
       return;
     }
 
@@ -162,23 +220,25 @@ process.on("SIGTERM", shutdown);
 async function shutdown() {
   try {
     const context = contextPromise ? await contextPromise : undefined;
+    if (context) await persistContextCookies(context, "shutdown").catch(() => undefined);
     await context?.browser()?.close();
   } finally {
+    stopCookieAutoPersist();
     browserProcess?.kill();
     process.exit(0);
   }
 }
 
 async function browserSummary() {
-  if (!contextPromise) return { running: false, cdpUrl: cdpUrl(), queue: browserQueueSummary() };
+  if (!contextPromise) return { running: false, queue: browserQueueSummary(), stealth: stealthSummary() };
   try {
     const context = await withTimeout(contextPromise, BROWSER_STATUS_TIMEOUT_MS, "Browser status timed out.");
-    return { running: true, pages: context.pages().length, cdpUrl: cdpUrl(), queue: browserQueueSummary() };
+    return { running: true, pages: context.pages().length, queue: browserQueueSummary(), stealth: stealthSummary() };
   } catch (error) {
     return {
       running: false,
-      cdpUrl: cdpUrl(),
       queue: browserQueueSummary(),
+      stealth: stealthSummary(),
       error: error instanceof Error ? error.message : String(error)
     };
   }
@@ -191,11 +251,21 @@ async function healthBrowserSummary({ ensure = false } = {}) {
   } catch (error) {
     return {
       running: false,
-      cdpUrl: cdpUrl(),
+      queue: browserQueueSummary(),
+      stealth: stealthSummary(),
       error: error instanceof Error ? error.message : String(error)
     };
   }
   return browserSummary();
+}
+
+function stealthSummary() {
+  return {
+    plugin: STEALTH_PLUGIN_READY,
+    customFingerprint: true,
+    platform: "Windows",
+    cdp: "internal-loopback"
+  };
 }
 
 async function ensureContext() {
@@ -308,8 +378,11 @@ async function launchContext() {
       "--no-first-run",
       "--no-default-browser-check",
       "--disable-sync",
+      "--disable-blink-features=AutomationControlled",
       "--password-store=basic",
       "--window-size=1440,980",
+      `--user-agent=${WINDOWS_USER_AGENT}`,
+      "--accept-lang=zh-CN,zh,en-US,en",
       `--remote-debugging-address=${CDP_HOST}`,
       `--remote-debugging-port=${INTERNAL_CDP_PORT}`,
       "--lang=zh-CN",
@@ -327,6 +400,7 @@ async function launchContext() {
       browserProcess = undefined;
       contextPromise = undefined;
       servicePagePromise = undefined;
+      stopCookieAutoPersist();
     }
   });
 
@@ -335,9 +409,15 @@ async function launchContext() {
     await waitForCdpHttp();
     const browser = await connectBrowserOverCdp();
     const context = browser.contexts()[0] || (await browser.newContext({ viewport: { width: 1440, height: 980 }, locale: "zh-CN" }));
+    await configureContextFingerprint(context);
     await loadCookies(context);
+    startCookieAutoPersist(context);
     context.on("page", (page) => {
       page.setDefaultTimeout(30_000);
+      applyPageFingerprint(page).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`Page fingerprint apply failed: ${message}`);
+      });
     });
     await verifyContextReady(context);
     return context;
@@ -346,6 +426,7 @@ async function launchContext() {
       terminateProcess(spawned, "launch failed");
       browserProcess = undefined;
     }
+    stopCookieAutoPersist();
     throw error;
   }
 }
@@ -358,12 +439,90 @@ async function clearStaleProfileLocks() {
   );
 }
 
+async function configureContextFingerprint(context) {
+  await context.setExtraHTTPHeaders({
+    "Accept-Language": WINDOWS_ACCEPT_LANGUAGE
+  }).catch(() => undefined);
+  await context.addInitScript(
+    ({ userAgent, platform, platformVersion, brands, fullVersionList, languages }) => {
+      const defineGetter = (target, key, value) => {
+        try {
+          Object.defineProperty(target, key, { get: () => value, configurable: true });
+        } catch {
+          // Some browser-owned properties may be non-configurable in older builds.
+        }
+      };
+
+      defineGetter(Navigator.prototype, "platform", platform);
+      defineGetter(Navigator.prototype, "userAgent", userAgent);
+      defineGetter(Navigator.prototype, "appVersion", userAgent.replace(/^Mozilla\//, ""));
+      defineGetter(Navigator.prototype, "languages", languages);
+      defineGetter(Navigator.prototype, "language", languages[0]);
+      defineGetter(Navigator.prototype, "webdriver", undefined);
+      defineGetter(Navigator.prototype, "maxTouchPoints", 0);
+
+      const userAgentData = {
+        brands,
+        mobile: false,
+        platform: "Windows",
+        getHighEntropyValues: async (hints = []) => {
+          const values = {
+            brands,
+            mobile: false,
+            platform: "Windows",
+            architecture: "x86",
+            bitness: "64",
+            model: "",
+            platformVersion,
+            uaFullVersion: fullVersionList[0]?.version || "",
+            fullVersionList
+          };
+          return Object.fromEntries(hints.map((hint) => [hint, values[hint]]).filter(([, value]) => value !== undefined));
+        },
+        toJSON: () => ({ brands, mobile: false, platform: "Windows" })
+      };
+      defineGetter(Navigator.prototype, "userAgentData", userAgentData);
+    },
+    {
+      userAgent: WINDOWS_USER_AGENT,
+      platform: WINDOWS_NAVIGATOR_PLATFORM,
+      platformVersion: WINDOWS_PLATFORM_VERSION,
+      brands: WINDOWS_UA_METADATA.brands,
+      fullVersionList: WINDOWS_UA_METADATA.fullVersionList,
+      languages: ["zh-CN", "zh", "en-US", "en"]
+    }
+  ).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Context fingerprint init script failed: ${message}`);
+  });
+
+  await Promise.all(context.pages().map((page) => applyPageFingerprint(page)));
+}
+
+async function applyPageFingerprint(page) {
+  const session = await page.context().newCDPSession(page);
+  try {
+    await session.send("Emulation.setUserAgentOverride", {
+      userAgent: WINDOWS_USER_AGENT,
+      acceptLanguage: WINDOWS_ACCEPT_LANGUAGE,
+      platform: "Windows",
+      userAgentMetadata: WINDOWS_UA_METADATA
+    });
+  } finally {
+    await session.detach().catch(() => undefined);
+  }
+}
+
 async function servicePage() {
   const context = await ensureContext();
   if (!servicePagePromise) {
     servicePagePromise = (async () => {
       const page = context.pages()[0] || (await context.newPage());
       page.setDefaultTimeout(30_000);
+      await applyPageFingerprint(page).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`Service page fingerprint apply failed: ${message}`);
+      });
       return page;
     })();
   }
@@ -383,6 +542,7 @@ async function restartBrowser(reason = "manual") {
     const oldProcess = browserProcess;
     contextPromise = undefined;
     servicePagePromise = undefined;
+    stopCookieAutoPersist();
 
     if (oldProcess) {
       terminateProcess(oldProcess, reason);
@@ -392,6 +552,7 @@ async function restartBrowser(reason = "manual") {
 
     if (oldContextPromise) {
       const context = await withTimeout(oldContextPromise, 1_500, "Old browser context close timed out.").catch(() => undefined);
+      if (context) await persistContextCookies(context, "restart").catch(() => undefined);
       await withTimeout(context?.browser()?.close(), 1_500, "Old browser close timed out.").catch(() => undefined);
     }
 
@@ -441,12 +602,11 @@ async function loginStatus() {
     const context = await ensureContext();
     const cookies = await context.cookies();
     const xhsCookies = cookies.filter((cookie) => /xiaohongshu|xhs|rednote/i.test(cookie.domain));
-    await persistCookies(xhsCookies);
+    if (xhsCookies.length) await persistCookies(xhsCookies, "loginStatus");
     return {
       is_logged_in: xhsCookies.some((cookie) => ["web_session", "id_token"].includes(cookie.name) && cookie.value),
       username: await readVisibleUsername().catch(() => ""),
-      cookie_count: xhsCookies.length,
-      cdp_url: cdpUrl()
+      cookie_count: xhsCookies.length
     };
   });
 }
@@ -861,17 +1021,61 @@ async function readVisibleUsername() {
 }
 
 async function loadCookies(context) {
-  try {
-    const text = await readFile(COOKIES_PATH, "utf8");
-    const cookies = JSON.parse(text);
-    if (Array.isArray(cookies) && cookies.length) await context.addCookies(cookies);
-  } catch {
-    // no exported cookies yet
+  for (const cookiesPath of COOKIE_FALLBACK_PATHS) {
+    try {
+      const text = await readFile(cookiesPath, "utf8");
+      const cookies = JSON.parse(text);
+      if (Array.isArray(cookies) && cookies.length) {
+        await context.addCookies(cookies);
+        console.error(`Loaded ${cookies.length} XHS cookies from ${cookiesPath}`);
+        if (cookiesPath !== COOKIES_PATH) await persistCookies(cookies, "migrate");
+        return;
+      }
+    } catch {
+      // try next cookie path
+    }
   }
+  console.error(`No exported XHS cookies found in ${COOKIE_FALLBACK_PATHS.join(", ")}`);
 }
 
-async function persistCookies(cookies) {
-  await writeFile(COOKIES_PATH, JSON.stringify(cookies, null, 2), "utf8").catch(() => undefined);
+async function persistContextCookies(context, reason = "auto") {
+  const cookies = await context.cookies();
+  const xhsCookies = cookies.filter((cookie) => /xiaohongshu|xhs|rednote/i.test(cookie.domain));
+  if (!xhsCookies.length) return 0;
+  await persistCookies(xhsCookies, reason);
+  return xhsCookies.length;
+}
+
+async function persistCookies(cookies, reason = "manual") {
+  if (!Array.isArray(cookies) || !cookies.length) return;
+  const data = JSON.stringify(cookies, null, 2);
+  await Promise.all(
+    COOKIE_FALLBACK_PATHS.map(async (cookiesPath) => {
+      try {
+        await mkdir(path.dirname(cookiesPath), { recursive: true });
+        await writeFile(cookiesPath, data, "utf8");
+      } catch {
+        // best-effort compatibility mirror
+      }
+    })
+  );
+  console.error(`Persisted ${cookies.length} XHS cookies (${reason}) to ${COOKIES_PATH}`);
+}
+
+function startCookieAutoPersist(context) {
+  stopCookieAutoPersist();
+  cookiePersistTimer = setInterval(() => {
+    persistContextCookies(context, "auto").catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`Cookie auto persist failed: ${message}`);
+    });
+  }, 15_000);
+  cookiePersistTimer.unref?.();
+}
+
+function stopCookieAutoPersist() {
+  if (cookiePersistTimer) clearInterval(cookiePersistTimer);
+  cookiePersistTimer = undefined;
 }
 
 function toNotePayload(post) {
@@ -1042,7 +1246,26 @@ function normalizePositiveEnv(name, fallback) {
   return Math.floor(value);
 }
 
+function detectChromeVersion() {
+  const fallback = process.env.XHS_BROWSER_FULL_VERSION || "137.0.0.0";
+  try {
+    const output = execFileSync(process.env.GOOGLE_CHROME_BIN || "/usr/bin/google-chrome-stable", ["--version"], {
+      encoding: "utf8",
+      timeout: 2_000
+    });
+    const version = output.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1] || fallback;
+    return { full: version, major: version.split(".")[0] || "137" };
+  } catch {
+    return { full: fallback, major: fallback.split(".")[0] || "137" };
+  }
+}
+
+function uniquePaths(paths) {
+  return [...new Set(paths.filter(Boolean))];
+}
+
 function startCdpProxy() {
+  if (!CDP_PROXY_ENABLED || CDP_PORT === INTERNAL_CDP_PORT) return;
   if (cdpProxyStarted) return;
   cdpProxyStarted = true;
   const proxy = createTcpServer((client) => {
@@ -1057,8 +1280,8 @@ function startCdpProxy() {
     upstream.on("error", close);
   });
   proxy.on("error", (error) => console.error(`CDP proxy error: ${error.message}`));
-  proxy.listen(CDP_PORT, "0.0.0.0", () => {
-    console.log(`CDP proxy listening on 0.0.0.0:${CDP_PORT} -> 127.0.0.1:${INTERNAL_CDP_PORT}`);
+  proxy.listen(CDP_PORT, "127.0.0.1", () => {
+    console.log(`CDP proxy listening on 127.0.0.1:${CDP_PORT} -> 127.0.0.1:${INTERNAL_CDP_PORT}`);
   });
 }
 

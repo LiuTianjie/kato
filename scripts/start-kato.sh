@@ -2,6 +2,12 @@
 set -eu
 
 cleanup() {
+  if [ -n "${NOVNC_PID:-}" ]; then
+    kill "$NOVNC_PID" 2>/dev/null || true
+  fi
+  if [ -n "${VNC_PID:-}" ]; then
+    kill "$VNC_PID" 2>/dev/null || true
+  fi
   if [ -n "${XHS_PID:-}" ]; then
     kill "$XHS_PID" 2>/dev/null || true
   fi
@@ -11,9 +17,37 @@ cleanup() {
   if [ -n "${XHS_MONITOR_PID:-}" ]; then
     kill "$XHS_MONITOR_PID" 2>/dev/null || true
   fi
+  if [ -n "${XVFB_PID:-}" ]; then
+    kill "$XVFB_PID" 2>/dev/null || true
+  fi
 }
 
 trap cleanup INT TERM EXIT
+
+export DISPLAY="${XHS_DISPLAY:-:99}"
+DISPLAY_SIZE="${XHS_DISPLAY_SIZE:-1440x980x24}"
+Xvfb "$DISPLAY" -screen 0 "$DISPLAY_SIZE" -ac +extension RANDR &
+XVFB_PID="$!"
+sleep 0.5
+
+if [ "${XHS_VNC_ENABLED:-1}" = "1" ]; then
+  x11vnc \
+    -display "$DISPLAY" \
+    -forever \
+    -shared \
+    -nopw \
+    -localhost \
+    -listen 127.0.0.1 \
+    -rfbport "${XHS_VNC_PORT:-5900}" \
+    -quiet &
+  VNC_PID="$!"
+
+  websockify \
+    --web=/usr/share/novnc \
+    "127.0.0.1:${XHS_NOVNC_PORT:-6080}" \
+    "127.0.0.1:${XHS_VNC_PORT:-5900}" &
+  NOVNC_PID="$!"
+fi
 
 PORT="${XHS_SERVICE_PORT:-18060}" node mcp/xiaohongshu/service/server.js &
 XHS_PID="$!"
@@ -35,4 +69,11 @@ STATUS="$?"
 cleanup
 wait "$XHS_PID" 2>/dev/null || true
 wait "$XHS_MONITOR_PID" 2>/dev/null || true
+if [ -n "${VNC_PID:-}" ]; then
+  wait "$VNC_PID" 2>/dev/null || true
+fi
+if [ -n "${NOVNC_PID:-}" ]; then
+  wait "$NOVNC_PID" 2>/dev/null || true
+fi
+wait "$XVFB_PID" 2>/dev/null || true
 exit "$STATUS"

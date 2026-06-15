@@ -16,23 +16,9 @@ export const dashboardApi = {
   getDebugScreenshots: () => api("/api/debug-screenshots?limit=48"),
   getMcpStatus: () => api("/api/mcp/login-status"),
   restartMcpBrowser: () => api("/api/mcp/browser/restart", { method: "POST" }),
-  openCdpLogin: (body = {}) => api("/api/cdp-login/open", { method: "POST", body }),
-  getCdpTarget: () => api("/api/cdp-login/target?ensure=1"),
-  getCdpFrame: (params = {}) => {
-    const search = new URLSearchParams({ ensure: "1" });
-    if (params.width) search.set("width", String(params.width));
-    if (params.height) search.set("height", String(params.height));
-    return api(`/api/cdp-login/frame?${search.toString()}`);
-  },
-  getCdpScreencastUrl: (params = {}) => {
-    const search = new URLSearchParams({ ensure: "1" });
-    if (params.width) search.set("width", String(params.width));
-    if (params.height) search.set("height", String(params.height));
-    return `/api/cdp-login/screencast?${search.toString()}`;
-  },
-  sendCdpInput: (body = {}) => api("/api/cdp-login/input", { method: "POST", body }),
-  sendCdpBrowserAction: (body = {}) => api("/api/cdp-login/browser-action", { method: "POST", body }),
-  syncCdpCookies: (body = {}) => api("/api/cdp-login/sync-cookies", { method: "POST", body }),
+  openBrowserViewer: (body = {}) => api("/api/browser-viewer/open", { method: "POST", body }),
+  sendBrowserViewerAction: (body = {}) => api("/api/browser-viewer/action", { method: "POST", body }),
+  syncBrowserViewerCookies: () => api("/api/browser-viewer/sync-cookies", { method: "POST" }),
   getOperation: (id) => api(`/api/operations/${id}`),
   cancelOperation: (id) => api(`/api/operations/${id}/cancel`, { method: "POST" }),
   getPersona: () => api("/api/account-persona"),

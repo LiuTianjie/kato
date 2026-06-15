@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { AppConfig } from "../config.js";
 
-const DEFAULT_PORT = 9222;
+const DEFAULT_PORT = 9224;
 const DEFAULT_HOST = "127.0.0.1";
 const XHS_CREATOR_URL = "https://creator.xiaohongshu.com";
 const XHS_WEB_URL = "https://www.xiaohongshu.com/explore";
@@ -28,6 +28,15 @@ export interface CdpLoginResult {
   loggedIn?: boolean;
   cookiesPath?: string;
   exportedCookies?: number;
+}
+
+export interface BrowserViewerLoginResult {
+  account: string;
+  mcpBaseUrl: string;
+  dashboardUrl: string;
+  viewerUrl: string;
+  loginUrl: string;
+  opened: boolean;
 }
 
 export function getDefaultCdpPort(): number {
@@ -77,6 +86,42 @@ export async function openCdpLoginWindow(config: AppConfig, options: CdpLoginOpt
   }
 
   return result;
+}
+
+export async function openBrowserViewerLogin(config: AppConfig, account?: string): Promise<BrowserViewerLoginResult> {
+  const mcpBaseUrl = getMcpRestBaseUrl(config);
+  await requestContainerLoginBrowser(mcpBaseUrl);
+  const dashboardPort = Number(process.env.PORT || 4173);
+  const dashboardUrl = process.env.KATO_DASHBOARD_URL || `http://localhost:${dashboardPort}`;
+  return {
+    account: account?.trim() || "mcp-container",
+    mcpBaseUrl,
+    dashboardUrl,
+    viewerUrl: `${dashboardUrl.replace(/\/$/, "")}/#browser`,
+    loginUrl: XHS_WEB_URL,
+    opened: true
+  };
+}
+
+export async function syncBrowserViewerCookiesToMcp(config: AppConfig): Promise<{ cookiesPath: string; exportedCookies: number }> {
+  const mcpBaseUrl = getMcpRestBaseUrl(config);
+  const response = await fetch(`${mcpBaseUrl}/api/v1/browser/sync-cookies`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}"
+  });
+  const text = await response.text();
+  const payload = text ? JSON.parse(text) : {};
+  if (!response.ok || isMcpFailure(payload)) {
+    throw new Error(mcpErrorMessage(payload, `Kato cookie 同步失败：HTTP ${response.status}`));
+  }
+  const data = payload && typeof payload === "object" && "data" in payload ? (payload as { data: unknown }).data : payload;
+  if (!data || typeof data !== "object") {
+    throw new Error("Kato cookie 同步返回为空。");
+  }
+  const cookiesPath = String((data as { cookiesPath?: unknown }).cookiesPath ?? "mcp/xiaohongshu/data/cookies.json");
+  const exportedCookies = Number((data as { exportedCookies?: unknown }).exportedCookies ?? 0);
+  return { cookiesPath, exportedCookies: Number.isFinite(exportedCookies) ? exportedCookies : 0 };
 }
 
 export async function restartContainerBrowser(config: AppConfig, reason = "manual", port = getDefaultCdpPort()): Promise<unknown> {
@@ -136,10 +181,28 @@ function getMcpRestBaseUrl(config: AppConfig): string {
 async function requestContainerLoginBrowser(mcpBaseUrl: string): Promise<unknown> {
   const response = await fetch(`${mcpBaseUrl}/api/v1/login/qrcode`);
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(`Kato 容器浏览器接管启动失败：HTTP ${response.status} ${JSON.stringify(payload)}`);
+  if (!response.ok || isMcpFailure(payload)) {
+    throw new Error(mcpErrorMessage(payload, `Kato 容器浏览器接管启动失败：HTTP ${response.status} ${JSON.stringify(payload)}`));
   }
   return payload;
+}
+
+function isMcpFailure(payload: unknown): boolean {
+  return Boolean(payload && typeof payload === "object" && "success" in payload && (payload as { success?: unknown }).success === false);
+}
+
+function mcpErrorMessage(payload: unknown, fallback: string): string {
+  if (payload && typeof payload === "object") {
+    const error = (payload as { error?: unknown; message?: unknown }).error;
+    if (typeof error === "string" && error.trim()) return error;
+    if (error && typeof error === "object") {
+      const message = (error as { message?: unknown }).message;
+      if (typeof message === "string" && message.trim()) return message;
+    }
+    const message = (payload as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message;
+  }
+  return fallback;
 }
 
 async function waitForLogin(port: number, timeoutMs: number): Promise<boolean> {

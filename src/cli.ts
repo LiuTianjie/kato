@@ -9,7 +9,13 @@ import { importNotesFromCsv, listActiveNotes } from "./notes/importNotes.js";
 import { markInteraction } from "./runs/approval.js";
 import { parseKeywordArg } from "./runs/keywords.js";
 import { publishConfirmedInteractions } from "./runs/publish.js";
-import { getDefaultCdpPort, openCdpLoginWindow, syncCdpCookiesToMcp } from "./auth/cdpLogin.js";
+import {
+  getDefaultCdpPort,
+  openBrowserViewerLogin,
+  openCdpLoginWindow,
+  syncBrowserViewerCookiesToMcp,
+  syncCdpCookiesToMcp
+} from "./auth/cdpLogin.js";
 
 type Args = Record<string, string | boolean>;
 
@@ -68,35 +74,48 @@ async function main(): Promise<void> {
         break;
       }
       case "auth:cdp": {
-        const result = await openCdpLoginWindow(config, {
-          account: typeof args.account === "string" ? args.account : undefined,
-          port: Number(args.port ?? getDefaultCdpPort()),
-          restart: args.restart === true,
-          wait: args.wait === true,
-          syncCookies: args["sync-cookies"] === true,
-          timeoutMs: Number(args.timeout ?? 300) * 1000
-        });
-        console.log(`CDP: ${result.cdpUrl}`);
-        console.log(`DevTools targets: ${result.devtoolsUrl}`);
+        if (args.legacy === true) {
+          const result = await openCdpLoginWindow(config, {
+            account: typeof args.account === "string" ? args.account : undefined,
+            port: Number(args.port ?? getDefaultCdpPort()),
+            restart: args.restart === true,
+            wait: args.wait === true,
+            syncCookies: args["sync-cookies"] === true,
+            timeoutMs: Number(args.timeout ?? 300) * 1000
+          });
+          console.log(`Legacy CDP: ${result.cdpUrl}`);
+          console.log(`DevTools targets: ${result.devtoolsUrl}`);
+          console.log(`MCP: ${result.mcpBaseUrl}`);
+          console.log(`Account: ${result.account}`);
+          console.log(`Cookies: ${result.profileDir}`);
+          console.log(`Login page: ${result.loginUrl}`);
+          console.log(result.alreadyRunning ? "Chrome: reused existing container CDP browser" : "Chrome: requested MCP container browser");
+          if (result.restarted) console.log("Chrome: restarted container browser before opening login");
+          if (result.loggedIn !== undefined) {
+            console.log(result.loggedIn ? "Login: confirmed" : "Login: still waiting or timed out");
+            if (!result.loggedIn) process.exitCode = 1;
+          } else {
+            console.log("请在打开的 Chrome 窗口中完成登录 / 二次验证。");
+          }
+          if (result.cookiesPath) {
+            console.log(`Cookies: exported ${result.exportedCookies ?? 0} to ${result.cookiesPath}`);
+          }
+          break;
+        }
+        const result = await openBrowserViewerLogin(config, typeof args.account === "string" ? args.account : undefined);
+        console.log(`Dashboard: ${result.dashboardUrl}`);
+        console.log(`Browser viewer: ${result.viewerUrl}`);
         console.log(`MCP: ${result.mcpBaseUrl}`);
         console.log(`Account: ${result.account}`);
-        console.log(`Cookies: ${result.profileDir}`);
         console.log(`Login page: ${result.loginUrl}`);
-        console.log(result.alreadyRunning ? "Chrome: reused existing container CDP browser" : "Chrome: requested MCP container browser");
-        if (result.restarted) console.log("Chrome: restarted container browser before opening login");
-        if (result.loggedIn !== undefined) {
-          console.log(result.loggedIn ? "Login: confirmed" : "Login: still waiting or timed out");
-          if (!result.loggedIn) process.exitCode = 1;
-        } else {
-          console.log("请在打开的 Chrome 窗口中完成登录 / 二次验证。");
-        }
-        if (result.cookiesPath) {
-          console.log(`Cookies: exported ${result.exportedCookies ?? 0} to ${result.cookiesPath}`);
-        }
+        console.log("请在 Dashboard 的浏览器接管 Tab 内完成登录 / 二次验证。");
         break;
       }
       case "auth:sync-cookies": {
-        const result = await syncCdpCookiesToMcp(config, Number(args.port ?? getDefaultCdpPort()));
+        const result =
+          args.legacy === true
+            ? await syncCdpCookiesToMcp(config, Number(args.port ?? getDefaultCdpPort()))
+            : await syncBrowserViewerCookiesToMcp(config);
         console.log(`Cookies: exported ${result.exportedCookies} to ${result.cookiesPath}`);
         break;
       }
@@ -149,6 +168,7 @@ Usage:
   npm run mark -- --interaction-id 1 --status posted_by_user
   npm run auth:cdp
   npm run auth:sync-cookies
+  npm run auth:sync-cookies -- --legacy
 `);
 }
 
