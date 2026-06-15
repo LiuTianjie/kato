@@ -9,7 +9,7 @@ import { bindContentWorkspace, refreshContentWorkspace } from "./js/components/c
 import { renderHistory, renderHistoryLoading, renderMetrics, clearHistoryFilters } from "./js/components/history.js";
 import { appendClientLog, bindLogPanel } from "./js/components/logPanel.js";
 import { bindCdpViewer } from "./js/components/cdpViewer.js";
-import { openCdpLogin, refreshMcp } from "./js/components/mcpPanel.js";
+import { openCdpLogin, refreshMcp, restartMcpBrowser } from "./js/components/mcpPanel.js";
 import { configureNotes, renderNotes, renderNotesLoading } from "./js/components/notes.js";
 import { bindPostSearch, renderPostSearchEmpty } from "./js/components/postSearch.js";
 import {
@@ -48,6 +48,7 @@ function bindEvents() {
   $("refreshAll").addEventListener("click", () => withButtonLoading($("refreshAll"), "刷新中", refreshAll));
   $("refreshMcp").addEventListener("click", () => refreshMcp($("refreshMcp")));
   $("openCdpLogin").addEventListener("click", () => openCdpLogin($("openCdpLogin")));
+  $("restartMcpBrowser").addEventListener("click", () => restartMcpBrowser($("restartMcpBrowser")));
   $("startRun").addEventListener("click", () => operations.startRun($("startRun")));
   $("syncNotes").addEventListener("click", () => operations.syncNotes($("syncNotes")));
   $("refreshDebugScreenshots").addEventListener("click", () =>

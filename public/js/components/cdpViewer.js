@@ -45,6 +45,13 @@ export async function connectCdpViewer() {
   }
 }
 
+export async function reconnectCdpViewer() {
+  connected = false;
+  stopStream();
+  $("cdpScreen").removeAttribute("src");
+  return connectCdpViewer();
+}
+
 function startStream() {
   stopStream();
   const requestedViewport = getRequestedViewport();

@@ -15,6 +15,7 @@ export const dashboardApi = {
   getInteractions: (params) => api(`/api/interactions?${params}`),
   getDebugScreenshots: () => api("/api/debug-screenshots?limit=48"),
   getMcpStatus: () => api("/api/mcp/login-status"),
+  restartMcpBrowser: () => api("/api/mcp/browser/restart", { method: "POST" }),
   openCdpLogin: (body = {}) => api("/api/cdp-login/open", { method: "POST", body }),
   getCdpTarget: () => api("/api/cdp-login/target?ensure=1"),
   getCdpFrame: (params = {}) => {

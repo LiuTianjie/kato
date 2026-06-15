@@ -2,7 +2,7 @@ import { dashboardApi } from "../api.js";
 import { $, setText } from "../dom.js";
 import { errorMessage } from "../format.js";
 import { withButtonLoading } from "../loading.js";
-import { connectCdpViewer } from "./cdpViewer.js";
+import { connectCdpViewer, reconnectCdpViewer } from "./cdpViewer.js";
 import { appendClientLog } from "./logPanel.js";
 import { activateTab } from "./tabs.js";
 
@@ -41,6 +41,25 @@ export async function openCdpLogin(button) {
       await connectCdpViewer();
     } catch (error) {
       appendClientLog(`失败 · 浏览器接管：${errorMessage(error)}`);
+    }
+  });
+}
+
+export async function restartMcpBrowser(button) {
+  appendClientLog("开始 · 重启容器 Chromium");
+  return withButtonLoading(button, "重启中", async () => {
+    try {
+      const result = await dashboardApi.restartMcpBrowser();
+      const browser = result.data?.browser || result.browser || {};
+      setText("mcpState", browser.running ? "浏览器已重启" : "浏览器重启完成");
+      $("mcpState").className = browser.running ? "mcp-state ok" : "mcp-state warn";
+      appendClientLog(`成功 · 容器 Chromium 已重启：${browser.cdpUrl || "CDP 已重新初始化"}`);
+      activateTab("browser");
+      await reconnectCdpViewer();
+    } catch (error) {
+      setText("mcpState", "浏览器重启失败");
+      $("mcpState").className = "mcp-state warn";
+      appendClientLog(`失败 · 重启容器 Chromium：${errorMessage(error)}`);
     }
   });
 }

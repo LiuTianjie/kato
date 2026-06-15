@@ -393,6 +393,11 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     return;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/mcp/browser/restart") {
+    sendJson(res, 200, await postMcpJson("/api/v1/browser/restart", { reason: "dashboard" }));
+    return;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/cdp-login/open") {
     const body = await readJson(req);
     const result = await openCdpLoginWindow(config, {
@@ -605,6 +610,19 @@ async function fetchMcpJson(endpoint: string): Promise<unknown> {
   const base = config.xhs.mcp?.url ? new URL(config.xhs.mcp.url).origin : "http://localhost:18060";
   const response = await fetch(`${base}${endpoint}`);
   return response.json();
+}
+
+async function postMcpJson(endpoint: string, body: Record<string, unknown>): Promise<unknown> {
+  const base = config.xhs.mcp?.url ? new URL(config.xhs.mcp.url).origin : "http://localhost:18060";
+  const response = await fetch(`${base}${endpoint}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!response.ok) throw new Error(`MCP ${endpoint} failed: HTTP ${response.status}`);
+  return data;
 }
 
 function contentType(filePath: string): string {

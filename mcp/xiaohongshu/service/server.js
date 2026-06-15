@@ -21,6 +21,7 @@ let contextPromise;
 let servicePagePromise;
 let browserProcess;
 let cdpProxyStarted = false;
+let restartPromise;
 
 const server = createServer(async (req, res) => {
   try {
@@ -39,6 +40,13 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/api/v1/login/qrcode") {
       await openLoginPage();
       sendJson(res, 200, { success: true, data: { opened: true, loginUrl: XHS_HOME_URL, cdpUrl: cdpUrl() } });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/v1/browser/restart") {
+      const body = await readJson(req);
+      const data = await restartBrowser(String(body.reason || "manual"));
+      sendJson(res, 200, { success: true, data });
       return;
     }
 
@@ -139,13 +147,25 @@ async function shutdown() {
 
 async function browserSummary() {
   if (!contextPromise) return { running: false, cdpUrl: cdpUrl() };
-  const context = await contextPromise;
-  return { running: true, pages: context.pages().length, cdpUrl: cdpUrl() };
+  try {
+    const context = await contextPromise;
+    return { running: true, pages: context.pages().length, cdpUrl: cdpUrl() };
+  } catch (error) {
+    return {
+      running: false,
+      cdpUrl: cdpUrl(),
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
 }
 
 async function ensureContext() {
   if (!contextPromise) {
-    contextPromise = launchContext();
+    contextPromise = launchContext().catch((error) => {
+      contextPromise = undefined;
+      servicePagePromise = undefined;
+      throw error;
+    });
   }
   return contextPromise;
 }
@@ -154,7 +174,7 @@ async function launchContext() {
   await mkdir(PROFILE_DIR, { recursive: true });
   await mkdir(path.dirname(COOKIES_PATH), { recursive: true });
   await clearStaleProfileLocks();
-  browserProcess = spawn(
+  const spawned = spawn(
     BROWSER_BIN,
     [
       ...(CHROMIUM_HEADLESS ? ["--headless=new"] : []),
@@ -174,13 +194,16 @@ async function launchContext() {
     ],
     { stdio: ["ignore", "pipe", "pipe"] }
   );
-  browserProcess.stdout?.on("data", (chunk) => process.stdout.write(chunk));
-  browserProcess.stderr?.on("data", (chunk) => process.stderr.write(chunk));
-  browserProcess.on("exit", (code) => {
+  browserProcess = spawned;
+  spawned.stdout?.on("data", (chunk) => process.stdout.write(chunk));
+  spawned.stderr?.on("data", (chunk) => process.stderr.write(chunk));
+  spawned.on("exit", (code) => {
     console.error(`Chromium exited with code ${code ?? "unknown"}`);
-    browserProcess = undefined;
-    contextPromise = undefined;
-    servicePagePromise = undefined;
+    if (browserProcess === spawned) {
+      browserProcess = undefined;
+      contextPromise = undefined;
+      servicePagePromise = undefined;
+    }
   });
 
   startCdpProxy();
@@ -211,7 +234,63 @@ async function servicePage() {
       return page;
     })();
   }
-  return servicePagePromise;
+  const page = await servicePagePromise;
+  if (page.isClosed()) {
+    servicePagePromise = undefined;
+    return servicePage();
+  }
+  return page;
+}
+
+async function restartBrowser(reason = "manual") {
+  if (restartPromise) return restartPromise;
+  restartPromise = (async () => {
+    console.error(`Restarting Chromium: ${reason}`);
+    const oldContextPromise = contextPromise;
+    const oldProcess = browserProcess;
+    contextPromise = undefined;
+    servicePagePromise = undefined;
+    try {
+      const context = oldContextPromise ? await oldContextPromise.catch(() => undefined) : undefined;
+      await context?.browser()?.close().catch(() => undefined);
+    } finally {
+      if (oldProcess && !oldProcess.killed) {
+        oldProcess.kill("SIGTERM");
+        setTimeout(() => {
+          if (oldProcess.exitCode === null && oldProcess.signalCode === null) oldProcess.kill("SIGKILL");
+        }, 2_000).unref();
+      }
+      if (browserProcess === oldProcess) browserProcess = undefined;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await ensureContext();
+    return {
+      restarted: true,
+      reason,
+      browser: await browserSummary()
+    };
+  })().finally(() => {
+    restartPromise = undefined;
+  });
+  return restartPromise;
+}
+
+async function withBrowserRecovery(label, task) {
+  try {
+    return await task();
+  } catch (error) {
+    if (!isRecoverableBrowserError(error)) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    await restartBrowser(`${label}: ${message.slice(0, 240)}`);
+    return task();
+  }
+}
+
+function isRecoverableBrowserError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /Page crashed|Page\.getLayoutMetrics|Target closed|Browser has been closed|Execution context was destroyed|Protocol error|CDP/i.test(
+    message
+  );
 }
 
 async function openLoginPage() {
@@ -242,60 +321,64 @@ async function currentUserSummary() {
 }
 
 async function searchFeeds(keyword, limit, options = {}) {
-  if (!keyword.trim()) return [];
-  const pageNumber = normalizePositiveInt(options.page, 1);
-  const page = await servicePage();
-  const url = new URL("https://www.xiaohongshu.com/search_result");
-  url.searchParams.set("keyword", keyword);
-  url.searchParams.set("source", "web_search_result_notes");
-  await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: 60_000 });
-  await page.waitForTimeout(3_000);
-  await autoScroll(page, Math.max(2, pageNumber + 1));
-  const posts = await scrapePosts(page);
-  const start = (pageNumber - 1) * limit;
-  return uniquePosts(posts).slice(start, start + limit);
+  return withBrowserRecovery("searchFeeds", async () => {
+    if (!keyword.trim()) return [];
+    const pageNumber = normalizePositiveInt(options.page, 1);
+    const page = await servicePage();
+    const url = new URL("https://www.xiaohongshu.com/search_result");
+    url.searchParams.set("keyword", keyword);
+    url.searchParams.set("source", "web_search_result_notes");
+    await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.waitForTimeout(3_000);
+    await autoScroll(page, Math.max(2, pageNumber + 1));
+    const posts = await scrapePosts(page);
+    const start = (pageNumber - 1) * limit;
+    return uniquePosts(posts).slice(start, start + limit);
+  });
 }
 
 async function getFeedDetail(body) {
-  const id = String(body.feed_id || body.id || "").trim();
-  const xsecToken = String(body.xsec_token || body.xsecToken || "").trim();
-  const url = String(body.url || buildXhsUrl(id, xsecToken)).trim();
-  if (!url && !id) throw new Error("feed_id or url is required.");
-  const page = await servicePage();
-  await page.goto(url || buildXhsUrl(id, xsecToken), { waitUntil: "domcontentloaded", timeout: 60_000 });
-  await page.waitForTimeout(2_500);
-  const detail = await page.evaluate(() => {
-    const pick = (selectors) => {
-      for (const selector of selectors) {
-        const node = document.querySelector(selector);
-        const text = node?.textContent?.trim();
-        if (text) return text;
-      }
-      return "";
-    };
-    const meta = (name) =>
-      document.querySelector(`meta[property="${name}"]`)?.getAttribute("content") ||
-      document.querySelector(`meta[name="${name}"]`)?.getAttribute("content") ||
-      "";
+  return withBrowserRecovery("getFeedDetail", async () => {
+    const id = String(body.feed_id || body.id || "").trim();
+    const xsecToken = String(body.xsec_token || body.xsecToken || "").trim();
+    const url = String(body.url || buildXhsUrl(id, xsecToken)).trim();
+    if (!url && !id) throw new Error("feed_id or url is required.");
+    const page = await servicePage();
+    await page.goto(url || buildXhsUrl(id, xsecToken), { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.waitForTimeout(2_500);
+    const detail = await page.evaluate(() => {
+      const pick = (selectors) => {
+        for (const selector of selectors) {
+          const node = document.querySelector(selector);
+          const text = node?.textContent?.trim();
+          if (text) return text;
+        }
+        return "";
+      };
+      const meta = (name) =>
+        document.querySelector(`meta[property="${name}"]`)?.getAttribute("content") ||
+        document.querySelector(`meta[name="${name}"]`)?.getAttribute("content") ||
+        "";
+      return {
+        title: pick(["#detail-title", ".title", "[class*=title]"]) || meta("og:title") || document.title,
+        snippet:
+          pick(["#detail-desc", ".desc", "[class*=desc]", "[class*=content]"]) ||
+          meta("description") ||
+          meta("og:description"),
+        author: pick([".author .name", "[class*=author] [class*=name]", "[class*=nickname]"]),
+        text: document.body?.innerText?.slice(0, 2000) || ""
+      };
+    });
+    const parsed = postFromUrl(url);
     return {
-      title: pick(["#detail-title", ".title", "[class*=title]"]) || meta("og:title") || document.title,
-      snippet:
-        pick(["#detail-desc", ".desc", "[class*=desc]", "[class*=content]"]) ||
-        meta("description") ||
-        meta("og:description"),
-      author: pick([".author .name", "[class*=author] [class*=name]", "[class*=nickname]"]),
-      text: document.body?.innerText?.slice(0, 2000) || ""
+      id: id || parsed.id,
+      xsecToken: xsecToken || parsed.xsecToken,
+      url,
+      title: cleanTitle(detail.title),
+      snippet: cleanSnippet(detail.snippet || detail.text),
+      author: detail.author || undefined
     };
   });
-  const parsed = postFromUrl(url);
-  return {
-    id: id || parsed.id,
-    xsecToken: xsecToken || parsed.xsecToken,
-    url,
-    title: cleanTitle(detail.title),
-    snippet: cleanSnippet(detail.snippet || detail.text),
-    author: detail.author || undefined
-  };
 }
 
 async function postComment(body) {
@@ -469,11 +552,13 @@ async function scrapePosts(page) {
 }
 
 async function getFeedComments(body, limit, options = {}) {
-  await getFeedDetail(body);
-  const page = await servicePage();
-  const index = normalizeCursorIndex(options.index, options.cursor, 0);
-  await autoScroll(page, Math.max(3, index + 3));
-  return uniqueComments(await scrapeComments(page), limit, index * limit);
+  return withBrowserRecovery("getFeedComments", async () => {
+    await getFeedDetail(body);
+    const page = await servicePage();
+    const index = normalizeCursorIndex(options.index, options.cursor, 0);
+    await autoScroll(page, Math.max(3, index + 3));
+    return uniqueComments(await scrapeComments(page), limit, index * limit);
+  });
 }
 
 async function scrapeComments(page) {
