@@ -14,11 +14,13 @@ const INTERNAL_CDP_PORT = Number(process.env.XHS_INTERNAL_CDP_PORT || CDP_PORT +
 const PROFILE_DIR = process.env.XHS_PROFILE_DIR || "/app/data/profile";
 const COOKIES_PATH = process.env.COOKIES_PATH || "/app/data/cookies.json";
 const CHROMIUM_HEADLESS = process.env.XHS_CHROMIUM_HEADLESS === "1";
-const CDP_CONNECT_TIMEOUT_MS = normalizePositiveEnv("XHS_CDP_CONNECT_TIMEOUT_MS", 12_000);
+const CDP_CONNECT_TIMEOUT_MS = normalizePositiveEnv("XHS_CDP_CONNECT_TIMEOUT_MS", 30_000);
 const BROWSER_STATUS_TIMEOUT_MS = normalizePositiveEnv("XHS_BROWSER_STATUS_TIMEOUT_MS", 2_000);
-const BROWSER_RESTART_TIMEOUT_MS = normalizePositiveEnv("XHS_BROWSER_RESTART_TIMEOUT_MS", 25_000);
+const BROWSER_RESTART_TIMEOUT_MS = normalizePositiveEnv("XHS_BROWSER_RESTART_TIMEOUT_MS", 120_000);
 const PROCESS_EXIT_GRACE_MS = normalizePositiveEnv("XHS_PROCESS_EXIT_GRACE_MS", 2_000);
-const HEALTH_ENSURE_TIMEOUT_MS = normalizePositiveEnv("XHS_HEALTH_ENSURE_TIMEOUT_MS", 8_000);
+const HEALTH_ENSURE_TIMEOUT_MS = normalizePositiveEnv("XHS_HEALTH_ENSURE_TIMEOUT_MS", 20_000);
+const CDP_CONNECT_ATTEMPTS = normalizePositiveEnv("XHS_CDP_CONNECT_ATTEMPTS", 3);
+const BROWSER_TASK_TIMEOUT_MS = normalizePositiveEnv("XHS_BROWSER_TASK_TIMEOUT_MS", 180_000);
 const XHS_HOME_URL = "https://www.xiaohongshu.com/explore";
 const XHS_CREATOR_URL = "https://creator.xiaohongshu.com";
 
@@ -27,6 +29,18 @@ let servicePagePromise;
 let browserProcess;
 let cdpProxyStarted = false;
 let restartPromise;
+let browserTaskTail = Promise.resolve();
+let browserTaskSeq = 0;
+let browserTaskPending = 0;
+let browserTaskActive = null;
+let browserPriorityPromise;
+
+class BrowserTaskTimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "BrowserTaskTimeoutError";
+  }
+}
 
 const server = createServer(async (req, res) => {
   try {
@@ -41,25 +55,27 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/api/v1/login/status") {
-      sendJson(res, 200, { success: true, data: await loginStatus() });
+      const data = await enqueueBrowserTask("login:status", () => loginStatus());
+      sendJson(res, 200, { success: true, data });
       return;
     }
 
     if (req.method === "GET" && url.pathname === "/api/v1/login/qrcode") {
-      await openLoginPage();
+      await enqueueBrowserTask("login:qrcode", () => openLoginPage());
       sendJson(res, 200, { success: true, data: { opened: true, loginUrl: XHS_HOME_URL, cdpUrl: cdpUrl() } });
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/v1/browser/restart") {
       const body = await readJson(req);
-      const data = await restartBrowser(String(body.reason || "manual"));
+      const data = await priorityRestartBrowser(`priority:${String(body.reason || "manual")}`);
       sendJson(res, 200, { success: true, data });
       return;
     }
 
     if (req.method === "GET" && url.pathname === "/api/v1/user/me") {
-      sendJson(res, 200, { success: true, data: await currentUserSummary() });
+      const data = await enqueueBrowserTask("user:me", () => currentUserSummary());
+      sendJson(res, 200, { success: true, data });
       return;
     }
 
@@ -67,7 +83,7 @@ const server = createServer(async (req, res) => {
       const keyword = url.searchParams.get("keyword") || url.searchParams.get("query") || "";
       const limit = normalizeLimit(url.searchParams.get("limit"), 20);
       const page = normalizePositiveInt(url.searchParams.get("page"), 1);
-      const feeds = await searchFeeds(keyword, limit, { page });
+      const feeds = await enqueueBrowserTask("feeds:search", () => searchFeeds(keyword, limit, { page }));
       sendJson(res, 200, { success: true, data: pagedPayload("feeds", feeds, { page, limit }) });
       return;
     }
@@ -77,14 +93,14 @@ const server = createServer(async (req, res) => {
       const keyword = String(body.keyword || body.query || "");
       const limit = normalizeLimit(body.limit, 20);
       const page = normalizePositiveInt(body.page, 1);
-      const feeds = await searchFeeds(keyword, limit, { page });
+      const feeds = await enqueueBrowserTask("feeds:search", () => searchFeeds(keyword, limit, { page }));
       sendJson(res, 200, { success: true, data: pagedPayload("feeds", feeds, { page, limit }) });
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/v1/feeds/detail") {
       const body = await readJson(req);
-      const post = await getFeedDetail(body);
+      const post = await enqueueBrowserTask("feeds:detail", () => getFeedDetail(body));
       sendJson(res, 200, { success: true, data: { note: toNotePayload(post), feeds: [post] } });
       return;
     }
@@ -93,7 +109,7 @@ const server = createServer(async (req, res) => {
       const body = await readJson(req);
       const limit = normalizeLimit(body.limit || body.max_comments || body.max_comment_items, 50);
       const index = normalizeCursorIndex(body.index, body.cursor, 0);
-      const comments = await getFeedComments(body, limit, { index });
+      const comments = await enqueueBrowserTask("feeds:comments", () => getFeedComments(body, limit, { index }));
       sendJson(res, 200, {
         success: true,
         data: {
@@ -112,14 +128,14 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/v1/feeds/comment") {
       const body = await readJson(req);
-      await postComment(body);
+      await enqueueBrowserTask("feeds:comment", () => postComment(body));
       sendJson(res, 200, { success: true, data: { posted: true } });
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/api/v1/feeds/like") {
       const body = await readJson(req);
-      await likeFeed(body);
+      await enqueueBrowserTask("feeds:like", () => likeFeed(body));
       sendJson(res, 200, { success: true, data: { liked: body.unlike === true ? false : true } });
       return;
     }
@@ -154,14 +170,15 @@ async function shutdown() {
 }
 
 async function browserSummary() {
-  if (!contextPromise) return { running: false, cdpUrl: cdpUrl() };
+  if (!contextPromise) return { running: false, cdpUrl: cdpUrl(), queue: browserQueueSummary() };
   try {
     const context = await withTimeout(contextPromise, BROWSER_STATUS_TIMEOUT_MS, "Browser status timed out.");
-    return { running: true, pages: context.pages().length, cdpUrl: cdpUrl() };
+    return { running: true, pages: context.pages().length, cdpUrl: cdpUrl(), queue: browserQueueSummary() };
   } catch (error) {
     return {
       running: false,
       cdpUrl: cdpUrl(),
+      queue: browserQueueSummary(),
       error: error instanceof Error ? error.message : String(error)
     };
   }
@@ -190,6 +207,91 @@ async function ensureContext() {
     });
   }
   return contextPromise;
+}
+
+function enqueueBrowserTask(label, task, options = {}) {
+  const id = ++browserTaskSeq;
+  const timeoutMs = normalizePositiveInt(options.timeoutMs, BROWSER_TASK_TIMEOUT_MS);
+  const queuedAt = Date.now();
+  browserTaskPending += 1;
+
+  const run = async () => {
+    if (browserPriorityPromise) await browserPriorityPromise.catch(() => undefined);
+    browserTaskPending = Math.max(0, browserTaskPending - 1);
+    browserTaskActive = { id, label, startedAt: new Date().toISOString() };
+    const waitedMs = Date.now() - queuedAt;
+    console.error(`Browser task #${id} started: ${label}; waited=${waitedMs}ms pending=${browserTaskPending}`);
+    try {
+      return await runBrowserTaskWithTimeout(label, task, timeoutMs);
+    } finally {
+      const activeMs = Date.now() - (queuedAt + waitedMs);
+      console.error(`Browser task #${id} finished: ${label}; active=${activeMs}ms pending=${browserTaskPending}`);
+      browserTaskActive = null;
+    }
+  };
+
+  const result = browserTaskTail.then(run, run);
+  browserTaskTail = result.catch(() => undefined);
+  return result;
+}
+
+function priorityRestartBrowser(reason) {
+  if (!browserPriorityPromise) {
+    browserPriorityPromise = restartBrowser(reason).finally(() => {
+      browserPriorityPromise = undefined;
+    });
+  }
+  return browserPriorityPromise;
+}
+
+async function runBrowserTaskWithTimeout(label, task, timeoutMs) {
+  let timer;
+  const taskPromise = Promise.resolve().then(task);
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new BrowserTaskTimeoutError(`Browser task ${label} timed out after ${timeoutMs}ms.`)),
+      timeoutMs
+    );
+  });
+  try {
+    return await Promise.race([taskPromise, timeoutPromise]);
+  } catch (error) {
+    if (error instanceof BrowserTaskTimeoutError) {
+      taskPromise.catch(() => undefined);
+      await resetBrowserAfterTaskTimeout(label);
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function resetBrowserAfterTaskTimeout(label) {
+  console.error(`Browser task timed out; resetting Chromium before next task: ${label}`);
+  const oldContextPromise = contextPromise;
+  const oldProcess = browserProcess;
+  contextPromise = undefined;
+  servicePagePromise = undefined;
+
+  if (oldProcess) {
+    terminateProcess(oldProcess, `task timeout: ${label}`);
+    await waitForProcessExit(oldProcess, PROCESS_EXIT_GRACE_MS + 500).catch(() => undefined);
+  }
+  if (browserProcess === oldProcess) browserProcess = undefined;
+
+  if (oldContextPromise) {
+    const context = await withTimeout(oldContextPromise, 1_500, "Timed-out browser context close timed out.").catch(() => undefined);
+    await withTimeout(context?.browser()?.close(), 1_500, "Timed-out browser close timed out.").catch(() => undefined);
+  }
+
+  await waitForCdpClosed(3_000).catch(() => undefined);
+}
+
+function browserQueueSummary() {
+  return {
+    pending: browserTaskPending,
+    active: browserTaskActive
+  };
 }
 
 async function launchContext() {
@@ -231,14 +333,13 @@ async function launchContext() {
   try {
     startCdpProxy();
     await waitForCdpHttp();
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${INTERNAL_CDP_PORT}`, {
-      timeout: CDP_CONNECT_TIMEOUT_MS
-    });
+    const browser = await connectBrowserOverCdp();
     const context = browser.contexts()[0] || (await browser.newContext({ viewport: { width: 1440, height: 980 }, locale: "zh-CN" }));
     await loadCookies(context);
     context.on("page", (page) => {
       page.setDefaultTimeout(30_000);
     });
+    await verifyContextReady(context);
     return context;
   } catch (error) {
     if (browserProcess === spawned) {
@@ -294,8 +395,10 @@ async function restartBrowser(reason = "manual") {
       await withTimeout(context?.browser()?.close(), 1_500, "Old browser close timed out.").catch(() => undefined);
     }
 
-    await delay(500);
+    await waitForCdpClosed(3_000).catch(() => undefined);
+    await delay(1_000);
     await ensureContext();
+    await servicePage();
     return {
       restarted: true,
       reason,
@@ -470,7 +573,8 @@ async function handleMcp(req, res) {
     }
 
     if (payload.method === "tools/call") {
-      const result = await callTool(payload.params || {});
+      const toolName = String(payload.params?.name || "unknown");
+      const result = await enqueueBrowserTask(`mcp:${toolName}`, () => callTool(payload.params || {}));
       sendMcpResult(res, payload.id, result);
       return;
     }
@@ -850,6 +954,33 @@ function cdpUrl() {
   return `http://127.0.0.1:${CDP_PORT}`;
 }
 
+async function connectBrowserOverCdp() {
+  let lastError;
+  for (let attempt = 1; attempt <= CDP_CONNECT_ATTEMPTS; attempt += 1) {
+    try {
+      await waitForCdpHttp(Math.min(15_000, CDP_CONNECT_TIMEOUT_MS));
+      return await chromium.connectOverCDP(`http://127.0.0.1:${INTERNAL_CDP_PORT}`, {
+        timeout: CDP_CONNECT_TIMEOUT_MS
+      });
+    } catch (error) {
+      lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`CDP connect attempt ${attempt}/${CDP_CONNECT_ATTEMPTS} failed: ${message}`);
+      if (attempt < CDP_CONNECT_ATTEMPTS) await delay(1_000 * attempt);
+    }
+  }
+  throw lastError || new Error("Chromium CDP connection failed.");
+}
+
+async function verifyContextReady(context) {
+  const page = context.pages()[0] || (await context.newPage());
+  page.setDefaultTimeout(30_000);
+  await page.evaluate(() => document.readyState).catch(async (error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Chromium page readiness check failed: ${message}`);
+  });
+}
+
 async function waitForCdpHttp(timeoutMs = 15_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -858,6 +989,15 @@ async function waitForCdpHttp(timeoutMs = 15_000) {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   throw new Error(`Chromium CDP port ${INTERNAL_CDP_PORT} did not become ready.`);
+}
+
+async function waitForCdpClosed(timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const response = await fetch(`http://127.0.0.1:${INTERNAL_CDP_PORT}/json/version`).catch(() => null);
+    if (!response?.ok) return;
+    await delay(150);
+  }
 }
 
 function delay(ms) {

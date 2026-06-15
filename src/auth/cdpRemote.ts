@@ -87,69 +87,71 @@ export async function dispatchCdpLoginInput(
   options: { port?: number } = {}
 ): Promise<{ ok: true }> {
   const port = options.port ?? getDefaultCdpPort();
-  const target = await findPageTarget(port, false);
-  const type = String(input.type ?? "");
+  return withCdpActionRecovery(config, port, "input", async () => {
+    const target = await findUsablePageTarget(config, port, true);
+    const type = String(input.type ?? "");
 
-  if (type === "click") {
-    const x = numberInRange(input.x, 0, 100_000, "x");
-    const y = numberInRange(input.y, 0, 100_000, "y");
-    await sendCdpCommand(target.webSocketDebuggerUrl, "Input.dispatchMouseEvent", {
-      type: "mousePressed",
-      x,
-      y,
-      button: "left",
-      buttons: 1,
-      clickCount: 1
-    });
-    await sendCdpCommand(target.webSocketDebuggerUrl, "Input.dispatchMouseEvent", {
-      type: "mouseReleased",
-      x,
-      y,
-      button: "left",
-      buttons: 0,
-      clickCount: 1
-    });
-    return { ok: true };
-  }
+    if (type === "click") {
+      const x = numberInRange(input.x, 0, 100_000, "x");
+      const y = numberInRange(input.y, 0, 100_000, "y");
+      await sendCdpCommand(target.webSocketDebuggerUrl, "Input.dispatchMouseEvent", {
+        type: "mousePressed",
+        x,
+        y,
+        button: "left",
+        buttons: 1,
+        clickCount: 1
+      });
+      await sendCdpCommand(target.webSocketDebuggerUrl, "Input.dispatchMouseEvent", {
+        type: "mouseReleased",
+        x,
+        y,
+        button: "left",
+        buttons: 0,
+        clickCount: 1
+      });
+      return { ok: true };
+    }
 
-  if (type === "wheel") {
-    const x = numberInRange(input.x, 0, 100_000, "x");
-    const y = numberInRange(input.y, 0, 100_000, "y");
-    const deltaX = numberInRange(input.deltaX ?? 0, -20_000, 20_000, "deltaX");
-    const deltaY = numberInRange(input.deltaY ?? 0, -20_000, 20_000, "deltaY");
-    await sendCdpCommand(target.webSocketDebuggerUrl, "Input.dispatchMouseEvent", {
-      type: "mouseWheel",
-      x,
-      y,
-      deltaX,
-      deltaY
-    });
-    return { ok: true };
-  }
+    if (type === "wheel") {
+      const x = numberInRange(input.x, 0, 100_000, "x");
+      const y = numberInRange(input.y, 0, 100_000, "y");
+      const deltaX = numberInRange(input.deltaX ?? 0, -20_000, 20_000, "deltaX");
+      const deltaY = numberInRange(input.deltaY ?? 0, -20_000, 20_000, "deltaY");
+      await sendCdpCommand(target.webSocketDebuggerUrl, "Input.dispatchMouseEvent", {
+        type: "mouseWheel",
+        x,
+        y,
+        deltaX,
+        deltaY
+      });
+      return { ok: true };
+    }
 
-  if (type === "text") {
-    const text = String(input.text ?? "");
-    if (text) await sendCdpCommand(target.webSocketDebuggerUrl, "Input.insertText", { text });
-    return { ok: true };
-  }
+    if (type === "text") {
+      const text = String(input.text ?? "");
+      if (text) await sendCdpCommand(target.webSocketDebuggerUrl, "Input.insertText", { text });
+      return { ok: true };
+    }
 
-  if (type === "key") {
-    const key = String(input.key ?? "");
-    const code = String(input.code ?? "");
-    const keyCode = keyToWindowsVirtualKeyCode(key);
-    const params = {
-      key,
-      code,
-      windowsVirtualKeyCode: keyCode,
-      nativeVirtualKeyCode: keyCode,
-      modifiers: Number(input.modifiers ?? 0)
-    };
-    await sendCdpCommand(target.webSocketDebuggerUrl, "Input.dispatchKeyEvent", { ...params, type: "keyDown" });
-    await sendCdpCommand(target.webSocketDebuggerUrl, "Input.dispatchKeyEvent", { ...params, type: "keyUp" });
-    return { ok: true };
-  }
+    if (type === "key") {
+      const key = String(input.key ?? "");
+      const code = String(input.code ?? "");
+      const keyCode = keyToWindowsVirtualKeyCode(key);
+      const params = {
+        key,
+        code,
+        windowsVirtualKeyCode: keyCode,
+        nativeVirtualKeyCode: keyCode,
+        modifiers: Number(input.modifiers ?? 0)
+      };
+      await sendCdpCommand(target.webSocketDebuggerUrl, "Input.dispatchKeyEvent", { ...params, type: "keyDown" });
+      await sendCdpCommand(target.webSocketDebuggerUrl, "Input.dispatchKeyEvent", { ...params, type: "keyUp" });
+      return { ok: true };
+    }
 
-  throw new Error("不支持的 CDP 输入类型。");
+    throw new Error("不支持的 CDP 输入类型。");
+  });
 }
 
 export async function dispatchCdpBrowserAction(
@@ -161,34 +163,36 @@ export async function dispatchCdpBrowserAction(
   if (!(await isCdpOpen(port))) {
     await openCdpLoginWindow(config, { port });
   }
-  const action = String(input.action ?? "");
-  let target = await findPageTarget(port, true);
+  return withCdpActionRecovery(config, port, "browser-action", async () => {
+    const action = String(input.action ?? "");
+    let target = await findUsablePageTarget(config, port, true);
 
-  if (action === "navigate") {
-    const url = normalizeNavigationUrl(input.url);
-    await sendCdpCommand(target.webSocketDebuggerUrl, "Page.navigate", { url });
-    await waitForPageSettle(target.webSocketDebuggerUrl);
-  } else if (action === "back") {
-    await sendCdpCommand(target.webSocketDebuggerUrl, "Runtime.evaluate", { expression: "history.back()" });
-    await waitForPageSettle(target.webSocketDebuggerUrl);
-  } else if (action === "forward") {
-    await sendCdpCommand(target.webSocketDebuggerUrl, "Runtime.evaluate", { expression: "history.forward()" });
-    await waitForPageSettle(target.webSocketDebuggerUrl);
-  } else if (action === "reload") {
-    await sendCdpCommand(target.webSocketDebuggerUrl, "Page.reload", { ignoreCache: input.ignoreCache === true });
-    await waitForPageSettle(target.webSocketDebuggerUrl);
-  } else {
-    throw new Error("不支持的浏览器动作。");
-  }
+    if (action === "navigate") {
+      const url = normalizeNavigationUrl(input.url);
+      await sendCdpCommand(target.webSocketDebuggerUrl, "Page.navigate", { url });
+      await waitForPageSettle(target.webSocketDebuggerUrl);
+    } else if (action === "back") {
+      await sendCdpCommand(target.webSocketDebuggerUrl, "Runtime.evaluate", { expression: "history.back()" });
+      await waitForPageSettle(target.webSocketDebuggerUrl);
+    } else if (action === "forward") {
+      await sendCdpCommand(target.webSocketDebuggerUrl, "Runtime.evaluate", { expression: "history.forward()" });
+      await waitForPageSettle(target.webSocketDebuggerUrl);
+    } else if (action === "reload") {
+      await sendCdpCommand(target.webSocketDebuggerUrl, "Page.reload", { ignoreCache: input.ignoreCache === true });
+      await waitForPageSettle(target.webSocketDebuggerUrl);
+    } else {
+      throw new Error("不支持的浏览器动作。");
+    }
 
-  target = await findPageTarget(port, true);
-  const viewport = await getViewport(target.webSocketDebuggerUrl);
-  return {
-    ok: true,
-    title: target.title ?? "",
-    url: target.url ?? "",
-    viewport
-  };
+    target = await findUsablePageTarget(config, port, true);
+    const viewport = await getViewport(target.webSocketDebuggerUrl);
+    return {
+      ok: true,
+      title: target.title ?? "",
+      url: target.url ?? "",
+      viewport
+    };
+  });
 }
 
 export async function streamCdpBrowserFrames(config: AppConfig, options: ScreencastOptions): Promise<void> {
@@ -315,6 +319,21 @@ async function findUsablePageTarget(
   }
 }
 
+async function withCdpActionRecovery<T>(
+  config: AppConfig,
+  port: number,
+  label: string,
+  task: () => Promise<T>
+): Promise<T> {
+  try {
+    return await task();
+  } catch (error) {
+    if (!isRecoverableCdpError(error)) throw error;
+    await restartContainerBrowser(config, `cdp-${label}: ${errorMessage(error).slice(0, 180)}`, port);
+    return task();
+  }
+}
+
 async function findPageTarget(port: number, createIfMissing: boolean): Promise<Required<Pick<CdpTarget, "webSocketDebuggerUrl">> & CdpTarget> {
   const targets = await fetchTargets(port);
   let page =
@@ -333,7 +352,7 @@ async function findPageTarget(port: number, createIfMissing: boolean): Promise<R
 }
 
 function isRecoverableCdpError(error: unknown): boolean {
-  return /Target page, context or browser has been closed|Target closed|Page\.getLayoutMetrics|CDP .*超时|WebSocket|ECONNREFUSED|Failed to fetch|已关闭|closed|timeout/i.test(
+  return /Target page, context or browser has been closed|Target closed|Page\.getLayoutMetrics|CDP .*超时|WebSocket|ECONNREFUSED|Failed to fetch|Internal error|已关闭|closed|timeout/i.test(
     errorMessage(error)
   );
 }
@@ -417,7 +436,7 @@ function sendCdpCommand<T = unknown>(wsUrl: string, method: string, params?: Rec
       clearTimeout(timeout);
       socket.close();
       if (payload.error) {
-        reject(new Error(payload.error.message ?? `CDP ${method} 失败。`));
+        reject(new Error(`CDP ${method} 失败：${payload.error.message ?? "unknown error"}`));
         return;
       }
       resolve((payload.result ?? {}) as T);

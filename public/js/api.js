@@ -6,7 +6,7 @@ export async function api(path, options = {}) {
   });
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
-  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  if (!response.ok) throw new Error(data.error?.message || data.error || `HTTP ${response.status}`);
   return data;
 }
 

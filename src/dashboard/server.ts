@@ -394,7 +394,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
   }
 
   if (req.method === "POST" && url.pathname === "/api/mcp/browser/restart") {
-    sendJson(res, 200, await postMcpJson("/api/v1/browser/restart", { reason: "dashboard" }));
+    sendJson(res, 200, await postMcpJson("/api/v1/browser/restart", { reason: "dashboard" }, 130_000));
     return;
   }
 
@@ -612,16 +612,19 @@ async function fetchMcpJson(endpoint: string): Promise<unknown> {
   return response.json();
 }
 
-async function postMcpJson(endpoint: string, body: Record<string, unknown>): Promise<unknown> {
+async function postMcpJson(endpoint: string, body: Record<string, unknown>, timeoutMs = 35_000): Promise<unknown> {
   const base = config.xhs.mcp?.url ? new URL(config.xhs.mcp.url).origin : "http://localhost:18060";
   const response = await fetchWithTimeout(`${base}${endpoint}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
-  }, 35_000);
+  }, timeoutMs);
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
-  if (!response.ok) throw new Error(`MCP ${endpoint} failed: HTTP ${response.status}`);
+  if (!response.ok) {
+    const message = typeof data?.error === "object" ? data.error.message : data?.error;
+    throw new Error(message || `MCP ${endpoint} failed: HTTP ${response.status}`);
+  }
   return data;
 }
 
