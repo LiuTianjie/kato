@@ -95,7 +95,7 @@ class HttpMcpXhsAdapter implements XhsAdapter {
   readonly platformId = "xhs" as const;
   private readonly client: JsonRpcHttpClient;
   private readonly restBaseUrl: string;
-  private readonly restTimeoutMs = normalizePositiveEnv("XHS_REST_TIMEOUT_MS", 90_000);
+  private readonly restTimeoutMs = normalizePositiveEnv("XHS_REST_TIMEOUT_MS", 600_000);
   private readonly tools: ToolNames;
   private initialized = false;
 

@@ -217,6 +217,77 @@ test("serverx-compatible search keeps posts when comment enrichment fails", asyn
   }
 });
 
+test("serverx-compatible search enriches comments by default", async () => {
+  const fixture = createFixture();
+  const originalToken = process.env.XHS_API_TOKEN;
+  const originalFetch = globalThis.fetch;
+  const calls: string[] = [];
+  process.env.XHS_API_TOKEN = "secret-token";
+  fixture.config.xhs = {
+    provider: "http",
+    mcp: { url: "http://fake.local/mcp" }
+  };
+  globalThis.fetch = async (input) => {
+    const requestUrl = String(input);
+    calls.push(requestUrl);
+    if (requestUrl.includes("/api/v1/feeds/search")) {
+      return new Response(
+        JSON.stringify({
+          success: true,
+          data: {
+            feeds: [
+              {
+                id: "post-1",
+                url: "https://www.xiaohongshu.com/explore/post-1?xsec_token=token-1",
+                xsecToken: "token-1",
+                noteCard: { displayTitle: "AI工具真实搜索结果" }
+              }
+            ]
+          }
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    if (requestUrl.includes("/api/v1/feeds/comments")) {
+      return new Response(
+        JSON.stringify({
+          success: true,
+          data: {
+            comments: [
+              {
+                id: "comment-1",
+                content: "默认补评论",
+                author: "用户A"
+              }
+            ]
+          }
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    throw new Error(`Unexpected fetch: ${requestUrl}`);
+  };
+
+  try {
+    const search = await postJson(
+      fixture.config,
+      fixture.db,
+      "/search_notes",
+      { keyword: "AI工具", limit: 1 },
+      "secret-token"
+    );
+    assert.equal(search.status, 200);
+    assert.equal(search.payload.success, true);
+    assert.equal(search.payload.data[0].comments.length, 1);
+    assert.equal(search.payload.data[0].comments[0].content, "默认补评论");
+    assert.equal(calls.some((item) => item.includes("/api/v1/feeds/comments")), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("XHS_API_TOKEN", originalToken);
+    cleanupFixture(fixture);
+  }
+});
+
 test("serverx-compatible search can skip comment enrichment", async () => {
   const fixture = createFixture();
   const originalToken = process.env.XHS_API_TOKEN;
@@ -275,6 +346,79 @@ test("serverx-compatible search can skip comment enrichment", async () => {
     assert.equal(searchWithZeroComments.payload.success, true);
     assert.deepEqual(searchWithZeroComments.payload.data[0].comments, []);
     assert.equal(calls.some((item) => item.includes("/api/v1/feeds/comments")), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("XHS_API_TOKEN", originalToken);
+    cleanupFixture(fixture);
+  }
+});
+
+test("serverx-compatible detail enriches comments by default", async () => {
+  const fixture = createFixture();
+  const originalToken = process.env.XHS_API_TOKEN;
+  const originalFetch = globalThis.fetch;
+  const calls: string[] = [];
+  process.env.XHS_API_TOKEN = "secret-token";
+  fixture.config.xhs = {
+    provider: "http",
+    mcp: { url: "http://fake.local/mcp" }
+  };
+  globalThis.fetch = async (input) => {
+    const requestUrl = String(input);
+    calls.push(requestUrl);
+    if (requestUrl.includes("/api/v1/feeds/detail")) {
+      return new Response(
+        JSON.stringify({
+          success: true,
+          data: {
+            feeds: [
+              {
+                id: "post-1",
+                url: "https://www.xiaohongshu.com/explore/post-1?xsec_token=token-1",
+                xsecToken: "token-1",
+                title: "AI工具真实搜索结果",
+                snippet: "这里讨论 AI工具 和效率工作流"
+              }
+            ]
+          }
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    if (requestUrl.includes("/api/v1/feeds/comments")) {
+      return new Response(
+        JSON.stringify({
+          success: true,
+          data: {
+            comments: [
+              {
+                id: "comment-1",
+                content: "详情默认补评论",
+                author: "用户A"
+              }
+            ]
+          }
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    throw new Error(`Unexpected fetch: ${requestUrl}`);
+  };
+
+  try {
+    const detail = await postJson(
+      fixture.config,
+      fixture.db,
+      "/note_detail",
+      { note_id: "post-1", xsec_token: "token-1" },
+      "secret-token"
+    );
+    assert.equal(detail.status, 200);
+    assert.equal(detail.payload.success, true);
+    assert.equal(detail.payload.data.note_id, "post-1");
+    assert.equal(detail.payload.data.comments.length, 1);
+    assert.equal(detail.payload.data.comments[0].content, "详情默认补评论");
+    assert.equal(calls.some((item) => item.includes("/api/v1/feeds/comments")), true);
   } finally {
     globalThis.fetch = originalFetch;
     restoreEnv("XHS_API_TOKEN", originalToken);

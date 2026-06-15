@@ -51,7 +51,7 @@ class PublicFetchTimeoutError extends Error {
 
 const idempotencyResults = new Map<string, Promise<unknown>>();
 const DEFAULT_XHS_API_TOKEN = "LiuTao0.1";
-const MCP_FETCH_TIMEOUT_MS = normalizePositiveEnv("XHS_PUBLIC_MCP_FETCH_TIMEOUT_MS", 90_000);
+const MCP_FETCH_TIMEOUT_MS = normalizePositiveEnv("XHS_PUBLIC_MCP_FETCH_TIMEOUT_MS", 600_000);
 
 export async function handlePublicXhsApi(
   req: IncomingMessage,
@@ -266,7 +266,9 @@ async function noteDetailForServerx(
   options: RouteOptions = {}
 ): Promise<Record<string, unknown>> {
   const post = await getPostDetail(config, normalizeServerxPostInput(body), options);
-  const comments = await safeGetComments(config, post, normalizeLimit(body.max_comments, 50), options);
+  const includeComments = parseBooleanFlag(body.include_comments ?? body.includeComments, true);
+  const commentLimit = includeComments ? normalizeOptionalLimit(body.max_comments ?? body.maxComments, 50) : 0;
+  const comments = commentLimit > 0 ? await safeGetComments(config, post, commentLimit, options) : [];
   return toServerxPost(post, comments);
 }
 
