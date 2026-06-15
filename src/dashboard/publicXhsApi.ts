@@ -395,14 +395,15 @@ function normalizePostInput(body: Record<string, unknown>): XhsPost {
   const raw = (body.post && typeof body.post === "object" ? body.post : body) as Record<string, unknown>;
   const id = String(raw.id ?? raw.feedId ?? raw.feed_id ?? "").trim();
   const url = String(raw.url ?? "").trim();
+  const xsecToken = optionalString(raw.xsecToken ?? raw.xsec_token);
   if (!id && !url) throw new PublicApiError(400, "POST_IDENTIFIER_REQUIRED", "post.id or post.url is required.");
   return {
     id: id || url,
-    url: url || buildXhsUrl(id, raw.xsecToken ?? raw.xsec_token),
+    url: normalizeXhsUrl(url, id, xsecToken),
     title: String(raw.title ?? ""),
     snippet: String(raw.snippet ?? raw.desc ?? raw.description ?? ""),
     author: optionalString(raw.author),
-    xsecToken: optionalString(raw.xsecToken ?? raw.xsec_token),
+    xsecToken,
     likeCount: optionalNumber(raw.likeCount ?? raw.like_count),
     commentCount: optionalNumber(raw.commentCount ?? raw.comment_count),
     publishedAt: optionalString(raw.publishedAt ?? raw.published_at)
@@ -411,11 +412,11 @@ function normalizePostInput(body: Record<string, unknown>): XhsPost {
 
 function normalizeServerxPostInput(body: Record<string, unknown>): Record<string, unknown> {
   const noteId = String(body.note_id ?? body.id ?? body.feed_id ?? "").trim();
-  const xsecToken = body.xsec_token ?? body.xsecToken;
+  const xsecToken = optionalString(body.xsec_token ?? body.xsecToken);
   const url = String(body.url ?? body.share_text ?? "").trim();
   return {
     id: noteId,
-    url: url || buildXhsUrl(noteId, xsecToken),
+    url: normalizeXhsUrl(url, noteId, xsecToken),
     xsecToken,
     title: body.title,
     snippet: body.content ?? body.desc ?? body.note_content,
@@ -425,13 +426,14 @@ function normalizeServerxPostInput(body: Record<string, unknown>): Record<string
 
 function toServerxPost(post: XhsPost, comments: XhsComment[] = []): Record<string, unknown> {
   const payloadComments = comments.map(toServerxComment);
+  const url = normalizeXhsUrl(post.url, post.id, post.xsecToken);
   return {
     id: post.id,
     note_id: post.id,
     feed_id: post.id,
-    url: post.url,
-    share_url: post.url,
-    link: post.url,
+    url,
+    share_url: url,
+    link: url,
     title: post.title,
     display_title: post.title,
     content: post.snippet,
@@ -468,6 +470,40 @@ function buildXhsUrl(id: string, rawToken: unknown): string {
   const token = optionalString(rawToken);
   if (token) url.searchParams.set("xsec_token", token);
   return url.toString();
+}
+
+function normalizeXhsUrl(rawUrl: unknown, id: string, xsecToken: unknown): string {
+  const token = optionalString(xsecToken);
+  const fallback = buildXhsUrl(id, token);
+  const value = extractUrl(String(rawUrl ?? "").trim());
+  if (!value) return fallback;
+  try {
+    const url = new URL(normalizeUrlCandidate(value));
+    if (token && isXhsExploreUrl(url) && !url.searchParams.get("xsec_token")) {
+      url.searchParams.set("xsec_token", token);
+    }
+    return url.toString();
+  } catch {
+    return fallback;
+  }
+}
+
+function extractUrl(value: string): string {
+  if (!value) return "";
+  const match = value.match(/https?:\/\/[^\s"'<>]+/i);
+  return match?.[0] || value;
+}
+
+function normalizeUrlCandidate(value: string): string {
+  if (/^https?:\/\//i.test(value)) return value;
+  if (value.startsWith("//")) return `https:${value}`;
+  if (value.startsWith("/")) return `https://www.xiaohongshu.com${value}`;
+  if (/^(www\.)?xiaohongshu\.com(\/|$)/i.test(value)) return `https://${value}`;
+  return value;
+}
+
+function isXhsExploreUrl(url: URL): boolean {
+  return /(^|\.)xiaohongshu\.com$/i.test(url.hostname) && url.pathname.split("/").includes("explore");
 }
 
 function assertConfirmed(body: Record<string, unknown>): void {

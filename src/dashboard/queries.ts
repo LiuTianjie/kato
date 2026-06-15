@@ -128,7 +128,7 @@ export function getInteractions(
   }
   params.push(options.limit ?? 120);
 
-  return db
+  const rows = db
     .prepare(
       `
         SELECT
@@ -159,6 +159,7 @@ export function getInteractions(
       `
     )
     .all(...params);
+  return rows.map(normalizeInteractionRowUrls);
 }
 
 export function updateInteractionStatus(db: Db, ids: number[], status: string): number {
@@ -182,6 +183,49 @@ function count(db: Db, sql: string): number {
 function percentage(numerator: number, denominator: number): number {
   if (!denominator) return 0;
   return Math.round((numerator / denominator) * 1000) / 10;
+}
+
+function normalizeInteractionRowUrls(row: unknown): unknown {
+  const record = row as Record<string, unknown>;
+  return {
+    ...record,
+    post_url: normalizeXhsUrl(record.post_url, record.post_id, record.xsec_token)
+  };
+}
+
+function normalizeXhsUrl(rawUrl: unknown, rawId: unknown, rawToken: unknown): string {
+  const id = String(rawId ?? "").trim();
+  const token = String(rawToken ?? "").trim();
+  const fallback = buildXhsUrl(id, token);
+  const value = String(rawUrl ?? "").trim();
+  if (!value) return fallback;
+  try {
+    const url = new URL(normalizeUrlCandidate(value));
+    if (token && isXhsExploreUrl(url) && !url.searchParams.get("xsec_token")) {
+      url.searchParams.set("xsec_token", token);
+    }
+    return url.toString();
+  } catch {
+    return fallback;
+  }
+}
+
+function buildXhsUrl(id: string, token: string): string {
+  const url = new URL(`https://www.xiaohongshu.com/explore/${encodeURIComponent(id || "unknown")}`);
+  if (token) url.searchParams.set("xsec_token", token);
+  return url.toString();
+}
+
+function normalizeUrlCandidate(value: string): string {
+  if (/^https?:\/\//i.test(value)) return value;
+  if (value.startsWith("//")) return `https:${value}`;
+  if (value.startsWith("/")) return `https://www.xiaohongshu.com${value}`;
+  if (/^(www\.)?xiaohongshu\.com(\/|$)/i.test(value)) return `https://${value}`;
+  return value;
+}
+
+function isXhsExploreUrl(url: URL): boolean {
+  return /(^|\.)xiaohongshu\.com$/i.test(url.hostname) && url.pathname.split("/").includes("explore");
 }
 
 function getTopKeywords(db: Db): Array<{ keyword: string; count: number }> {

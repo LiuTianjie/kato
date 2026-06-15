@@ -18,6 +18,7 @@ test("http adapter parses XHS browser service REST search data.feeds responses",
             {
               xsecToken: "xsec-token",
               id: "feed-1",
+              url: "https://www.xiaohongshu.com/explore/feed-1",
               noteCard: {
                 displayTitle: "AI工具真实搜索结果",
                 user: { nickname: "作者A" },
@@ -45,6 +46,7 @@ test("http adapter parses XHS browser service REST search data.feeds responses",
     assert.equal(posts[0].likeCount, 433);
     assert.equal(posts[0].commentCount, 22);
     assert.match(posts[0].url, /xiaohongshu\.com\/explore\/feed-1/);
+    assert.equal(new URL(posts[0].url).searchParams.get("xsec_token"), "xsec-token");
 
     assert.equal(urls.length, 1);
     assert.match(urls[0], /^http:\/\/fake\.local\/api\/v1\/feeds\/search\?keyword=AI/);

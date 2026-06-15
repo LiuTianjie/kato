@@ -704,11 +704,12 @@ function normalizePostShape(item: Partial<XhsPost> & Record<string, unknown>): P
     | undefined;
   const id = String(item.id ?? note?.noteId ?? item.noteId ?? "");
   const xsecToken = String(item.xsecToken ?? note?.xsecToken ?? item.xsec_token ?? "");
+  const url = normalizeXhsUrl(String(item.url ?? ""), id, xsecToken);
   return {
     ...item,
     id,
     xsecToken: xsecToken || undefined,
-    url: item.url ? String(item.url) : buildXhsUrl(id, xsecToken),
+    url,
     title: String(item.title ?? note?.title ?? noteCard?.displayTitle ?? ""),
     snippet: String(item.snippet ?? item.description ?? item.content ?? note?.desc ?? noteCard?.displayTitle ?? ""),
     author: String(item.author ?? user?.nickname ?? user?.nickName ?? ""),
@@ -727,6 +728,33 @@ function buildXhsUrl(id: string, xsecToken: string): string {
   const url = new URL(`https://www.xiaohongshu.com/explore/${encodeURIComponent(id || "unknown")}`);
   if (xsecToken) url.searchParams.set("xsec_token", xsecToken);
   return url.toString();
+}
+
+function normalizeXhsUrl(rawUrl: string, id: string, xsecToken: string): string {
+  const fallback = buildXhsUrl(id, xsecToken);
+  const value = rawUrl.trim();
+  if (!value) return fallback;
+  try {
+    const url = new URL(normalizeUrlCandidate(value));
+    if (xsecToken && isXhsExploreUrl(url) && !url.searchParams.get("xsec_token")) {
+      url.searchParams.set("xsec_token", xsecToken);
+    }
+    return url.toString();
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeUrlCandidate(value: string): string {
+  if (/^https?:\/\//i.test(value)) return value;
+  if (value.startsWith("//")) return `https:${value}`;
+  if (value.startsWith("/")) return `https://www.xiaohongshu.com${value}`;
+  if (/^(www\.)?xiaohongshu\.com(\/|$)/i.test(value)) return `https://${value}`;
+  return value;
+}
+
+function isXhsExploreUrl(url: URL): boolean {
+  return /(^|\.)xiaohongshu\.com$/i.test(url.hostname) && url.pathname.split("/").includes("explore");
 }
 
 function urlToPost(value: string): XhsPost {

@@ -641,10 +641,10 @@ async function getFeedDetail(body) {
   return withBrowserRecovery("getFeedDetail", async () => {
     const id = String(body.feed_id || body.id || "").trim();
     const xsecToken = String(body.xsec_token || body.xsecToken || "").trim();
-    const url = String(body.url || buildXhsUrl(id, xsecToken)).trim();
+    const url = normalizeXhsDetailUrl(body.url, id, xsecToken);
     if (!url && !id) throw new Error("feed_id or url is required.");
     const page = await servicePage();
-    await page.goto(url || buildXhsUrl(id, xsecToken), { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await page.waitForTimeout(2_500);
     const detail = await page.evaluate(() => {
       const pick = (selectors) => {
@@ -1109,6 +1109,41 @@ function buildXhsUrl(id, xsecToken) {
   const url = new URL(`https://www.xiaohongshu.com/explore/${encodeURIComponent(id || "unknown")}`);
   if (xsecToken) url.searchParams.set("xsec_token", xsecToken);
   return url.toString();
+}
+
+function normalizeXhsDetailUrl(rawUrl, id, xsecToken) {
+  const token = String(xsecToken || "").trim();
+  const fallback = id ? buildXhsUrl(id, token) : "";
+  const extractedUrl = normalizeUrlCandidate(extractUrl(String(rawUrl || "").trim()));
+  if (!extractedUrl) return fallback;
+  try {
+    const url = new URL(extractedUrl);
+    if (token && isXhsExploreUrl(url) && !url.searchParams.get("xsec_token")) {
+      url.searchParams.set("xsec_token", token);
+    }
+    return url.toString();
+  } catch {
+    return fallback || extractedUrl;
+  }
+}
+
+function extractUrl(value) {
+  if (!value) return "";
+  const match = value.match(/https?:\/\/[^\s"'<>]+/i);
+  return match?.[0] || value;
+}
+
+function normalizeUrlCandidate(value) {
+  if (!value) return "";
+  if (/^https?:\/\//i.test(value)) return value;
+  if (value.startsWith("//")) return `https:${value}`;
+  if (value.startsWith("/")) return `https://www.xiaohongshu.com${value}`;
+  if (/^(www\.)?xiaohongshu\.com(\/|$)/i.test(value)) return `https://${value}`;
+  return value;
+}
+
+function isXhsExploreUrl(url) {
+  return /(^|\.)xiaohongshu\.com$/i.test(url.hostname) && url.pathname.split("/").includes("explore");
 }
 
 function cleanTitle(value) {

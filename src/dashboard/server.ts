@@ -57,6 +57,7 @@ const debugScreenshotDir = path.join(config.rootDir, "mcp", "xiaohongshu", "data
 const port = Number(process.env.PORT ?? 4173);
 const noVncHost = process.env.XHS_NOVNC_HOST || "127.0.0.1";
 const noVncPort = Number(process.env.XHS_NOVNC_PORT || 6080);
+const vncPort = Number(process.env.XHS_VNC_PORT || 5900);
 const browserDisplay = process.env.XHS_DISPLAY || ":99";
 const noVncViewerUrl = "/novnc/vnc.html?autoconnect=1&resize=scale&path=novnc/websockify";
 const legacyCdpLoginEnabled =
@@ -416,12 +417,15 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
   }
 
   if (req.method === "POST" && url.pathname === "/api/mcp/browser/restart") {
-    sendJson(res, 200, await postMcpJson("/api/v1/browser/restart", { reason: "dashboard" }, 130_000));
+    const result = await postMcpJson("/api/v1/browser/restart", { reason: "dashboard" }, 130_000);
+    await waitForBrowserViewerReady(10_000);
+    sendJson(res, 200, { ...(result as Record<string, unknown>), viewerUrl: noVncViewerUrl });
     return;
   }
 
   if (req.method === "POST" && url.pathname === "/api/browser-viewer/open") {
     await fetchMcpJson("/api/v1/login/qrcode", 45_000);
+    await waitForBrowserViewerReady(10_000);
     sendJson(res, 200, {
       opened: true,
       viewerUrl: noVncViewerUrl,
@@ -741,6 +745,43 @@ function runXdotool(args: string[]): Promise<void> {
       resolve();
     });
   });
+}
+
+async function waitForBrowserViewerReady(timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = "";
+  while (Date.now() < deadline) {
+    try {
+      await probeTcpPort(noVncPort, noVncHost, 1_000);
+      await probeTcpPort(vncPort, noVncHost, 1_000);
+      const response = await fetchWithTimeout(`http://${noVncHost}:${noVncPort}/vnc.html`, { method: "GET" }, 1_500);
+      if (response.ok) return;
+      lastError = `HTTP ${response.status}`;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+    await delay(400);
+  }
+  throw new Error(`noVNC 未就绪：${lastError || "等待超时"}`);
+}
+
+function probeTcpPort(port: number, host: string, timeoutMs: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const socket = connectTcp(port, host);
+    const done = (error?: Error) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      if (error) reject(error);
+      else resolve();
+    };
+    socket.setTimeout(timeoutMs, () => done(new Error(`${host}:${port} 连接超时`)));
+    socket.on("connect", () => done());
+    socket.on("error", (error) => done(error));
+  });
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function normalizeViewerUrl(raw: string): string {

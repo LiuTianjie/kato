@@ -2,11 +2,11 @@
 set -eu
 
 cleanup() {
-  if [ -n "${NOVNC_PID:-}" ]; then
-    kill "$NOVNC_PID" 2>/dev/null || true
+  if [ -n "${NOVNC_SUPERVISOR_PID:-}" ]; then
+    kill "$NOVNC_SUPERVISOR_PID" 2>/dev/null || true
   fi
-  if [ -n "${VNC_PID:-}" ]; then
-    kill "$VNC_PID" 2>/dev/null || true
+  if [ -n "${VNC_SUPERVISOR_PID:-}" ]; then
+    kill "$VNC_SUPERVISOR_PID" 2>/dev/null || true
   fi
   if [ -n "${XHS_PID:-}" ]; then
     kill "$XHS_PID" 2>/dev/null || true
@@ -24,6 +24,53 @@ cleanup() {
 
 trap cleanup INT TERM EXIT
 
+start_vnc_supervisor() {
+  (
+    set +e
+    child=""
+    trap 'if [ -n "$child" ]; then kill "$child" 2>/dev/null || true; fi; exit 0' INT TERM
+    while :; do
+      x11vnc \
+        -display "$DISPLAY" \
+        -forever \
+        -shared \
+        -nopw \
+        -localhost \
+        -listen 127.0.0.1 \
+        -rfbport "${XHS_VNC_PORT:-5900}" \
+        -quiet &
+      child="$!"
+      wait "$child"
+      code="$?"
+      child=""
+      echo "x11vnc exited with code ${code}; restarting in 1s" >&2
+      sleep 1
+    done
+  ) &
+  VNC_SUPERVISOR_PID="$!"
+}
+
+start_novnc_supervisor() {
+  (
+    set +e
+    child=""
+    trap 'if [ -n "$child" ]; then kill "$child" 2>/dev/null || true; fi; exit 0' INT TERM
+    while :; do
+      websockify \
+        --web=/usr/share/novnc \
+        "127.0.0.1:${XHS_NOVNC_PORT:-6080}" \
+        "127.0.0.1:${XHS_VNC_PORT:-5900}" &
+      child="$!"
+      wait "$child"
+      code="$?"
+      child=""
+      echo "websockify exited with code ${code}; restarting in 1s" >&2
+      sleep 1
+    done
+  ) &
+  NOVNC_SUPERVISOR_PID="$!"
+}
+
 CHROME_USER="${XHS_CHROME_USER:-kato}"
 PROFILE_DIR="${XHS_PROFILE_DIR:-/app/mcp/xiaohongshu/data/profile}"
 mkdir -p /app/data /app/output /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images "$PROFILE_DIR"
@@ -38,22 +85,8 @@ XVFB_PID="$!"
 sleep 0.5
 
 if [ "${XHS_VNC_ENABLED:-1}" = "1" ]; then
-  x11vnc \
-    -display "$DISPLAY" \
-    -forever \
-    -shared \
-    -nopw \
-    -localhost \
-    -listen 127.0.0.1 \
-    -rfbport "${XHS_VNC_PORT:-5900}" \
-    -quiet &
-  VNC_PID="$!"
-
-  websockify \
-    --web=/usr/share/novnc \
-    "127.0.0.1:${XHS_NOVNC_PORT:-6080}" \
-    "127.0.0.1:${XHS_VNC_PORT:-5900}" &
-  NOVNC_PID="$!"
+  start_vnc_supervisor
+  start_novnc_supervisor
 fi
 
 PORT="${XHS_SERVICE_PORT:-18060}" node mcp/xiaohongshu/service/server.js &
@@ -76,11 +109,11 @@ STATUS="$?"
 cleanup
 wait "$XHS_PID" 2>/dev/null || true
 wait "$XHS_MONITOR_PID" 2>/dev/null || true
-if [ -n "${VNC_PID:-}" ]; then
-  wait "$VNC_PID" 2>/dev/null || true
+if [ -n "${VNC_SUPERVISOR_PID:-}" ]; then
+  wait "$VNC_SUPERVISOR_PID" 2>/dev/null || true
 fi
-if [ -n "${NOVNC_PID:-}" ]; then
-  wait "$NOVNC_PID" 2>/dev/null || true
+if [ -n "${NOVNC_SUPERVISOR_PID:-}" ]; then
+  wait "$NOVNC_SUPERVISOR_PID" 2>/dev/null || true
 fi
 wait "$XVFB_PID" 2>/dev/null || true
 exit "$STATUS"

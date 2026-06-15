@@ -8,7 +8,7 @@ let viewerUrl = "";
 const DEFAULT_VIEWER_URL = "/novnc/vnc.html?autoconnect=1&resize=scale&path=novnc/websockify";
 
 export function bindCdpViewer() {
-  $("connectCdpViewer").addEventListener("click", connectCdpViewer);
+  $("connectCdpViewer").addEventListener("click", reconnectCdpViewer);
   $("cdpBack").addEventListener("click", () => runBrowserAction("back"));
   $("cdpForward").addEventListener("click", () => runBrowserAction("forward"));
   $("cdpReload").addEventListener("click", () => runBrowserAction("reload"));
@@ -20,14 +20,18 @@ export function bindCdpViewer() {
   });
 }
 
-export async function connectCdpViewer() {
+export async function connectCdpViewer(options = {}) {
+  if (options.force) {
+    connected = false;
+    clearViewerFrame();
+  }
   if (connected) return;
   connected = true;
   setViewerStatus("连接中");
   appendClientLog("开始 · 连接容器浏览器远程画面");
   try {
     const result = await dashboardApi.openBrowserViewer();
-    viewerUrl = result.viewerUrl || DEFAULT_VIEWER_URL;
+    viewerUrl = withViewerNonce(result.viewerUrl || DEFAULT_VIEWER_URL);
     ensureViewerFrame(viewerUrl);
     setAddressValue(result.loginUrl || "https://www.xiaohongshu.com/explore");
     setViewerStatus("noVNC 已打开");
@@ -40,9 +44,7 @@ export async function connectCdpViewer() {
 }
 
 export async function reconnectCdpViewer() {
-  connected = false;
-  clearViewerFrame();
-  return connectCdpViewer();
+  return connectCdpViewer({ force: true });
 }
 
 async function handleAddressSubmit(event) {
@@ -87,6 +89,12 @@ function ensureViewerFrame(url) {
 function clearViewerFrame() {
   const wrap = $("cdpScreenWrap");
   wrap.replaceChildren();
+}
+
+function withViewerNonce(url) {
+  const parsed = new URL(url, window.location.origin);
+  parsed.searchParams.set("_kato_viewer", Date.now().toString(36));
+  return `${parsed.pathname}${parsed.search}${parsed.hash}`;
 }
 
 function setAddressValue(url) {
