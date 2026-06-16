@@ -5,6 +5,9 @@ cleanup() {
   if [ -n "${XHS_PID:-}" ]; then
     kill "$XHS_PID" 2>/dev/null || true
   fi
+  if [ -n "${DOUYIN_PID:-}" ]; then
+    kill "$DOUYIN_PID" 2>/dev/null || true
+  fi
   if [ -n "${DASHBOARD_PID:-}" ]; then
     kill "$DASHBOARD_PID" 2>/dev/null || true
   fi
@@ -18,6 +21,7 @@ trap cleanup INT TERM EXIT
 export BROWSER_RUNTIME_PORT="${BROWSER_RUNTIME_PORT:-${XHS_BROWSER_RUNTIME_PORT:-18100}}"
 export BROWSER_RUNTIME_URL="${BROWSER_RUNTIME_URL:-${XHS_BROWSER_RUNTIME_URL:-http://127.0.0.1:${BROWSER_RUNTIME_PORT}}}"
 export XHS_BROWSER_RUNTIME_URL="${XHS_BROWSER_RUNTIME_URL:-${BROWSER_RUNTIME_URL}}"
+export DOUYIN_BROWSER_RUNTIME_URL="${DOUYIN_BROWSER_RUNTIME_URL:-${BROWSER_RUNTIME_URL}}"
 export BROWSER_DISPLAY="${BROWSER_DISPLAY:-${XHS_DISPLAY:-:99}}"
 export XHS_DISPLAY="${XHS_DISPLAY:-${BROWSER_DISPLAY}}"
 export BROWSER_CDP_HOST="${BROWSER_CDP_HOST:-${XHS_CDP_HOST:-127.0.0.1}}"
@@ -37,6 +41,7 @@ export BROWSER_COOKIE_MIRROR_PATHS="${BROWSER_COOKIE_MIRROR_PATHS:-/app/data/coo
 
 CHROME_USER="${BROWSER_CHROME_USER:-${XHS_CHROME_USER:-kato}}"
 mkdir -p /app/data /app/output /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images "$BROWSER_PROFILE_DIR"
+mkdir -p /app/data/platforms/douyin
 if id "$CHROME_USER" >/dev/null 2>&1; then
   chown -R "$CHROME_USER:$CHROME_USER" /app/data /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images "$BROWSER_PROFILE_DIR" /home/"$CHROME_USER" 2>/dev/null || true
 fi
@@ -47,11 +52,14 @@ RUNTIME_PID="$!"
 PORT="${XHS_SERVICE_PORT:-18060}" node mcp/xiaohongshu/service/server.js &
 XHS_PID="$!"
 
+PORT="${DOUYIN_SERVICE_PORT:-18070}" node mcp/douyin/service/server.js &
+DOUYIN_PID="$!"
+
 PORT="${PORT:-4173}" node dist/dashboard/server.js &
 DASHBOARD_PID="$!"
 
 set +e
-wait -n "$RUNTIME_PID" "$XHS_PID" "$DASHBOARD_PID"
+wait -n "$RUNTIME_PID" "$XHS_PID" "$DOUYIN_PID" "$DASHBOARD_PID"
 STATUS="$?"
 set -e
 
@@ -59,12 +67,15 @@ if ! kill -0 "$RUNTIME_PID" 2>/dev/null; then
   echo "Browser runtime exited with code ${STATUS}; stopping Kato services" >&2
 elif ! kill -0 "$XHS_PID" 2>/dev/null; then
   echo "XHS browser service exited with code ${STATUS}; stopping dashboard" >&2
+elif ! kill -0 "$DOUYIN_PID" 2>/dev/null; then
+  echo "Douyin browser service exited with code ${STATUS}; stopping dashboard" >&2
 elif ! kill -0 "$DASHBOARD_PID" 2>/dev/null; then
   echo "Dashboard exited with code ${STATUS}; stopping Kato services" >&2
 fi
 
 cleanup
 wait "$XHS_PID" 2>/dev/null || true
+wait "$DOUYIN_PID" 2>/dev/null || true
 wait "$RUNTIME_PID" 2>/dev/null || true
 wait "$DASHBOARD_PID" 2>/dev/null || true
 exit "$STATUS"

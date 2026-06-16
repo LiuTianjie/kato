@@ -1,0 +1,1319 @@
+import { createServer } from "node:http";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import path from "node:path";
+import { chromium } from "playwright-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
+
+const SERVICE_LOG_LIMIT = normalizePositiveEnv("DOUYIN_SERVICE_LOG_LIMIT", 600);
+let serviceLogSeq = 0;
+const serviceLogs = [];
+
+let stealthPluginReady = false;
+try {
+  chromium.use(StealthPlugin());
+  stealthPluginReady = true;
+} catch (error) {
+  serviceLog("warn", "stealth", `Stealth plugin unavailable; using custom fingerprint fallback only: ${errorMessage(error)}`);
+}
+
+const PORT = Number(process.env.PORT || process.env.DOUYIN_SERVICE_PORT || 18070);
+const BROWSER_RUNTIME_URL =
+  process.env.DOUYIN_BROWSER_RUNTIME_URL ||
+  process.env.BROWSER_RUNTIME_URL ||
+  `http://127.0.0.1:${process.env.BROWSER_RUNTIME_PORT || 18100}`;
+const INTERNAL_CDP_PORT = Number(process.env.DOUYIN_INTERNAL_CDP_PORT || process.env.BROWSER_CDP_PORT || 9224);
+const PROFILE_DIR = process.env.BROWSER_PROFILE_DIR || process.env.DOUYIN_PROFILE_DIR || "/app/data/browser-profile";
+const COOKIES_PATH = process.env.DOUYIN_COOKIES_PATH || "/app/data/platforms/douyin/cookies.json";
+const CDP_CONNECT_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_CDP_CONNECT_TIMEOUT_MS", 30_000);
+const CDP_CONNECT_ATTEMPTS = normalizePositiveEnv("DOUYIN_CDP_CONNECT_ATTEMPTS", 3);
+const BROWSER_STATUS_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_BROWSER_STATUS_TIMEOUT_MS", 2_000);
+const BROWSER_RUNTIME_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_BROWSER_RUNTIME_TIMEOUT_MS", 30_000);
+const HEALTH_ENSURE_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_HEALTH_ENSURE_TIMEOUT_MS", 20_000);
+const BROWSER_TASK_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_BROWSER_TASK_TIMEOUT_MS", 180_000);
+const HUMAN_DELAY_ENABLED = process.env.DOUYIN_HUMAN_DELAY_ENABLED !== "0";
+const TASK_DELAY_MIN_MS = normalizeNonNegativeEnv("DOUYIN_BROWSER_TASK_DELAY_MIN_MS", 900);
+const TASK_DELAY_MAX_MS = normalizeDelayMax("DOUYIN_BROWSER_TASK_DELAY_MAX_MS", 2_600, TASK_DELAY_MIN_MS);
+const BROWSER_VERSION = detectChromeVersion();
+const BROWSER_MAJOR_VERSION = process.env.DOUYIN_BROWSER_MAJOR_VERSION || BROWSER_VERSION.major;
+const WINDOWS_USER_AGENT =
+  process.env.DOUYIN_BROWSER_USER_AGENT ||
+  `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${BROWSER_VERSION.full} Safari/537.36`;
+const WINDOWS_ACCEPT_LANGUAGE = process.env.DOUYIN_BROWSER_ACCEPT_LANGUAGE || "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7";
+const WINDOWS_NAVIGATOR_PLATFORM = process.env.DOUYIN_NAVIGATOR_PLATFORM || "Win32";
+const WINDOWS_PLATFORM_VERSION = process.env.DOUYIN_BROWSER_PLATFORM_VERSION || "10.0.0";
+const WINDOWS_UA_METADATA = {
+  brands: [
+    { brand: "Google Chrome", version: BROWSER_MAJOR_VERSION },
+    { brand: "Chromium", version: BROWSER_MAJOR_VERSION },
+    { brand: "Not/A)Brand", version: "24" }
+  ],
+  fullVersionList: [
+    { brand: "Google Chrome", version: BROWSER_VERSION.full },
+    { brand: "Chromium", version: BROWSER_VERSION.full },
+    { brand: "Not/A)Brand", version: "24.0.0.0" }
+  ],
+  fullVersion: BROWSER_VERSION.full,
+  platform: "Windows",
+  platformVersion: WINDOWS_PLATFORM_VERSION,
+  architecture: "x86",
+  bitness: "64",
+  model: "",
+  mobile: false,
+  wow64: false
+};
+let contextPromise;
+let restartPromise;
+let browserTaskTail = Promise.resolve();
+let browserTaskSeq = 0;
+let browserTaskPending = 0;
+let browserTaskActive = null;
+let cookiePersistTimer;
+
+class BrowserTaskTimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "BrowserTaskTimeoutError";
+  }
+}
+
+class BrowserTaskCancelledError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "BrowserTaskCancelledError";
+  }
+}
+
+const server = createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    const requestSignal = createRequestAbortSignal(req, res);
+
+    if (req.method === "GET" && url.pathname === "/api/v1/browser/logs") {
+      const since = Number(url.searchParams.get("since") || 0);
+      const limit = Number(url.searchParams.get("limit") || 200);
+      sendJson(res, 200, { success: true, data: { logs: serviceLogsSince(since, limit), cursor: serviceLogSeq } });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/health") {
+      const ensure = url.searchParams.get("ensure") === "1";
+      const browser = await healthBrowserSummary({ ensure });
+      const ok = ensure ? browser.running === true : true;
+      sendJson(res, ok ? 200 : 503, { ok, service: "kato-douyin-browser", browser });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/v1/login/status") {
+      const data = await enqueueBrowserTask("login:status", (taskContext) => loginStatus(taskContext), { signal: requestSignal });
+      sendJson(res, 200, { success: true, data });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/v1/links/resolve") {
+      const body = await readJson(req);
+      const data = await enqueueBrowserTask("links:resolve", (taskContext) => resolveDouyinLink(String(body.url || body.text || ""), taskContext), {
+        signal: requestSignal
+      });
+      sendJson(res, 200, { success: true, data });
+      return;
+    }
+
+    if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/v1/posts/search") {
+      const body = req.method === "POST" ? await readJson(req) : Object.fromEntries(url.searchParams.entries());
+      const keyword = String(body.keyword || body.query || "").trim();
+      const limit = normalizeLimit(body.limit, 20);
+      const page = normalizePositiveInt(body.page, 1);
+      const data = await enqueueBrowserTask("posts:search", (taskContext) => searchPosts(keyword, limit, { page, taskContext }), {
+        signal: requestSignal
+      });
+      sendJson(res, 200, {
+        success: true,
+        data: {
+          posts: data,
+          items: data,
+          count: data.length,
+          page,
+          page_size: limit,
+          has_more: data.length >= limit
+        }
+      });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/v1/posts/detail") {
+      const body = await readJson(req);
+      const post = await enqueueBrowserTask("posts:detail", (taskContext) => getPostDetail(body, taskContext), { signal: requestSignal });
+      sendJson(res, 200, { success: true, data: { post, item: post, items: post ? [post] : [] } });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/v1/posts/comments") {
+      const body = await readJson(req);
+      const limit = normalizeLimit(body.limit || body.count || body.max_comments, 20);
+      const result = await enqueueBrowserTask("posts:comments", (taskContext) => getPostComments(body, limit, taskContext), {
+        signal: requestSignal
+      });
+      sendJson(res, 200, { success: true, data: result });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/v1/posts/comment_replies") {
+      const body = await readJson(req);
+      const limit = normalizeLimit(body.limit || body.count || body.max_comments, 20);
+      const result = await enqueueBrowserTask("posts:comment_replies", (taskContext) => getCommentReplies(body, limit, taskContext), {
+        signal: requestSignal
+      });
+      sendJson(res, 200, { success: true, data: result });
+      return;
+    }
+
+    sendJson(res, 404, { success: false, error: { code: "NOT_FOUND", message: "Endpoint not found." } });
+  } catch (error) {
+    const message = errorMessage(error);
+    if (error instanceof BrowserTaskCancelledError) {
+      serviceLog("warn", "request", `${req.method || "GET"} ${req.url || "/"} cancelled: ${message}`);
+      sendJson(res, 499, { success: false, error: { code: "CLIENT_CLOSED_REQUEST", message } });
+      return;
+    }
+    serviceLog("error", "request", `${req.method || "GET"} ${req.url || "/"} failed: ${message}`);
+    sendJson(res, 500, { success: false, error: { code: "INTERNAL_ERROR", message } });
+  }
+});
+
+server.listen(PORT, () => {
+  serviceLog("info", "service", `kato-douyin-browser listening on http://0.0.0.0:${PORT}`);
+});
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+async function shutdown() {
+  try {
+    const context = contextPromise ? await contextPromise.catch(() => undefined) : undefined;
+    if (context) await persistContextCookies(context, "shutdown").catch(() => undefined);
+    await context?.browser()?.close().catch(() => undefined);
+  } finally {
+    stopCookieAutoPersist();
+    server.close();
+    process.exit(0);
+  }
+}
+
+async function healthBrowserSummary({ ensure = false } = {}) {
+  if (!ensure) return browserSummary();
+  try {
+    await withTimeout(ensureContext(), HEALTH_ENSURE_TIMEOUT_MS, "Browser health ensure timed out.");
+  } catch (error) {
+    return {
+      running: false,
+      queue: browserQueueSummary(),
+      stealth: stealthSummary(),
+      error: errorMessage(error)
+    };
+  }
+  return browserSummary();
+}
+
+async function browserSummary() {
+  const runtime = await runtimeBrowserSummary().catch((error) => ({ ok: false, error: errorMessage(error) }));
+  if (!contextPromise) return { running: false, queue: browserQueueSummary(), stealth: stealthSummary(), runtime };
+  try {
+    const context = await withTimeout(contextPromise, BROWSER_STATUS_TIMEOUT_MS, "Browser status timed out.");
+    return { running: true, pages: context.pages().length, queue: browserQueueSummary(), stealth: stealthSummary(), runtime };
+  } catch (error) {
+    return {
+      running: false,
+      queue: browserQueueSummary(),
+      stealth: stealthSummary(),
+      runtime,
+      error: errorMessage(error)
+    };
+  }
+}
+
+function stealthSummary() {
+  return {
+    plugin: stealthPluginReady,
+    customFingerprint: true,
+    platform: "Windows",
+    cdp: "internal-loopback"
+  };
+}
+
+async function ensureContext() {
+  if (!contextPromise) {
+    contextPromise = launchContext().catch((error) => {
+      contextPromise = undefined;
+      throw error;
+    });
+  }
+  return contextPromise;
+}
+
+async function launchContext() {
+  await mkdir(PROFILE_DIR, { recursive: true });
+  await mkdir(path.dirname(COOKIES_PATH), { recursive: true });
+  try {
+    await ensureRuntimeBrowser();
+    await waitForCdpHttp();
+    const browser = await connectBrowserOverCdp();
+    const context = browser.contexts()[0] || (await browser.newContext({ viewport: { width: 1440, height: 980 }, locale: "zh-CN" }));
+    await configureContextFingerprint(context);
+    await loadCookies(context);
+    startCookieAutoPersist(context);
+    context.on("page", (page) => {
+      page.setDefaultTimeout(30_000);
+      applyPageFingerprint(page).catch((error) => {
+        serviceLog("warn", "stealth", `Page fingerprint apply failed: ${errorMessage(error)}`);
+      });
+    });
+    await verifyContextReady(context);
+    return context;
+  } catch (error) {
+    stopCookieAutoPersist();
+    throw error;
+  }
+}
+
+async function configureContextFingerprint(context) {
+  await context.setExtraHTTPHeaders({ "Accept-Language": WINDOWS_ACCEPT_LANGUAGE }).catch(() => undefined);
+  await context.addInitScript(
+    ({ userAgent, platform, platformVersion, brands, fullVersionList, languages }) => {
+      const defineGetter = (target, key, value) => {
+        try {
+          Object.defineProperty(target, key, { get: () => value, configurable: true });
+        } catch {
+          // Browser-owned descriptors may be locked on some builds.
+        }
+      };
+
+      defineGetter(Navigator.prototype, "platform", platform);
+      defineGetter(Navigator.prototype, "userAgent", userAgent);
+      defineGetter(Navigator.prototype, "appVersion", userAgent.replace(/^Mozilla\//, ""));
+      defineGetter(Navigator.prototype, "languages", languages);
+      defineGetter(Navigator.prototype, "language", languages[0]);
+      defineGetter(Navigator.prototype, "webdriver", undefined);
+      defineGetter(Navigator.prototype, "maxTouchPoints", 0);
+
+      const userAgentData = {
+        brands,
+        mobile: false,
+        platform: "Windows",
+        getHighEntropyValues: async (hints = []) => {
+          const values = {
+            brands,
+            mobile: false,
+            platform: "Windows",
+            architecture: "x86",
+            bitness: "64",
+            model: "",
+            platformVersion,
+            uaFullVersion: fullVersionList[0]?.version || "",
+            fullVersionList
+          };
+          return Object.fromEntries(hints.map((hint) => [hint, values[hint]]).filter(([, value]) => value !== undefined));
+        },
+        toJSON: () => ({ brands, mobile: false, platform: "Windows" })
+      };
+      defineGetter(Navigator.prototype, "userAgentData", userAgentData);
+    },
+    {
+      userAgent: WINDOWS_USER_AGENT,
+      platform: WINDOWS_NAVIGATOR_PLATFORM,
+      platformVersion: WINDOWS_PLATFORM_VERSION,
+      brands: WINDOWS_UA_METADATA.brands,
+      fullVersionList: WINDOWS_UA_METADATA.fullVersionList,
+      languages: ["zh-CN", "zh", "en-US", "en"]
+    }
+  ).catch((error) => serviceLog("warn", "stealth", `Context fingerprint init failed: ${errorMessage(error)}`));
+
+  await Promise.all(context.pages().map((page) => applyPageFingerprint(page)));
+}
+
+async function applyPageFingerprint(page) {
+  const session = await page.context().newCDPSession(page);
+  try {
+    await session.send("Emulation.setUserAgentOverride", {
+      userAgent: WINDOWS_USER_AGENT,
+      acceptLanguage: WINDOWS_ACCEPT_LANGUAGE,
+      platform: "Windows",
+      userAgentMetadata: WINDOWS_UA_METADATA
+    });
+  } finally {
+    await session.detach().catch(() => undefined);
+  }
+}
+
+async function verifyContextReady(context) {
+  const page = await context.newPage();
+  try {
+    await applyPageFingerprint(page).catch(() => undefined);
+    await page.goto("about:blank", { waitUntil: "domcontentloaded", timeout: 10_000 });
+  } finally {
+    await page.close({ runBeforeUnload: false }).catch(() => undefined);
+  }
+}
+
+async function newTaskPage(taskContext) {
+  taskContext?.throwIfCancelled?.();
+  const context = await ensureContext();
+  const page = await context.newPage();
+  page.setDefaultTimeout(30_000);
+  taskContext.page = page;
+  page.on("crash", () => {
+    serviceLog("error", "browser", "Task page crashed.", { task: `#${taskContext.id}:${taskContext.label}`, url: safeLogUrl(page.url()) });
+  });
+  await applyPageFingerprint(page).catch((error) => serviceLog("warn", "stealth", `Task page fingerprint apply failed: ${errorMessage(error)}`));
+  bindTaskPage(taskContext, page);
+  return page;
+}
+
+function enqueueBrowserTask(label, task, options = {}) {
+  const id = ++browserTaskSeq;
+  const timeoutMs = normalizePositiveInt(options.timeoutMs, BROWSER_TASK_TIMEOUT_MS);
+  const queuedAt = Date.now();
+  const taskContext = createBrowserTaskContext(id, label, options.signal);
+  browserTaskPending += 1;
+
+  const run = async () => {
+    let removedFromPending = false;
+    const removeFromPending = () => {
+      if (removedFromPending) return;
+      browserTaskPending = Math.max(0, browserTaskPending - 1);
+      removedFromPending = true;
+    };
+    let markCancelled;
+    try {
+      removeFromPending();
+      taskContext.throwIfCancelled();
+      browserTaskActive = { id, label, startedAt: new Date().toISOString(), cancelled: false };
+      markCancelled = () => {
+        if (browserTaskActive?.id !== id) return;
+        browserTaskActive.cancelled = true;
+        browserTaskActive.cancelReason = abortReasonMessage(taskContext.signal);
+        serviceLog("warn", "queue", `Browser task #${id} cancelled: ${label}.`, { reason: browserTaskActive.cancelReason });
+      };
+      taskContext.signal.addEventListener("abort", markCancelled, { once: true });
+      serviceLog("info", "queue", `Browser task #${id} started: ${label}.`, {
+        waitedMs: Date.now() - queuedAt,
+        pending: browserTaskPending
+      });
+      await humanDelay(`task:${label}`, TASK_DELAY_MIN_MS, TASK_DELAY_MAX_MS, { log: true, signal: taskContext.signal });
+      return await runBrowserTaskWithTimeout(label, task, timeoutMs, taskContext);
+    } finally {
+      removeFromPending();
+      const activeMs = browserTaskActive?.id === id ? Date.now() - Date.parse(browserTaskActive.startedAt) : 0;
+      if (browserTaskActive?.id === id) {
+        serviceLog("info", "queue", `Browser task #${id} finished: ${label}.`, { activeMs, pending: browserTaskPending });
+        if (markCancelled) taskContext.signal.removeEventListener("abort", markCancelled);
+        browserTaskActive = null;
+      }
+      await closeTaskPage(taskContext, "task finished").catch(() => undefined);
+    }
+  };
+
+  const result = browserTaskTail.then(run, run);
+  browserTaskTail = result.catch(() => undefined);
+  return result;
+}
+
+async function runBrowserTaskWithTimeout(label, task, timeoutMs, taskContext) {
+  let timer;
+  const taskPromise = Promise.resolve().then(() => task(taskContext));
+  const abortPromise = new Promise((_, reject) => {
+    if (taskContext.signal.aborted) {
+      reject(taskAbortReason(taskContext.signal));
+      return;
+    }
+    taskContext.signal.addEventListener("abort", () => reject(taskAbortReason(taskContext.signal)), { once: true });
+  });
+  try {
+    timer = setTimeout(() => taskContext.abort(new BrowserTaskTimeoutError(`Browser task ${label} timed out after ${timeoutMs}ms.`)), timeoutMs);
+    return await Promise.race([taskPromise, abortPromise]);
+  } catch (error) {
+    if (error instanceof BrowserTaskTimeoutError) {
+      taskPromise.catch(() => undefined);
+      await resetBrowserAfterTaskTimeout(label);
+    } else if (error instanceof BrowserTaskCancelledError) {
+      taskPromise.catch(() => undefined);
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function resetBrowserAfterTaskTimeout(label) {
+  serviceLog("warn", "queue", `Browser task timed out; resetting Chromium before next task: ${label}`);
+  const oldContextPromise = contextPromise;
+  contextPromise = undefined;
+  stopCookieAutoPersist();
+  if (oldContextPromise) {
+    const context = await withTimeout(oldContextPromise, 1_500, "Timed-out browser context close timed out.").catch(() => undefined);
+    await withTimeout(context?.browser()?.close(), 1_500, "Timed-out browser close timed out.").catch(() => undefined);
+  }
+  await requestRuntimeRestart(`douyin task timeout: ${label}`);
+}
+
+function createBrowserTaskContext(id, label, externalSignal) {
+  const controller = new AbortController();
+  const context = {
+    id,
+    label,
+    signal: controller.signal,
+    page: undefined,
+    abort(reason) {
+      if (!controller.signal.aborted) controller.abort(reason);
+    },
+    throwIfCancelled() {
+      if (controller.signal.aborted) throw taskAbortReason(controller.signal);
+    }
+  };
+
+  if (externalSignal) {
+    const abortFromExternal = () => context.abort(taskAbortReason(externalSignal, `Browser task ${label} cancelled because client disconnected.`));
+    if (externalSignal.aborted) abortFromExternal();
+    else externalSignal.addEventListener("abort", abortFromExternal, { once: true });
+  }
+
+  return context;
+}
+
+function bindTaskPage(taskContext, page) {
+  if (!taskContext?.signal) return;
+  const closePage = () => closeCancelledTaskPage(taskContext, page);
+  if (taskContext.signal.aborted) {
+    closePage();
+    throw taskAbortReason(taskContext.signal);
+  }
+  taskContext.signal.addEventListener("abort", closePage, { once: true });
+}
+
+function closeCancelledTaskPage(taskContext, page) {
+  if (!page || page.isClosed()) return;
+  serviceLog("warn", "queue", `Closing active page for cancelled task #${taskContext.id}: ${taskContext.label}.`, {
+    reason: abortReasonMessage(taskContext.signal)
+  });
+  page.close({ runBeforeUnload: false }).catch(() => undefined);
+}
+
+async function closeTaskPage(taskContext, reason) {
+  const page = taskContext?.page;
+  taskContext.page = undefined;
+  if (!page || page.isClosed()) return;
+  serviceLog("info", "queue", `Closing task page after ${reason}.`, {
+    task: `#${taskContext.id}:${taskContext.label}`,
+    url: safeLogUrl(page.url())
+  });
+  await page.close({ runBeforeUnload: false }).catch(() => undefined);
+}
+
+async function withBrowserRecovery(label, task, taskContext) {
+  try {
+    taskContext?.throwIfCancelled?.();
+    return await task();
+  } catch (error) {
+    if (error instanceof BrowserTaskCancelledError || error instanceof BrowserTaskTimeoutError) throw error;
+    if (!isRecoverableBrowserError(error)) throw error;
+    taskContext?.throwIfCancelled?.();
+    serviceLog("warn", "browser", `Recoverable browser error in ${label}; restarting.`, { error: errorMessage(error).slice(0, 240) });
+    await restartBrowser(`${label}: ${errorMessage(error).slice(0, 240)}`);
+    taskContext?.throwIfCancelled?.();
+    return task();
+  }
+}
+
+function isRecoverableBrowserError(error) {
+  return /Page crashed|Target closed|Browser has been closed|Execution context was destroyed|Protocol error|connectOverCDP|CDP|timed out/i.test(
+    errorMessage(error)
+  );
+}
+
+async function restartBrowser(reason = "manual") {
+  if (restartPromise) return restartPromise;
+  restartPromise = withTimeout(
+    (async () => {
+      serviceLog("warn", "browser", `Restarting runtime browser: ${reason}`);
+      const oldContextPromise = contextPromise;
+      contextPromise = undefined;
+      stopCookieAutoPersist();
+      if (oldContextPromise) {
+        const context = await withTimeout(oldContextPromise, 1_500, "Old browser context close timed out.").catch(() => undefined);
+        if (context) await persistContextCookies(context, "restart").catch(() => undefined);
+        await withTimeout(context?.browser()?.close(), 1_500, "Old browser close timed out.").catch(() => undefined);
+      }
+      await requestRuntimeRestart(reason);
+      await ensureContext();
+      return { restarted: true, reason, browser: await browserSummary() };
+    })(),
+    120_000,
+    "Browser restart timed out."
+  ).finally(() => {
+    restartPromise = undefined;
+  });
+  return restartPromise;
+}
+
+async function loginStatus(taskContext) {
+  return withBrowserRecovery(
+    "loginStatus",
+    async () => {
+      const context = await ensureContext();
+      const cookies = (await context.cookies()).filter(isDouyinCookie);
+      if (cookies.length) await persistCookies(cookies, "loginStatus");
+      return {
+        is_logged_in: cookies.some((cookie) => ["sessionid", "sid_guard", "passport_auth_status", "sid_tt"].includes(cookie.name) && cookie.value),
+        cookie_count: cookies.length,
+        domains: [...new Set(cookies.map((cookie) => cookie.domain))],
+        username: ""
+      };
+    },
+    taskContext
+  );
+}
+
+async function searchPosts(keyword, limit, options = {}) {
+  const taskContext = options.taskContext;
+  return withBrowserRecovery(
+    "searchPosts",
+    async () => {
+      if (!keyword.trim()) return [];
+      const pageNumber = normalizePositiveInt(options.page, 1);
+      serviceLog("info", "posts", "Douyin search requested.", { keyword, limit, page: pageNumber });
+      const page = await newTaskPage(taskContext);
+      const capture = startDouyinResponseCapture(page, ["search", "detail"]);
+      const targetUrl = `https://www.douyin.com/search/${encodeURIComponent(keyword)}?type=video`;
+      let payloads = [];
+      try {
+        await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch((error) => {
+          serviceLog("warn", "posts", `Search navigation warning: ${errorMessage(error)}`);
+        });
+        await humanDelay("search:settle", 2_500, 5_500, { signal: taskContext?.signal });
+        await autoScroll(page, Math.max(2, pageNumber + 1), taskContext);
+      } finally {
+        payloads = await capture.stop();
+      }
+      taskContext?.throwIfCancelled?.();
+      const posts = uniquePosts([...extractPostsFromPayloads(payloads), ...(await scrapePosts(page))]);
+      const start = (pageNumber - 1) * limit;
+      const result = posts.slice(start, start + limit);
+      serviceLog("info", "posts", "Douyin search completed.", {
+        keyword,
+        capturedPayloads: payloads.length,
+        parsed: posts.length,
+        returned: result.length,
+        currentUrl: safeLogUrl(page.url())
+      });
+      return result;
+    },
+    taskContext
+  );
+}
+
+async function getPostDetail(body, taskContext) {
+  return withBrowserRecovery(
+    "getPostDetail",
+    async () => {
+      const resolved = await normalizePostInput(body, taskContext);
+      if (!resolved.awemeId && !resolved.url) throw new Error("aweme_id, id or url is required.");
+      const url = resolved.url || canonicalPostUrl(resolved.awemeId);
+      serviceLog("info", "detail", "Douyin detail requested.", { awemeId: resolved.awemeId, url: safeLogUrl(url) });
+      const page = await newTaskPage(taskContext);
+      const capture = startDouyinResponseCapture(page, ["detail", "comment"]);
+      let payloads = [];
+      try {
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+        await humanDelay("detail:settle", 2_000, 5_000, { signal: taskContext?.signal });
+      } finally {
+        payloads = await capture.stop();
+      }
+      const posts = extractPostsFromPayloads(payloads);
+      const detail = posts.find((post) => !resolved.awemeId || post.id === resolved.awemeId) || posts[0] || (await scrapeDetail(page, resolved));
+      return detail || normalizePost({ aweme_id: resolved.awemeId, share_url: url, desc: "", raw: { url } });
+    },
+    taskContext
+  );
+}
+
+async function getPostComments(body, limit, taskContext) {
+  return withBrowserRecovery(
+    "getPostComments",
+    async () => {
+      const resolved = await normalizePostInput(body, taskContext);
+      if (!resolved.awemeId && !resolved.url) throw new Error("aweme_id, id or url is required.");
+      const cursor = normalizeCursor(body.cursor, 0);
+      const page = await newTaskPage(taskContext);
+      const capture = startDouyinResponseCapture(page, ["comment"]);
+      let payloads = [];
+      try {
+        await page.goto(resolved.url || canonicalPostUrl(resolved.awemeId), { waitUntil: "domcontentloaded", timeout: 60_000 });
+        await humanDelay("comments:settle", 2_000, 4_800, { signal: taskContext?.signal });
+        await autoScroll(page, 2, taskContext);
+      } finally {
+        payloads = await capture.stop();
+      }
+      let extracted = extractCommentsPayload(payloads, "");
+      if (!extracted.comments.length && resolved.awemeId) {
+        const fallback = await fetchCommentsInPage(page, "list", { aweme_id: resolved.awemeId, cursor, count: limit }).catch((error) => {
+          serviceLog("warn", "comments", `In-page comments fetch failed: ${errorMessage(error)}`);
+          return null;
+        });
+        if (fallback) extracted = extractCommentsPayload([fallback], "");
+      }
+      const comments = uniqueComments(extracted.comments).slice(0, limit);
+      serviceLog("info", "comments", "Douyin comments completed.", {
+        awemeId: resolved.awemeId,
+        returned: comments.length,
+        cursor
+      });
+      return {
+        comments,
+        items: comments,
+        cursor: extracted.cursor,
+        has_more: extracted.hasMore || comments.length >= limit
+      };
+    },
+    taskContext
+  );
+}
+
+async function getCommentReplies(body, limit, taskContext) {
+  return withBrowserRecovery(
+    "getCommentReplies",
+    async () => {
+      const itemId = String(body.item_id || body.aweme_id || body.id || "").trim();
+      const commentId = String(body.comment_id || body.commentId || "").trim();
+      if (!itemId || !commentId) throw new Error("item_id/aweme_id and comment_id are required.");
+      const cursor = normalizeCursor(body.cursor, 0);
+      const page = await newTaskPage(taskContext);
+      const capture = startDouyinResponseCapture(page, ["commentReply"]);
+      let payloads = [];
+      try {
+        await page.goto(canonicalPostUrl(itemId), { waitUntil: "domcontentloaded", timeout: 60_000 });
+        await humanDelay("replies:settle", 1_800, 4_500, { signal: taskContext?.signal });
+      } finally {
+        payloads = await capture.stop();
+      }
+      let extracted = extractCommentsPayload(payloads, commentId);
+      if (!extracted.comments.length) {
+        const fallback = await fetchCommentsInPage(page, "reply", { item_id: itemId, comment_id: commentId, cursor, count: limit }).catch((error) => {
+          serviceLog("warn", "comments", `In-page replies fetch failed: ${errorMessage(error)}`);
+          return null;
+        });
+        if (fallback) extracted = extractCommentsPayload([fallback], commentId);
+      }
+      const comments = uniqueComments(extracted.comments.map((comment) => ({ ...comment, parentId: comment.parentId || commentId }))).slice(0, limit);
+      return {
+        comments,
+        items: comments,
+        cursor: extracted.cursor,
+        has_more: extracted.hasMore || comments.length >= limit
+      };
+    },
+    taskContext
+  );
+}
+
+async function resolveDouyinLink(input, taskContext) {
+  const raw = input.trim();
+  if (!raw) throw new Error("url or text is required.");
+  const extractedUrl = extractFirstUrl(raw);
+  const directId = extractAwemeId(raw);
+  if (!extractedUrl && directId) {
+    return { url: canonicalPostUrl(directId), resolvedUrl: canonicalPostUrl(directId), aweme_id: directId, id: directId };
+  }
+  if (!extractedUrl) throw new Error("No Douyin URL found.");
+  let resolvedUrl = extractedUrl;
+  try {
+    const response = await fetch(extractedUrl, { redirect: "follow", signal: AbortSignal.timeout(12_000), headers: { "User-Agent": WINDOWS_USER_AGENT } });
+    resolvedUrl = response.url || extractedUrl;
+  } catch (error) {
+    serviceLog("warn", "links", `HTTP resolve failed; falling back to browser URL: ${errorMessage(error)}`);
+  }
+  let awemeId = extractAwemeId(resolvedUrl) || extractAwemeId(extractedUrl);
+  if (!awemeId) {
+    const page = await newTaskPage(taskContext);
+    await page.goto(extractedUrl, { waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
+    await humanDelay("link:resolve", 800, 1_800, { signal: taskContext?.signal });
+    resolvedUrl = page.url() || resolvedUrl;
+    awemeId = extractAwemeId(resolvedUrl);
+  }
+  return {
+    url: extractedUrl,
+    resolvedUrl,
+    aweme_id: awemeId || "",
+    id: awemeId || "",
+    canonicalUrl: awemeId ? canonicalPostUrl(awemeId) : resolvedUrl
+  };
+}
+
+function startDouyinResponseCapture(page, kinds) {
+  const payloads = [];
+  const targets = new Set(kinds);
+  const onResponse = async (response) => {
+    const url = response.url();
+    const kind = classifyDouyinResponse(url);
+    if (!kind || !targets.has(kind)) return;
+    try {
+      const payload = await response.json();
+      payloads.push({ kind, url, payload });
+    } catch {
+      // Non-JSON responses are expected for some static resources.
+    }
+  };
+  page.on("response", onResponse);
+  return {
+    async stop() {
+      await delay(250);
+      page.off("response", onResponse);
+      return payloads;
+    }
+  };
+}
+
+function classifyDouyinResponse(url) {
+  if (!/douyin\.com/i.test(url) || !/\/aweme\/v1\/web\//i.test(url)) return "";
+  if (/\/general\/search\/single\/|\/search\/item\/|\/discover\/search\//i.test(url)) return "search";
+  if (/\/aweme\/detail\//i.test(url)) return "detail";
+  if (/\/comment\/list\/reply\//i.test(url)) return "commentReply";
+  if (/\/comment\/list\//i.test(url)) return "comment";
+  return "";
+}
+
+async function fetchCommentsInPage(page, type, params) {
+  const endpoint =
+    type === "reply" ? "https://www.douyin.com/aweme/v1/web/comment/list/reply/" : "https://www.douyin.com/aweme/v1/web/comment/list/";
+  const url = new URL(endpoint);
+  const defaults = {
+    device_platform: "webapp",
+    aid: "6383",
+    channel: "channel_pc_web",
+    item_type: "0",
+    pc_client_type: "1",
+    version_code: "290100",
+    version_name: "29.1.0",
+    cookie_enabled: "true",
+    screen_width: "1440",
+    screen_height: "980",
+    browser_language: "zh-CN",
+    browser_platform: "Win32",
+    browser_name: "Chrome",
+    browser_version: BROWSER_VERSION.full,
+    browser_online: "true",
+    engine_name: "Blink",
+    engine_version: BROWSER_VERSION.full,
+    os_name: "Windows",
+    os_version: "10",
+    cpu_core_num: "12",
+    device_memory: "8",
+    platform: "PC",
+    downlink: "10",
+    effective_type: "4g",
+    round_trip_time: "50"
+  };
+  for (const [key, value] of Object.entries({ ...defaults, ...params })) {
+    if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
+  }
+  return page.evaluate(async (requestUrl) => {
+    const response = await fetch(requestUrl, {
+      credentials: "include",
+      headers: {
+        accept: "application/json, text/plain, */*",
+        "accept-language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+      }
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+    return response.json();
+  }, url.toString());
+}
+
+function extractPostsFromPayloads(payloads) {
+  const posts = [];
+  for (const entry of payloads) {
+    const payload = entry?.payload ?? entry;
+    for (const item of walkObjects(payload)) {
+      const candidate = item.aweme_info || item.aweme_detail || item.aweme || item.item || item;
+      if (!candidate || typeof candidate !== "object") continue;
+      if (candidate.aweme_id || candidate.item_id || candidate.id) {
+        const post = normalizePost(candidate);
+        if (post.id && (post.title || post.snippet || post.url)) posts.push(post);
+      }
+    }
+  }
+  return posts;
+}
+
+function normalizePost(item) {
+  const id = stringValue(item.aweme_id ?? item.awemeId ?? item.item_id ?? item.id);
+  const title = stringValue(item.desc ?? item.title ?? item.caption ?? item.aweme_title);
+  const author = item.author || item.user || item.user_info || {};
+  const statistics = item.statistics || item.stats || item.interact_info || {};
+  const shareInfo = item.share_info || item.shareInfo || {};
+  const shareUrl = stringValue(item.share_url ?? shareInfo.share_url ?? item.url);
+  const url = normalizeDouyinUrl(shareUrl, id);
+  return {
+    platform: "douyin",
+    id,
+    url,
+    title: title || "抖音作品",
+    snippet: title,
+    author: stringValue(author.nickname ?? author.name ?? author.unique_id ?? author.short_id),
+    likeCount: numberValue(statistics.digg_count ?? statistics.like_count ?? statistics.liked_count),
+    commentCount: numberValue(statistics.comment_count),
+    publishedAt: dateFromSeconds(item.create_time ?? item.createTime),
+    raw: item
+  };
+}
+
+function extractCommentsPayload(payloads, parentId) {
+  const comments = [];
+  let cursor = "";
+  let hasMore = false;
+  for (const entry of payloads) {
+    const payload = entry?.payload ?? entry;
+    cursor ||= stringValue(payload.cursor ?? payload.next_cursor ?? payload.nextCursor);
+    hasMore = hasMore || payload.has_more === 1 || payload.has_more === true || payload.hasMore === true;
+    const lists = [];
+    if (Array.isArray(payload.comments)) lists.push(payload.comments);
+    if (Array.isArray(payload.data?.comments)) lists.push(payload.data.comments);
+    if (Array.isArray(payload.data)) lists.push(payload.data);
+    if (!lists.length) {
+      for (const object of walkObjects(payload)) {
+        if (Array.isArray(object.comments)) lists.push(object.comments);
+      }
+    }
+    for (const list of lists) {
+      for (const item of list) {
+        const comment = normalizeComment(item, parentId);
+        if (comment.id && comment.content) comments.push(comment);
+      }
+    }
+  }
+  return { comments, cursor, hasMore };
+}
+
+function normalizeComment(item, parentId = "") {
+  const user = item.user || item.user_info || {};
+  const id = stringValue(item.cid ?? item.comment_id ?? item.id);
+  return {
+    platform: "douyin",
+    id,
+    content: stringValue(item.text ?? item.content ?? item.reply_comment_total_text),
+    author: stringValue(user.nickname ?? user.name ?? user.unique_id),
+    parentId: stringValue(item.reply_id ?? item.reply_comment_id ?? item.parent_id ?? parentId),
+    raw: item
+  };
+}
+
+async function scrapePosts(page) {
+  const items = await page.evaluate(() => {
+    const anchors = Array.from(document.querySelectorAll('a[href*="/video/"], a[href*="modal_id="]'));
+    return anchors.slice(0, 80).map((anchor) => ({
+      href: anchor.href,
+      text: anchor.textContent?.trim() || anchor.getAttribute("aria-label") || ""
+    }));
+  }).catch(() => []);
+  return items.map((item) => {
+    const id = extractAwemeId(item.href);
+    return normalizePost({ aweme_id: id, share_url: item.href, desc: item.text });
+  }).filter((post) => post.id);
+}
+
+async function scrapeDetail(page, resolved) {
+  const data = await page.evaluate(() => {
+    const meta = (name) =>
+      document.querySelector(`meta[property="${name}"]`)?.getAttribute("content") ||
+      document.querySelector(`meta[name="${name}"]`)?.getAttribute("content") ||
+      "";
+    const title = meta("og:title") || document.title || "";
+    const desc = meta("description") || meta("og:description") || title;
+    return { title, desc, url: location.href };
+  }).catch(() => null);
+  if (!data) return null;
+  return normalizePost({ aweme_id: resolved.awemeId || extractAwemeId(data.url), share_url: data.url, desc: data.desc || data.title });
+}
+
+async function normalizePostInput(body, taskContext) {
+  const rawUrl = stringValue(body.url || body.share_url || body.source_url);
+  let awemeId = stringValue(body.aweme_id || body.awemeId || body.item_id || body.id);
+  let url = rawUrl;
+  if (!awemeId && rawUrl) {
+    const resolved = await resolveDouyinLink(rawUrl, taskContext).catch(() => null);
+    awemeId = resolved?.aweme_id || extractAwemeId(rawUrl);
+    url = resolved?.canonicalUrl || resolved?.resolvedUrl || rawUrl;
+  }
+  if (!url && awemeId) url = canonicalPostUrl(awemeId);
+  return { awemeId, url };
+}
+
+function uniquePosts(posts) {
+  const seen = new Set();
+  const result = [];
+  for (const post of posts) {
+    const key = post.id || post.url;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    result.push(post);
+  }
+  return result;
+}
+
+function uniqueComments(comments) {
+  const seen = new Set();
+  const result = [];
+  for (const comment of comments) {
+    const key = comment.id || `${comment.author}:${comment.content}`;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    result.push(comment);
+  }
+  return result;
+}
+
+async function autoScroll(page, rounds, taskContext) {
+  for (let index = 0; index < rounds; index += 1) {
+    taskContext?.throwIfCancelled?.();
+    await page.mouse.wheel(0, 500 + Math.round(Math.random() * 500)).catch(() => undefined);
+    await humanDelay("scroll", 650, 1_600, { signal: taskContext?.signal });
+  }
+}
+
+async function ensureRuntimeBrowser() {
+  const payload = await fetchRuntimeJson("/health?ensure=1", {}, BROWSER_RUNTIME_TIMEOUT_MS);
+  const ok = payload?.ok === true || payload?.runtime?.cdp?.ready === true;
+  if (!ok) throw new Error(`Browser runtime is not ready: ${JSON.stringify(payload).slice(0, 500)}`);
+  return payload;
+}
+
+async function runtimeBrowserSummary() {
+  return fetchRuntimeJson("/health", {}, BROWSER_RUNTIME_TIMEOUT_MS);
+}
+
+async function requestRuntimeRestart(reason) {
+  return fetchRuntimeJson(
+    "/browser/restart",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason })
+    },
+    120_000
+  );
+}
+
+async function waitForCdpHttp() {
+  const deadline = Date.now() + CDP_CONNECT_TIMEOUT_MS;
+  let lastError = "";
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${INTERNAL_CDP_PORT}/json/version`, { signal: AbortSignal.timeout(1_500) });
+      if (response.ok) return;
+      lastError = `HTTP ${response.status}`;
+    } catch (error) {
+      lastError = errorMessage(error);
+    }
+    await delay(400);
+  }
+  throw new Error(`CDP endpoint not ready on 127.0.0.1:${INTERNAL_CDP_PORT}: ${lastError}`);
+}
+
+async function connectBrowserOverCdp() {
+  let lastError;
+  for (let attempt = 1; attempt <= CDP_CONNECT_ATTEMPTS; attempt += 1) {
+    try {
+      return await chromium.connectOverCDP(`http://127.0.0.1:${INTERNAL_CDP_PORT}`, { timeout: CDP_CONNECT_TIMEOUT_MS });
+    } catch (error) {
+      lastError = error;
+      serviceLog("warn", "browser", `connectOverCDP attempt ${attempt}/${CDP_CONNECT_ATTEMPTS} failed: ${errorMessage(error)}`);
+      await requestRuntimeRestart(`douyin cdp connect attempt ${attempt}`).catch(() => undefined);
+      await delay(900 * attempt);
+    }
+  }
+  throw lastError;
+}
+
+async function fetchRuntimeJson(endpoint, init = {}, timeoutMs = BROWSER_RUNTIME_TIMEOUT_MS) {
+  const url = `${BROWSER_RUNTIME_URL.replace(/\/$/, "")}${endpoint}`;
+  const response = await fetchWithTimeout(url, init, timeoutMs);
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!response.ok || (data && data.success === false)) {
+    const message = data?.error?.message || data?.message || `Runtime ${endpoint} failed: HTTP ${response.status}`;
+    throw new Error(message);
+  }
+  return data;
+}
+
+async function fetchWithTimeout(url, init, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(new Error(`Request timed out after ${timeoutMs}ms.`)), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function loadCookies(context) {
+  try {
+    const raw = await readFile(COOKIES_PATH, "utf8");
+    const cookies = JSON.parse(raw);
+    if (Array.isArray(cookies) && cookies.length) {
+      await context.addCookies(cookies).catch(() => undefined);
+      serviceLog("info", "cookies", `Loaded ${cookies.length} Douyin cookies.`, { cookiesPath: COOKIES_PATH });
+    }
+  } catch {
+    // Missing cookie files are normal on first boot.
+  }
+}
+
+function startCookieAutoPersist(context) {
+  stopCookieAutoPersist();
+  cookiePersistTimer = setInterval(() => {
+    persistContextCookies(context, "timer").catch((error) => serviceLog("warn", "cookies", `Cookie auto persist failed: ${errorMessage(error)}`));
+  }, 30_000);
+  cookiePersistTimer.unref?.();
+}
+
+function stopCookieAutoPersist() {
+  if (cookiePersistTimer) clearInterval(cookiePersistTimer);
+  cookiePersistTimer = undefined;
+}
+
+async function persistContextCookies(context, source) {
+  const cookies = (await context.cookies()).filter(isDouyinCookie);
+  await persistCookies(cookies, source);
+  return cookies.length;
+}
+
+async function persistCookies(cookies, source) {
+  await mkdir(path.dirname(COOKIES_PATH), { recursive: true });
+  await writeFile(COOKIES_PATH, JSON.stringify(cookies, null, 2));
+  serviceLog("info", "cookies", `Persisted ${cookies.length} Douyin cookies.`, { source, cookiesPath: COOKIES_PATH });
+}
+
+function isDouyinCookie(cookie) {
+  return /(^|\.)douyin\.com$/i.test(cookie.domain) || /(^|\.)amemv\.com$/i.test(cookie.domain) || /bytedance/i.test(cookie.domain);
+}
+
+function browserQueueSummary() {
+  return { pending: browserTaskPending, active: browserTaskActive };
+}
+
+function createRequestAbortSignal(req, res) {
+  const controller = new AbortController();
+  const abort = () => {
+    if (!controller.signal.aborted) controller.abort(new BrowserTaskCancelledError("Client disconnected before the browser task completed."));
+  };
+  req.on("aborted", abort);
+  res.on("close", () => {
+    if (!res.writableEnded) abort();
+  });
+  return controller.signal;
+}
+
+function taskAbortReason(signal, fallbackMessage = "Browser task was cancelled.") {
+  const reason = signal?.reason;
+  if (reason instanceof Error) return reason;
+  if (typeof reason === "string" && reason) return new BrowserTaskCancelledError(reason);
+  return new BrowserTaskCancelledError(fallbackMessage);
+}
+
+function abortReasonMessage(signal) {
+  return taskAbortReason(signal).message;
+}
+
+function serviceLog(level, source, message, details) {
+  const entry = {
+    seq: ++serviceLogSeq,
+    time: new Date().toISOString(),
+    level,
+    source,
+    message: sanitizeLogText(message),
+    details: sanitizeLogDetails(details)
+  };
+  serviceLogs.push(entry);
+  while (serviceLogs.length > SERVICE_LOG_LIMIT) serviceLogs.shift();
+
+  const suffix = entry.details ? ` ${JSON.stringify(entry.details)}` : "";
+  const line = `[${entry.time}] [${entry.source}] ${level.toUpperCase()} ${entry.message}${suffix}`;
+  if (level === "error" || level === "warn") console.error(line);
+  else console.log(line);
+}
+
+function serviceLogsSince(since, limit) {
+  const cursor = Number.isFinite(Number(since)) ? Math.max(0, Math.floor(Number(since))) : 0;
+  const max = Number.isFinite(Number(limit)) ? Math.max(1, Math.min(500, Math.floor(Number(limit)))) : 200;
+  return serviceLogs.filter((entry) => entry.seq > cursor).slice(-max);
+}
+
+function sanitizeLogText(value) {
+  return String(value || "").slice(0, 1000);
+}
+
+function sanitizeLogDetails(value) {
+  if (value === undefined) return undefined;
+  try {
+    return JSON.parse(JSON.stringify(value, (_key, item) => (typeof item === "string" ? sanitizeLogText(item) : item)));
+  } catch {
+    return sanitizeLogText(value);
+  }
+}
+
+function safeLogUrl(value) {
+  return sanitizeLogText(value).slice(0, 600);
+}
+
+async function readJson(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(Buffer.from(chunk));
+  const raw = Buffer.concat(chunks).toString("utf8");
+  return raw ? JSON.parse(raw) : {};
+}
+
+function sendJson(res, status, payload) {
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(payload));
+}
+
+function normalizeLimit(value, fallback) {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.max(1, Math.min(100, Math.floor(parsed)));
+}
+
+function normalizePositiveInt(value, fallback) {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.floor(parsed);
+}
+
+function normalizeCursor(value, fallback) {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  const parsed = Number(value ?? fallback);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.floor(parsed);
+}
+
+function normalizePositiveEnv(name, fallback) {
+  return normalizePositiveInt(process.env[name], fallback);
+}
+
+function normalizeNonNegativeEnv(name, fallback) {
+  const value = Number(process.env[name] || fallback);
+  if (!Number.isFinite(value) || value < 0) return fallback;
+  return Math.floor(value);
+}
+
+function normalizeDelayMax(name, fallback, min) {
+  return Math.max(min, normalizeNonNegativeEnv(name, fallback));
+}
+
+async function humanDelay(label, minMs, maxMs, options = {}) {
+  if (!HUMAN_DELAY_ENABLED || maxMs <= 0) return 0;
+  const ms = minMs + Math.round(Math.random() * Math.max(0, maxMs - minMs));
+  if (options.log) serviceLog("info", "delay", `Human delay before ${label}.`, { ms });
+  await waitForAbortable(delay(ms), options.signal);
+  return ms;
+}
+
+function waitForAbortable(promise, signal) {
+  if (!signal) return promise;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      if (signal.aborted) {
+        reject(taskAbortReason(signal));
+        return;
+      }
+      signal.addEventListener("abort", () => reject(taskAbortReason(signal)), { once: true });
+    })
+  ]);
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function walkObjects(value, seen = new Set()) {
+  const result = [];
+  const visit = (item) => {
+    if (!item || typeof item !== "object" || seen.has(item)) return;
+    seen.add(item);
+    if (!Array.isArray(item)) result.push(item);
+    for (const child of Object.values(item)) {
+      if (child && typeof child === "object") visit(child);
+    }
+  };
+  visit(value);
+  return result;
+}
+
+function normalizeDouyinUrl(value, id) {
+  const raw = stringValue(value);
+  if (/^https?:\/\//i.test(raw)) return raw;
+  if (id) return canonicalPostUrl(id);
+  if (/^(www\.)?douyin\.com(\/|$)/i.test(raw)) return `https://${raw}`;
+  return raw;
+}
+
+function canonicalPostUrl(id) {
+  return `https://www.douyin.com/video/${encodeURIComponent(id || "unknown")}`;
+}
+
+function extractFirstUrl(text) {
+  return /https?:\/\/[^\s，。！？、)）"'<>]+/i.exec(text)?.[0] || "";
+}
+
+function extractAwemeId(value) {
+  const text = stringValue(value);
+  return (
+    /\/video\/(\d+)/i.exec(text)?.[1] ||
+    /[?&](?:modal_id|aweme_id|item_id|vid)=(\d+)/i.exec(text)?.[1] ||
+    /\/note\/(\d+)/i.exec(text)?.[1] ||
+    (/^\d{10,}$/.test(text) ? text : "")
+  );
+}
+
+function stringValue(value) {
+  if (value === null || value === undefined) return "";
+  return String(value).trim();
+}
+
+function numberValue(value) {
+  const numeric = Number(String(value ?? "").replace(/[^\d.-]/g, ""));
+  return Number.isFinite(numeric) ? numeric : undefined;
+}
+
+function dateFromSeconds(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return undefined;
+  return new Date(numeric * 1000).toISOString();
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function detectChromeVersion() {
+  const fallback = process.env.DOUYIN_BROWSER_FULL_VERSION || process.env.BROWSER_FULL_VERSION || "137.0.0.0";
+  try {
+    const output = execFileSync(process.env.GOOGLE_CHROME_BIN || "/usr/bin/google-chrome-stable", ["--version"], {
+      encoding: "utf8",
+      timeout: 2_000
+    });
+    const version = output.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1] || fallback;
+    return { full: version, major: version.split(".")[0] || "137" };
+  } catch {
+    return { full: fallback, major: fallback.split(".")[0] || "137" };
+  }
+}

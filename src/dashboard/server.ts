@@ -44,6 +44,7 @@ import {
   updateInteractionStatus
 } from "./queries.js";
 import { handlePublicXhsApi, isPublicXhsApiPath } from "./publicXhsApi.js";
+import { handlePublicDouyinApi, isPublicDouyinApiPath } from "./publicDouyinApi.js";
 import { getPlatformSpec, listPlatformSpecs, normalizePlatformViewerUrl } from "../platforms/registry.js";
 
 const config = loadConfig();
@@ -92,7 +93,7 @@ const server = createServer(async (req, res) => {
       proxyNoVncHttp(req, res, url);
       return;
     }
-    if (url.pathname.startsWith("/api/") || isPublicXhsApiPath(url.pathname)) {
+    if (url.pathname.startsWith("/api/") || isPublicXhsApiPath(url.pathname) || isPublicDouyinApiPath(url.pathname)) {
       await handleApi(req, res, url);
       return;
     }
@@ -122,6 +123,7 @@ process.on("SIGINT", () => {
 
 async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   if (await handlePublicXhsApi(req, res, url, { config, db })) return;
+  if (await handlePublicDouyinApi(req, res, url)) return;
 
   if (req.method === "GET" && url.pathname === "/api/dashboard") {
     sendJson(res, 200, {

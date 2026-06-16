@@ -37,7 +37,7 @@ src/
 
 - `src/platforms/types.ts` 定义平台统一只读/写入 adapter 契约。
 - `src/platforms/registry.ts` 定义 XHS、B站、抖音的平台 metadata、默认主页、搜索 URL、cookie 域和实现状态。
-- `src/adapters/platform.ts` 是平台 adapter factory；当前只有 `xhs` 返回真实实现，`bilibili`/`douyin` 会明确报未实现。
+- `src/adapters/platform.ts` 是平台 adapter factory；当前 `xhs` 和 `douyin` 返回真实实现，`bilibili` 会明确报未实现。
 - `src/adapters/xhsMcp.ts` 已实现 `WritablePlatformAdapter<XhsPost, XhsComment>`，是第一个平台实现。
 
 不要把 B 站或抖音逻辑放进 `mcp/xiaohongshu/service/server.js`。新的平台 service 可以直接调用 `BROWSER_RUNTIME_URL=http://127.0.0.1:18100`，再通过内部 CDP 连接同一个 runtime。
@@ -119,12 +119,13 @@ B 站建议先做只读：
 
 ## 抖音 Adapter 要点
 
-抖音也建议先做只读：
+抖音 v1 已按只读方式接入：
 
 - 搜索、详情、评论分开实现，不要为了详情强行从搜索页点击进入
 - URL 和 item id 要一起保存；详情页经常需要搜索结果里的上下文参数
 - 评论分页要保留平台返回的 cursor，不要只用 offset 猜测
 - cookie 按 `.douyin.com` 域同步，独立记录日志 source 为 `douyin`
+- 当前实现复用 `browser-runtime` 打开真实页面并监听抖音 Web 网络响应，不把 `douyin-download-api` 作为运行依赖
 
 抖音页面变化更频繁，service 内要保留 `raw` payload 和结构化日志，方便线上出问题时从 dashboard 看见是哪一步解析失败。
 

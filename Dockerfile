@@ -83,14 +83,17 @@ FROM browser-runtime AS kato
 
 ENV PORT=4173 \
     XHS_SERVICE_PORT=18060 \
+    DOUYIN_SERVICE_PORT=18070 \
     BROWSER_RUNTIME_PORT=18100 \
     BROWSER_RUNTIME_URL=http://127.0.0.1:18100 \
     XHS_BROWSER_RUNTIME_URL=http://127.0.0.1:18100 \
+    DOUYIN_BROWSER_RUNTIME_URL=http://127.0.0.1:18100 \
     BROWSER_PROFILE_DIR=/app/mcp/xiaohongshu/data/profile \
     BROWSER_COOKIES_PATH=/app/mcp/xiaohongshu/data/cookies.json \
     BROWSER_COOKIE_MIRROR_PATHS=/app/data/cookies.json \
     XHS_PROFILE_DIR=/app/mcp/xiaohongshu/data/profile \
-    COOKIES_PATH=/app/mcp/xiaohongshu/data/cookies.json
+    COOKIES_PATH=/app/mcp/xiaohongshu/data/cookies.json \
+    DOUYIN_COOKIES_PATH=/app/data/platforms/douyin/cookies.json
 
 WORKDIR /app
 
@@ -100,15 +103,16 @@ COPY package.json package-lock.json ./
 COPY public ./public
 COPY xhs.config.example.json ./
 COPY mcp/xiaohongshu/service ./mcp/xiaohongshu/service
+COPY mcp/douyin/service ./mcp/douyin/service
 COPY scripts/start-kato.sh ./scripts/start-kato.sh
 
 RUN chmod +x ./scripts/start-kato.sh \
-  && mkdir -p /app/data /app/output /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images \
+  && mkdir -p /app/data /app/output /app/data/platforms/douyin /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images \
   && chown -R kato:kato /home/kato /app/data /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images
 
-EXPOSE 4173 18060
+EXPOSE 4173 18060 18070
 
 HEALTHCHECK --interval=30s --timeout=25s --start-period=60s --retries=3 \
-  CMD node -e "const urls=['http://127.0.0.1:'+(process.env.PORT||4173)+'/api/dashboard','http://127.0.0.1:'+(process.env.XHS_SERVICE_PORT||18060)+'/health?ensure=1','http://127.0.0.1:'+(process.env.BROWSER_RUNTIME_PORT||18100)+'/health?ensure=1']; Promise.all(urls.map((url)=>fetch(url,{signal:AbortSignal.timeout(20000)}).then((r)=>{if(!r.ok) throw new Error(url+' '+r.status)}))).then(()=>process.exit(0)).catch((e)=>{console.error(e.message);process.exit(1)})"
+  CMD node -e "const urls=['http://127.0.0.1:'+(process.env.PORT||4173)+'/api/dashboard','http://127.0.0.1:'+(process.env.XHS_SERVICE_PORT||18060)+'/health?ensure=1','http://127.0.0.1:'+(process.env.DOUYIN_SERVICE_PORT||18070)+'/health','http://127.0.0.1:'+(process.env.BROWSER_RUNTIME_PORT||18100)+'/health?ensure=1']; Promise.all(urls.map((url)=>fetch(url,{signal:AbortSignal.timeout(20000)}).then((r)=>{if(!r.ok) throw new Error(url+' '+r.status)}))).then(()=>process.exit(0)).catch((e)=>{console.error(e.message);process.exit(1)})"
 
 CMD ["./scripts/start-kato.sh"]

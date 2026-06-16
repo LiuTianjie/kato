@@ -16,9 +16,12 @@ services:
     environment:
       - PORT=4173
       - XHS_SERVICE_PORT=18060
+      - DOUYIN_SERVICE_PORT=18070
       - BROWSER_RUNTIME_PORT=18100
       - BROWSER_RUNTIME_URL=http://127.0.0.1:18100
       - XHS_BROWSER_RUNTIME_URL=http://127.0.0.1:18100
+      - DOUYIN_BROWSER_RUNTIME_URL=http://127.0.0.1:18100
+      - DOUYIN_SERVICE_URL=http://127.0.0.1:18070
       - BROWSER_BIN=/usr/local/bin/kato-chromium
       - BROWSER_CDP_HOST=127.0.0.1
       - BROWSER_CDP_PORT=9224
@@ -39,9 +42,11 @@ services:
       - XHS_NOVNC_PORT=6080
       - XHS_PROFILE_DIR=/app/mcp/xiaohongshu/data/profile
       - COOKIES_PATH=/app/mcp/xiaohongshu/data/cookies.json
+      - DOUYIN_COOKIES_PATH=/app/data/platforms/douyin/cookies.json
       - LANG=zh_CN.UTF-8
       - LC_ALL=zh_CN.UTF-8
       - LANGUAGE=zh_CN:zh
     ports:
       - "4173:4173"
       - "18060:18060"
+      - "18070:18070"

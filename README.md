@@ -163,7 +163,7 @@ curl -X POST http://localhost:4173/api/v1/xhs/posts/search \
 
 ## AMD64 镜像与 Browser Runtime
 
-Kato 镜像只发布 `linux/amd64`。仓库内置一个可复用的 `browser-runtime` 镜像 target，负责 `google-chrome-stable`、Xvfb、x11vnc、noVNC、websockify、xdotool、内部 CDP、健康检查和重启恢复。最终 `kato` 镜像基于这个 runtime 构建，小红书只是第一个平台 adapter。后续接 B 站、抖音时按 [docs/platform-adapters.md](docs/platform-adapters.md) 的分层接入。
+Kato 镜像只发布 `linux/amd64`。仓库内置一个可复用的 `browser-runtime` 镜像 target，负责 `google-chrome-stable`、Xvfb、x11vnc、noVNC、websockify、xdotool、内部 CDP、健康检查和重启恢复。最终 `kato` 镜像基于这个 runtime 构建，小红书是第一个完整平台 adapter，抖音已接入只读 adapter。后续接 B 站时按 [docs/platform-adapters.md](docs/platform-adapters.md) 的分层接入。
 
 Runtime 默认监听容器内部 `127.0.0.1:18100`；CDP 仅绑定容器内部 `127.0.0.1:9224`，不需要也不应该映射到公网。Dashboard 通过 `/novnc/*` 反代浏览器画面。
 
@@ -213,7 +213,7 @@ XHS_API_TOKEN_VALUE=your-token ./scripts/deploy-luma.sh
 DRY_RUN=1 ./scripts/deploy-luma.sh
 ```
 
-部署配置见 [deploy/kato.luma.yml](deploy/kato.luma.yml)。它只对外暴露 dashboard 的 `4173` 端口；XHS service 和 CDP 保持容器内部能力，不直接暴露到公网。
+部署配置见 [deploy/kato.luma.yml](deploy/kato.luma.yml)。它只对外暴露 dashboard 的 `4173` 端口；XHS service、Douyin service 和 CDP 保持容器内部能力，不直接暴露到公网。
 
 ## 操作面板
 

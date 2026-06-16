@@ -45,13 +45,14 @@ export const PLATFORM_SPECS: Record<PlatformId, PlatformSpec> = {
     homeUrl: "https://www.douyin.com",
     cookieDomains: [".douyin.com"],
     defaultDataDir: "/app/data/platforms/douyin",
-    implemented: false,
+    defaultServicePort: 18070,
+    implemented: true,
     capabilities: {
-      search: false,
-      detail: false,
-      comments: false,
+      search: true,
+      detail: true,
+      comments: true,
       write: false,
-      login: false
+      login: true
     },
     searchUrl: (query) => `https://www.douyin.com/search/${encodeURIComponent(query)}`
   }
