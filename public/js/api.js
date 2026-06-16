@@ -13,6 +13,7 @@ export async function api(path, options = {}) {
 export const dashboardApi = {
   getDashboard: () => api("/api/dashboard"),
   getPlatforms: () => api("/api/platforms"),
+  getPlatformLoginStatuses: () => api("/api/platforms/login-status"),
   getInteractions: (params) => api(`/api/interactions?${params}`),
   getDebugScreenshots: () => api("/api/debug-screenshots?limit=48"),
   getMcpStatus: () => api("/api/mcp/login-status"),
@@ -20,6 +21,7 @@ export const dashboardApi = {
   openBrowserViewer: (body = {}) => api("/api/browser-viewer/open", { method: "POST", body }),
   sendBrowserViewerAction: (body = {}) => api("/api/browser-viewer/action", { method: "POST", body }),
   syncBrowserViewerCookies: () => api("/api/browser-viewer/sync-cookies", { method: "POST" }),
+  syncPlatformCookies: (platform) => api("/api/platforms/sync-cookies", { method: "POST", body: { platform } }),
   getOperation: (id) => api(`/api/operations/${id}`),
   cancelOperation: (id) => api(`/api/operations/${id}/cancel`, { method: "POST" }),
   getPersona: () => api("/api/account-persona"),

@@ -45,7 +45,8 @@ import {
 } from "./queries.js";
 import { handlePublicXhsApi, isPublicXhsApiPath } from "./publicXhsApi.js";
 import { handlePublicDouyinApi, isPublicDouyinApiPath } from "./publicDouyinApi.js";
-import { getPlatformSpec, listPlatformSpecs, normalizePlatformViewerUrl } from "../platforms/registry.js";
+import { getPlatformSpec, listPlatformSpecs, normalizePlatformViewerUrl, requirePlatformSpec } from "../platforms/registry.js";
+import type { PlatformId } from "../platforms/types.js";
 
 const config = loadConfig();
 mkdirSync(config.dataDir, { recursive: true });
@@ -56,13 +57,12 @@ initSchema(db);
 const publicDir = path.join(config.rootDir, "public");
 const debugScreenshotDir = path.join(config.rootDir, "mcp", "xiaohongshu", "data", "debug");
 const port = Number(process.env.PORT ?? 4173);
-const browserRuntimeUrl =
+const defaultBrowserRuntimeUrl =
   process.env.BROWSER_RUNTIME_URL ||
   process.env.XHS_BROWSER_RUNTIME_URL ||
   `http://127.0.0.1:${process.env.BROWSER_RUNTIME_PORT || process.env.XHS_BROWSER_RUNTIME_PORT || 18100}`;
-const noVncHost = process.env.BROWSER_NOVNC_HOST || process.env.XHS_NOVNC_HOST || "127.0.0.1";
-const noVncPort = Number(process.env.BROWSER_NOVNC_PORT || process.env.XHS_NOVNC_PORT || 6080);
-const noVncViewerUrl = "/novnc/vnc.html?autoconnect=1&resize=scale&path=novnc/websockify";
+const douyinServiceUrl = process.env.DOUYIN_SERVICE_URL || `http://127.0.0.1:${process.env.DOUYIN_SERVICE_PORT || 18070}`;
+const defaultNoVncHost = process.env.BROWSER_NOVNC_HOST || process.env.XHS_NOVNC_HOST || "127.0.0.1";
 const legacyCdpLoginEnabled =
   process.env.KATO_ENABLE_LEGACY_CDP_LOGIN === "1" || process.env.XHS_LEGACY_CDP_LOGIN_ENABLED === "1";
 type OperationState = "running" | "completed" | "failed" | "cancelled";
@@ -143,6 +143,18 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
         capabilities: platform.capabilities
       }))
     });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/platforms/login-status") {
+    sendJson(res, 200, { platforms: await Promise.all(listPlatformSpecs().map((platform) => getPlatformLoginStatus(platform.id))) });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/platforms/sync-cookies") {
+    const body = await readJson(req);
+    const platform = requirePlatformSpec(body.platform);
+    sendJson(res, 200, await syncPlatformCookies(platform.id));
     return;
   }
 
@@ -435,8 +447,8 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
 
   if (req.method === "POST" && url.pathname === "/api/mcp/browser/restart") {
     const result = await postMcpJson("/api/v1/browser/restart", { reason: "dashboard" }, 130_000);
-    await waitForBrowserViewerReady(10_000);
-    sendJson(res, 200, { ...(result as Record<string, unknown>), viewerUrl: noVncViewerUrl });
+    await waitForBrowserViewerReady("xhs", 10_000);
+    sendJson(res, 200, { ...(result as Record<string, unknown>), viewerUrl: noVncViewerUrl("xhs") });
     return;
   }
 
@@ -446,7 +458,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
   }
 
   if (req.method === "GET" && url.pathname === "/api/browser-runtime/logs") {
-    sendJson(res, 200, await fetchRuntimeJson(`/browser/logs${url.search}`));
+    sendJson(res, 200, await browserRuntimeLogs(url));
     return;
   }
 
@@ -454,12 +466,12 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     const body = await readJson(req);
     const platform = getPlatformSpec(body.platform);
     const targetUrl = normalizePlatformViewerUrl(platform, String(body.url ?? body.query ?? ""));
-    await postRuntimeJson("/browser/open", { url: targetUrl }, 45_000);
-    await waitForBrowserViewerReady(10_000);
+    await postRuntimeJson(platform.viewerRuntimeUrl || defaultBrowserRuntimeUrl, "/browser/open", { url: targetUrl }, 45_000);
+    await waitForBrowserViewerReady(platform.id, 10_000);
     sendJson(res, 200, {
       opened: true,
       platform: platform.id,
-      viewerUrl: noVncViewerUrl,
+      viewerUrl: noVncViewerUrl(platform.id),
       loginUrl: targetUrl,
       homeUrl: platform.homeUrl
     });
@@ -717,8 +729,32 @@ async function postMcpJson(endpoint: string, body: Record<string, unknown>, time
   return data;
 }
 
-async function fetchRuntimeJson(endpoint: string, timeoutMs = 20_000): Promise<unknown> {
-  const response = await fetchWithTimeout(`${browserRuntimeUrl.replace(/\/$/, "")}${endpoint}`, {}, timeoutMs);
+async function fetchDouyinJson(endpoint: string, timeoutMs = 20_000): Promise<unknown> {
+  const response = await fetchWithTimeout(`${douyinServiceUrl.replace(/\/$/, "")}${endpoint}`, {}, timeoutMs);
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!response.ok || isMcpFailure(data)) {
+    throw new Error(mcpErrorMessage(data, `Douyin ${endpoint} failed: HTTP ${response.status}`));
+  }
+  return data;
+}
+
+async function postDouyinJson(endpoint: string, body: Record<string, unknown>, timeoutMs = 35_000): Promise<unknown> {
+  const response = await fetchWithTimeout(`${douyinServiceUrl.replace(/\/$/, "")}${endpoint}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  }, timeoutMs);
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!response.ok || isMcpFailure(data)) {
+    throw new Error(mcpErrorMessage(data, `Douyin ${endpoint} failed: HTTP ${response.status}`));
+  }
+  return data;
+}
+
+async function fetchRuntimeJson(baseUrl: string, endpoint: string, timeoutMs = 20_000): Promise<unknown> {
+  const response = await fetchWithTimeout(`${baseUrl.replace(/\/$/, "")}${endpoint}`, {}, timeoutMs);
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};
   if (!response.ok || isMcpFailure(data)) {
@@ -727,8 +763,8 @@ async function fetchRuntimeJson(endpoint: string, timeoutMs = 20_000): Promise<u
   return data;
 }
 
-async function postRuntimeJson(endpoint: string, body: Record<string, unknown>, timeoutMs = 35_000): Promise<unknown> {
-  const response = await fetchWithTimeout(`${browserRuntimeUrl.replace(/\/$/, "")}${endpoint}`, {
+async function postRuntimeJson(baseUrl: string, endpoint: string, body: Record<string, unknown>, timeoutMs = 35_000): Promise<unknown> {
+  const response = await fetchWithTimeout(`${baseUrl.replace(/\/$/, "")}${endpoint}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
@@ -766,20 +802,108 @@ function unwrapMcpData(payload: unknown): unknown {
   return payload;
 }
 
+async function getPlatformLoginStatus(platform: PlatformId): Promise<Record<string, unknown>> {
+  const spec = getPlatformSpec(platform);
+  if (!spec.implemented || !spec.capabilities.login) {
+    return { platform: spec.id, label: spec.label, implemented: false, is_logged_in: false, error: "未接入登录能力" };
+  }
+  try {
+    const payload = platform === "douyin" ? await fetchDouyinJson("/api/v1/login/status", 35_000) : await fetchMcpJson("/api/v1/login/status", 35_000);
+    const data = unwrapMcpData(payload) as Record<string, unknown>;
+    return { platform: spec.id, label: spec.label, implemented: true, ...data };
+  } catch (error) {
+    return {
+      platform: spec.id,
+      label: spec.label,
+      implemented: true,
+      is_logged_in: false,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+async function syncPlatformCookies(platform: PlatformId): Promise<Record<string, unknown>> {
+  const spec = getPlatformSpec(platform);
+  if (!spec.implemented || !spec.capabilities.login) {
+    return { platform: spec.id, label: spec.label, synced: false, error: "未接入登录能力" };
+  }
+  const payload =
+    platform === "douyin"
+      ? await postDouyinJson("/api/v1/browser/sync-cookies", {}, 35_000)
+      : await postMcpJson("/api/v1/browser/sync-cookies", {}, 35_000);
+  const data = unwrapMcpData(payload) as Record<string, unknown>;
+  return { platform: spec.id, label: spec.label, synced: true, ...data };
+}
+
 async function runBrowserViewerAction(body: Record<string, unknown>): Promise<{ ok: true }> {
   const action = String(body.action ?? "");
   const platform = getPlatformSpec(body.platform);
   const payload = action === "navigate" ? { ...body, url: normalizePlatformViewerUrl(platform, String(body.url ?? "")) } : body;
-  await postRuntimeJson("/browser/action", payload, 20_000);
+  await postRuntimeJson(platform.viewerRuntimeUrl || defaultBrowserRuntimeUrl, "/browser/action", payload, 20_000);
   return { ok: true };
 }
 
-async function waitForBrowserViewerReady(timeoutMs: number): Promise<void> {
+async function browserRuntimeLogs(url: URL): Promise<Record<string, unknown>> {
+  const platformParam = url.searchParams.get("platform");
+  const kindParam = url.searchParams.get("kind");
+  const query = `/browser/logs${url.search}`;
+  const targets = platformParam
+    ? runtimeLogTargets(getPlatformSpec(platformParam), kindParam)
+    : listPlatformSpecs()
+        .filter((platform) => platform.implemented)
+        .flatMap((platform) => runtimeLogTargets(platform, kindParam));
+
+  const results = await Promise.all(
+    targets.map(async (target) => {
+      try {
+        const payload = await fetchRuntimeJson(target.baseUrl, query, 5_000);
+        const data = unwrapMcpData(payload) as { logs?: unknown[]; cursor?: unknown };
+        return {
+          source: target.source,
+          cursor: Number(data.cursor || 0),
+          logs: (Array.isArray(data.logs) ? data.logs : []).map((entry) =>
+            entry && typeof entry === "object" ? { sourceRuntime: target.source, ...entry } : { sourceRuntime: target.source, message: String(entry) }
+          )
+        };
+      } catch (error) {
+        return {
+          source: target.source,
+          cursor: 0,
+          logs: [
+            {
+              sourceRuntime: target.source,
+              level: "error",
+              message: error instanceof Error ? error.message : String(error)
+            }
+          ]
+        };
+      }
+    })
+  );
+  return {
+    success: true,
+    data: {
+      logs: results.flatMap((result) => result.logs),
+      cursor: Math.max(0, ...results.map((result) => result.cursor)),
+      sources: results.map((result) => result.source)
+    }
+  };
+}
+
+function runtimeLogTargets(platform: ReturnType<typeof getPlatformSpec>, kindParam?: string | null): Array<{ source: string; baseUrl: string }> {
+  const targets: Array<{ source: string; baseUrl: string }> = [];
+  if (kindParam !== "worker" && platform.viewerRuntimeUrl) targets.push({ source: `${platform.id}:viewer`, baseUrl: platform.viewerRuntimeUrl });
+  if (kindParam !== "viewer" && platform.workerRuntimeUrl) targets.push({ source: `${platform.id}:worker`, baseUrl: platform.workerRuntimeUrl });
+  return targets;
+}
+
+async function waitForBrowserViewerReady(platform: PlatformId, timeoutMs: number): Promise<void> {
+  const spec = getPlatformSpec(platform);
   const deadline = Date.now() + timeoutMs;
   let lastError = "";
   while (Date.now() < deadline) {
     try {
-      const runtime = await fetchRuntimeJson("/health?ensure=1", 3_000);
+      const runtime = await fetchRuntimeJson(spec.viewerRuntimeUrl || defaultBrowserRuntimeUrl, "/health?ensure=1", 3_000);
       const ready = (runtime as { runtime?: { noVnc?: { ready?: boolean } } }).runtime?.noVnc?.ready === true;
       if (ready) return;
       lastError = "runtime noVNC not ready";
@@ -811,14 +935,14 @@ function delay(ms: number): Promise<void> {
 }
 
 function proxyNoVncHttp(req: IncomingMessage, res: ServerResponse, url: URL): void {
-  const upstreamPath = stripNoVncPrefix(url);
+  const target = noVncTarget(url);
   const proxyReq = httpRequest(
     {
-      hostname: noVncHost,
-      port: noVncPort,
+      hostname: target.host,
+      port: target.port,
       method: req.method,
-      path: upstreamPath,
-      headers: { ...req.headers, host: `${noVncHost}:${noVncPort}` }
+      path: target.path,
+      headers: { ...req.headers, host: `${target.host}:${target.port}` }
     },
     (proxyRes) => {
       res.writeHead(proxyRes.statusCode ?? 502, proxyRes.headers);
@@ -833,13 +957,13 @@ function proxyNoVncHttp(req: IncomingMessage, res: ServerResponse, url: URL): vo
 }
 
 function proxyNoVncUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer, url: URL): void {
-  const upstreamPath = stripNoVncPrefix(url);
-  const upstream = connectTcp(noVncPort, noVncHost);
+  const target = noVncTarget(url);
+  const upstream = connectTcp(target.port, target.host);
   upstream.on("connect", () => {
     const headers = Object.entries(req.headers)
       .map(([key, value]) => `${key}: ${Array.isArray(value) ? value.join(", ") : value ?? ""}`)
       .join("\r\n");
-    upstream.write(`${req.method ?? "GET"} ${upstreamPath} HTTP/${req.httpVersion}\r\n${headers}\r\n\r\n`);
+    upstream.write(`${req.method ?? "GET"} ${target.path} HTTP/${req.httpVersion}\r\n${headers}\r\n\r\n`);
     if (head.length) upstream.write(head);
     upstream.pipe(socket);
     socket.pipe(upstream);
@@ -852,9 +976,26 @@ function proxyNoVncUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer, u
   socket.on("error", close);
 }
 
-function stripNoVncPrefix(url: URL): string {
-  const stripped = url.pathname.replace(/^\/novnc\/?/, "/") || "/";
-  return `${stripped}${url.search}`;
+function noVncViewerUrl(platform: PlatformId): string {
+  return `/novnc/${platform}/vnc.html?autoconnect=1&resize=scale&path=novnc/${platform}/websockify`;
+}
+
+function noVncTarget(url: URL): { host: string; port: number; path: string } {
+  const parts = url.pathname.split("/").filter(Boolean);
+  const parsedPlatform = parts[0] === "novnc" ? parts[1] : "";
+  const platform = (parsedPlatform === "douyin" || parsedPlatform === "bilibili" || parsedPlatform === "xhs" ? parsedPlatform : "xhs") as PlatformId;
+  const rest = platform === parsedPlatform ? parts.slice(2) : parts.slice(1);
+  return {
+    host: defaultNoVncHost,
+    port: noVncPortForPlatform(platform),
+    path: `/${rest.join("/") || ""}${url.search}`
+  };
+}
+
+function noVncPortForPlatform(platform: PlatformId): number {
+  if (platform === "douyin") return Number(process.env.DOUYIN_VIEWER_NOVNC_PORT || 6090);
+  if (platform === "bilibili") return Number(process.env.BILIBILI_VIEWER_NOVNC_PORT || 6100);
+  return Number(process.env.XHS_VIEWER_NOVNC_PORT || process.env.BROWSER_NOVNC_PORT || process.env.XHS_NOVNC_PORT || 6080);
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {

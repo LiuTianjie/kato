@@ -9,7 +9,7 @@ import { bindContentWorkspace, refreshContentWorkspace } from "./js/components/c
 import { renderHistory, renderHistoryLoading, renderMetrics, clearHistoryFilters } from "./js/components/history.js";
 import { appendClientLog, bindLogPanel } from "./js/components/logPanel.js";
 import { bindCdpViewer } from "./js/components/cdpViewer.js";
-import { openCdpLogin, refreshMcp, restartMcpBrowser } from "./js/components/mcpPanel.js";
+import { bindPlatformLoginActions, openCdpLogin, refreshMcp, restartMcpBrowser } from "./js/components/mcpPanel.js";
 import { configureNotes, renderNotes, renderNotesLoading } from "./js/components/notes.js";
 import { bindPostSearch, renderPostSearchEmpty } from "./js/components/postSearch.js";
 import {
@@ -43,6 +43,7 @@ function bindEvents() {
   bindTabs();
   bindLogPanel();
   bindCdpViewer();
+  bindPlatformLoginActions();
   bindContentWorkspace();
   bindPostSearch();
   $("refreshAll").addEventListener("click", () => withButtonLoading($("refreshAll"), "刷新中", refreshAll));

@@ -26,20 +26,34 @@ export async function connectCdpViewer(options = {}) {
     clearViewerFrame();
   }
   if (connected) return;
+  return openBrowserViewer({}, options);
+}
+
+export async function openPlatformViewer(platform, options = {}) {
+  return openBrowserViewer({ platform, url: options.url || "" }, { ...options, force: true });
+}
+
+async function openBrowserViewer(body = {}, options = {}) {
+  if (options.force) {
+    connected = false;
+    clearViewerFrame();
+  }
   connected = true;
   setViewerStatus("连接中");
-  appendClientLog("开始 · 连接容器浏览器远程画面");
+  const platformLabel = platformDisplayName(body.platform);
+  appendClientLog(platformLabel ? `开始 · 打开${platformLabel}登录页面` : "开始 · 连接容器浏览器远程画面");
   try {
-    const result = await dashboardApi.openBrowserViewer();
+    const result = await dashboardApi.openBrowserViewer(body);
     viewerUrl = withViewerNonce(result.viewerUrl || DEFAULT_VIEWER_URL);
     ensureViewerFrame(viewerUrl);
-    setAddressValue(result.loginUrl || "https://www.xiaohongshu.com/explore");
+    setAddressValue(result.loginUrl || result.homeUrl || "https://www.xiaohongshu.com/explore");
     setViewerStatus("noVNC 已打开");
-    appendClientLog("成功 · 已打开 noVNC 浏览器画面");
+    appendClientLog(platformLabel ? `成功 · ${platformLabel}页面已在 noVNC 中打开` : "成功 · 已打开 noVNC 浏览器画面");
   } catch (error) {
     connected = false;
+    clearViewerFrame();
     setViewerStatus(`连接失败：${errorMessage(error)}`, true);
-    appendClientLog(`失败 · 容器浏览器远程画面：${errorMessage(error)}`);
+    appendClientLog(platformLabel ? `失败 · 打开${platformLabel}页面：${errorMessage(error)}` : `失败 · 容器浏览器远程画面：${errorMessage(error)}`);
   }
 }
 
@@ -88,7 +102,10 @@ function ensureViewerFrame(url) {
 
 function clearViewerFrame() {
   const wrap = $("cdpScreenWrap");
-  wrap.replaceChildren();
+  const placeholder = document.createElement("div");
+  placeholder.className = "browser-viewer-placeholder";
+  placeholder.innerHTML = "<strong>noVNC 未连接</strong><span>点击平台登录后会在这里显示容器 Chrome。</span>";
+  wrap.replaceChildren(placeholder);
 }
 
 function withViewerNonce(url) {
@@ -112,4 +129,11 @@ function setNavButtonsBusy(isBusy) {
 function setViewerStatus(text, warn = false) {
   setText("cdpViewerStatus", text);
   $("cdpViewerStatus").className = warn ? "status-pill warn" : "status-pill ok";
+}
+
+function platformDisplayName(platform) {
+  if (platform === "xhs") return "小红书";
+  if (platform === "douyin") return "抖音";
+  if (platform === "bilibili") return "B站";
+  return "";
 }

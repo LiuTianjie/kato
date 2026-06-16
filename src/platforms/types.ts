@@ -68,9 +68,13 @@ export interface PlatformSpec {
   label: string;
   serviceName: string;
   homeUrl: string;
+  loginUrl?: string;
   cookieDomains: string[];
   defaultDataDir: string;
   defaultServicePort?: number;
+  viewerRuntimeUrl?: string;
+  workerRuntimeUrl?: string;
+  serviceUrl?: string;
   implemented: boolean;
   capabilities: PlatformCapabilities;
   searchUrl(query: string): string;

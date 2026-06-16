@@ -5,6 +5,7 @@ import { execFileSync, spawn } from "node:child_process";
 import path from "node:path";
 
 const PORT = numberEnv(["BROWSER_RUNTIME_PORT", "XHS_BROWSER_RUNTIME_PORT"], 18100);
+const RUNTIME_NAME = stringEnv(["BROWSER_RUNTIME_NAME", "KATO_BROWSER_RUNTIME_NAME"], `runtime:${PORT}`);
 const DISPLAY = stringEnv(["BROWSER_DISPLAY", "XHS_DISPLAY"], ":99");
 const DISPLAY_SIZE = stringEnv(["BROWSER_DISPLAY_SIZE", "XHS_DISPLAY_SIZE"], "1440x980x24");
 const VNC_ENABLED = stringEnv(["BROWSER_VNC_ENABLED", "XHS_VNC_ENABLED"], "1") !== "0";
@@ -34,6 +35,8 @@ const START_TIMEOUT_MS = numberEnv(["BROWSER_START_TIMEOUT_MS", "XHS_HEALTH_ENSU
 const RESTART_TIMEOUT_MS = numberEnv(["BROWSER_RESTART_TIMEOUT_MS", "XHS_BROWSER_RESTART_TIMEOUT_MS"], 120_000);
 const PROCESS_EXIT_GRACE_MS = numberEnv(["BROWSER_PROCESS_EXIT_GRACE_MS", "XHS_PROCESS_EXIT_GRACE_MS"], 2_000);
 const LOG_LIMIT = numberEnv(["BROWSER_RUNTIME_LOG_LIMIT", "XHS_SERVICE_LOG_LIMIT"], 800);
+const LEASE_DEFAULT_WAIT_MS = numberEnv(["BROWSER_LEASE_DEFAULT_WAIT_MS"], 120_000);
+const LEASE_DEFAULT_TTL_MS = numberEnv(["BROWSER_LEASE_DEFAULT_TTL_MS"], 900_000);
 
 let logSeq = 0;
 const logs = [];
@@ -42,6 +45,7 @@ let vncSupervisor;
 let noVncSupervisor;
 let chromeProcess;
 let restartPromise;
+let activeLease;
 
 const server = createServer(async (req, res) => {
   try {
@@ -52,6 +56,29 @@ const server = createServer(async (req, res) => {
       const status = ensure ? await ensureRuntimeReady() : await runtimeStatus();
       const ok = status.chrome.running && status.cdp.ready && (!VNC_ENABLED || (status.vnc.ready && status.noVnc.ready));
       sendJson(res, ensure && !ok ? 503 : 200, { ok: ensure ? ok : true, service: "kato-browser-runtime", runtime: status });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/browser/lease/acquire") {
+      const body = await readJson(req);
+      const lease = await acquireLease({
+        owner: String(body.owner || "unknown"),
+        label: String(body.label || "browser-task"),
+        waitMs: normalizeNonNegativeNumber(body.waitMs, LEASE_DEFAULT_WAIT_MS),
+        ttlMs: normalizePositiveNumber(body.ttlMs, LEASE_DEFAULT_TTL_MS)
+      });
+      sendJson(res, 200, { success: true, data: lease });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/browser/lease/release") {
+      const body = await readJson(req);
+      const released = releaseLease(String(body.leaseId || ""));
+      sendJson(res, released ? 200 : 409, {
+        success: released,
+        data: { released },
+        error: released ? undefined : { code: "LEASE_MISMATCH", message: "Lease is not active." }
+      });
       return;
     }
 
@@ -76,6 +103,7 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/browser/restart") {
       const body = await readJson(req);
       const reason = String(body.reason || "manual");
+      assertLeaseAccess(body.leaseId, "restart");
       const data = await restartBrowser(reason);
       sendJson(res, 200, { success: true, data });
       return;
@@ -83,15 +111,27 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/browser/action") {
       const body = await readJson(req);
+      assertLeaseAccess(body.leaseId, "browser action");
       await ensureRuntimeReady();
       await runBrowserAction(body);
       sendJson(res, 200, { success: true, data: { ok: true } });
       return;
     }
 
-    if (req.method === "POST" && url.pathname === "/browser/cookies/sync") {
+    if (req.method === "POST" && url.pathname === "/browser/cookies/export") {
       await ensureRuntimeReady();
       const body = await readJson(req);
+      const domains = Array.isArray(body.domains) ? body.domains.map((item) => String(item)).filter(Boolean) : [];
+      const cookies = await exportCookies(domains);
+      serviceLog("info", "cookies", `Exported ${cookies.length} browser cookies.`, { domains });
+      sendJson(res, 200, { success: true, data: { exportedCookies: cookies.length, cookies } });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/browser/cookies/sync") {
+      const body = await readJson(req);
+      assertLeaseAccess(body.leaseId, "cookie sync");
+      await ensureRuntimeReady();
       const domains = Array.isArray(body.domains) ? body.domains.map((item) => String(item)).filter(Boolean) : [];
       const cookies = await exportCookies(domains);
       await persistCookies(cookies);
@@ -111,12 +151,13 @@ const server = createServer(async (req, res) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     serviceLog("error", "request", `${req.method || "GET"} ${req.url || "/"} failed: ${message}`);
-    sendJson(res, 500, { success: false, error: { code: "INTERNAL_ERROR", message } });
+    const status = Number(error?.statusCode || 500);
+    sendJson(res, status, { success: false, error: { code: status === 423 ? "BROWSER_BUSY" : "INTERNAL_ERROR", message } });
   }
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-  serviceLog("info", "runtime", `kato-browser-runtime listening on http://127.0.0.1:${PORT}`);
+  serviceLog("info", "runtime", `${RUNTIME_NAME} listening on http://127.0.0.1:${PORT}`);
 });
 
 startDisplayRuntime().catch((error) => {
@@ -196,6 +237,7 @@ async function ensureRuntimeReady() {
 async function runtimeStatus() {
   const cdp = await isHttpReady(`http://127.0.0.1:${CDP_PORT}/json/version`, 600);
   return {
+    name: RUNTIME_NAME,
     display: { value: DISPLAY, running: Boolean(xvfbProcess && xvfbProcess.exitCode === null && xvfbProcess.signalCode === null) },
     chrome: {
       running: Boolean(chromeProcess && chromeProcess.exitCode === null && chromeProcess.signalCode === null),
@@ -222,8 +264,62 @@ async function runtimeStatus() {
       port: NOVNC_PORT,
       ready: VNC_ENABLED ? (await isHttpReady(`http://127.0.0.1:${NOVNC_PORT}/vnc.html`, 600)).ok : false
     },
-    logs: { cursor: logSeq }
+    logs: { cursor: logSeq },
+    lease: leaseSummary()
   };
+}
+
+async function acquireLease({ owner, label, waitMs, ttlMs }) {
+  const deadline = Date.now() + waitMs;
+  while (true) {
+    pruneExpiredLease();
+    if (!activeLease) {
+      activeLease = {
+        leaseId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+        owner,
+        label,
+        acquiredAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + ttlMs).toISOString(),
+        ttlMs
+      };
+      serviceLog("info", "lease", "Browser lease acquired.", activeLease);
+      return activeLease;
+    }
+    if (Date.now() >= deadline) {
+      const holder = `${activeLease.owner}:${activeLease.label}`;
+      throw httpError(423, `Browser runtime is busy; active lease held by ${holder}.`);
+    }
+    await delay(250);
+  }
+}
+
+function releaseLease(leaseId) {
+  pruneExpiredLease();
+  if (!activeLease || activeLease.leaseId !== leaseId) return false;
+  serviceLog("info", "lease", "Browser lease released.", activeLease);
+  activeLease = undefined;
+  return true;
+}
+
+function assertLeaseAccess(leaseId, action) {
+  pruneExpiredLease();
+  if (!activeLease) return;
+  if (leaseId && activeLease.leaseId === leaseId) return;
+  const holder = `${activeLease.owner}:${activeLease.label}`;
+  throw httpError(423, `Browser runtime ${action} is blocked by active lease ${holder}.`);
+}
+
+function pruneExpiredLease() {
+  if (!activeLease) return;
+  if (Date.parse(activeLease.expiresAt) > Date.now()) return;
+  serviceLog("warn", "lease", "Browser lease expired.", activeLease);
+  activeLease = undefined;
+}
+
+function leaseSummary() {
+  pruneExpiredLease();
+  if (!activeLease) return { active: false };
+  return { active: true, ...activeLease };
 }
 
 async function ensureBrowser() {
@@ -621,6 +717,12 @@ function withTimeout(promise, timeoutMs, message) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+function httpError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
+
 function normalizeViewerUrl(raw) {
   const value = raw.trim();
   if (!value) return "";
@@ -663,6 +765,18 @@ function numberEnv(names, fallback) {
   const value = Number(stringEnv(names, String(fallback)));
   if (!Number.isFinite(value) || value <= 0) return fallback;
   return Math.floor(value);
+}
+
+function normalizePositiveNumber(value, fallback) {
+  const numberValue = Number(value ?? fallback);
+  if (!Number.isFinite(numberValue) || numberValue <= 0) return fallback;
+  return Math.floor(numberValue);
+}
+
+function normalizeNonNegativeNumber(value, fallback) {
+  const numberValue = Number(value ?? fallback);
+  if (!Number.isFinite(numberValue) || numberValue < 0) return fallback;
+  return Math.floor(numberValue);
 }
 
 function stringEnv(names, fallback) {

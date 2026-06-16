@@ -12,7 +12,7 @@ http://localhost:4173/api/v1/xhs/*
 https://kato.itool.tech/api/v1/xhs/*
 ```
 
-这些接口面向本地或内网自动化调用。CDP 浏览器接管、推流、点击输入仍是 dashboard 内部能力，不作为公共契约。
+这些接口面向本地或内网自动化调用。noVNC 浏览器接管、Cookie 同步、推流、点击输入仍是 dashboard 内部能力，不作为公共契约；CDP 只作为容器内部控制通道。
 
 ## 鉴权
 

@@ -20,10 +20,14 @@ try {
 const PORT = Number(process.env.PORT || process.env.DOUYIN_SERVICE_PORT || 18070);
 const BROWSER_RUNTIME_URL =
   process.env.DOUYIN_BROWSER_RUNTIME_URL ||
+  process.env.BROWSER_WORKER_RUNTIME_URL ||
   process.env.BROWSER_RUNTIME_URL ||
-  `http://127.0.0.1:${process.env.BROWSER_RUNTIME_PORT || 18100}`;
+  "http://127.0.0.1:18111";
+const VIEWER_RUNTIME_URL =
+  process.env.DOUYIN_VIEWER_RUNTIME_URL ||
+  "http://127.0.0.1:18110";
 const INTERNAL_CDP_PORT = Number(process.env.DOUYIN_INTERNAL_CDP_PORT || process.env.BROWSER_CDP_PORT || 9224);
-const PROFILE_DIR = process.env.BROWSER_PROFILE_DIR || process.env.DOUYIN_PROFILE_DIR || "/app/data/browser-profile";
+const PROFILE_DIR = process.env.DOUYIN_PROFILE_DIR || process.env.BROWSER_PROFILE_DIR || "/app/data/platforms/douyin/worker-profile";
 const COOKIES_PATH = process.env.DOUYIN_COOKIES_PATH || "/app/data/platforms/douyin/cookies.json";
 const CDP_CONNECT_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_CDP_CONNECT_TIMEOUT_MS", 30_000);
 const CDP_CONNECT_ATTEMPTS = normalizePositiveEnv("DOUYIN_CDP_CONNECT_ATTEMPTS", 3);
@@ -62,6 +66,7 @@ const WINDOWS_UA_METADATA = {
   mobile: false,
   wow64: false
 };
+const DOUYIN_COOKIE_DOMAINS = [".douyin.com", "douyin.com", ".iesdouyin.com", "iesdouyin.com", ".amemv.com", "amemv.com", "bytedance"];
 let contextPromise;
 let restartPromise;
 let browserTaskTail = Promise.resolve();
@@ -107,6 +112,17 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/api/v1/login/status") {
       const data = await enqueueBrowserTask("login:status", (taskContext) => loginStatus(taskContext), { signal: requestSignal });
       sendJson(res, 200, { success: true, data });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/v1/browser/sync-cookies") {
+      const cookies = await exportViewerCookies(DOUYIN_COOKIE_DOMAINS);
+      await persistCookies(cookies, "manual-sync");
+      const context = contextPromise ? await contextPromise.catch(() => undefined) : undefined;
+      if (context && cookies.length) await context.addCookies(cookies).catch(() => undefined);
+      const exportedCookies = cookies.length;
+      serviceLog("info", "cookies", "Douyin browser cookies synced manually.", { exportedCookies });
+      sendJson(res, 200, { success: true, data: { cookiesPath: COOKIES_PATH, exportedCookies } });
       return;
     }
 
@@ -400,6 +416,9 @@ function enqueueBrowserTask(label, task, options = {}) {
         pending: browserTaskPending
       });
       await humanDelay(`task:${label}`, TASK_DELAY_MIN_MS, TASK_DELAY_MAX_MS, { log: true, signal: taskContext.signal });
+      const lease = await acquireRuntimeLease(label, timeoutMs, taskContext);
+      taskContext.leaseId = lease.leaseId;
+      if (browserTaskActive?.id === id) browserTaskActive.leaseId = lease.leaseId;
       return await runBrowserTaskWithTimeout(label, task, timeoutMs, taskContext);
     } finally {
       removeFromPending();
@@ -410,6 +429,7 @@ function enqueueBrowserTask(label, task, options = {}) {
         browserTaskActive = null;
       }
       await closeTaskPage(taskContext, "task finished").catch(() => undefined);
+      await releaseRuntimeLease(taskContext.leaseId).catch(() => undefined);
     }
   };
 
@@ -434,7 +454,7 @@ async function runBrowserTaskWithTimeout(label, task, timeoutMs, taskContext) {
   } catch (error) {
     if (error instanceof BrowserTaskTimeoutError) {
       taskPromise.catch(() => undefined);
-      await resetBrowserAfterTaskTimeout(label);
+      await resetBrowserAfterTaskTimeout(label, taskContext);
     } else if (error instanceof BrowserTaskCancelledError) {
       taskPromise.catch(() => undefined);
     }
@@ -444,7 +464,7 @@ async function runBrowserTaskWithTimeout(label, task, timeoutMs, taskContext) {
   }
 }
 
-async function resetBrowserAfterTaskTimeout(label) {
+async function resetBrowserAfterTaskTimeout(label, taskContext) {
   serviceLog("warn", "queue", `Browser task timed out; resetting Chromium before next task: ${label}`);
   const oldContextPromise = contextPromise;
   contextPromise = undefined;
@@ -453,7 +473,7 @@ async function resetBrowserAfterTaskTimeout(label) {
     const context = await withTimeout(oldContextPromise, 1_500, "Timed-out browser context close timed out.").catch(() => undefined);
     await withTimeout(context?.browser()?.close(), 1_500, "Timed-out browser close timed out.").catch(() => undefined);
   }
-  await requestRuntimeRestart(`douyin task timeout: ${label}`);
+  await requestRuntimeRestart(`douyin task timeout: ${label}`, taskContext?.leaseId);
 }
 
 function createBrowserTaskContext(id, label, externalSignal) {
@@ -518,7 +538,7 @@ async function withBrowserRecovery(label, task, taskContext) {
     if (!isRecoverableBrowserError(error)) throw error;
     taskContext?.throwIfCancelled?.();
     serviceLog("warn", "browser", `Recoverable browser error in ${label}; restarting.`, { error: errorMessage(error).slice(0, 240) });
-    await restartBrowser(`${label}: ${errorMessage(error).slice(0, 240)}`);
+    await restartBrowser(`${label}: ${errorMessage(error).slice(0, 240)}`, taskContext);
     taskContext?.throwIfCancelled?.();
     return task();
   }
@@ -530,7 +550,7 @@ function isRecoverableBrowserError(error) {
   );
 }
 
-async function restartBrowser(reason = "manual") {
+async function restartBrowser(reason = "manual", taskContext) {
   if (restartPromise) return restartPromise;
   restartPromise = withTimeout(
     (async () => {
@@ -543,7 +563,7 @@ async function restartBrowser(reason = "manual") {
         if (context) await persistContextCookies(context, "restart").catch(() => undefined);
         await withTimeout(context?.browser()?.close(), 1_500, "Old browser close timed out.").catch(() => undefined);
       }
-      await requestRuntimeRestart(reason);
+      await requestRuntimeRestart(reason, taskContext?.leaseId);
       await ensureContext();
       return { restarted: true, reason, browser: await browserSummary() };
     })(),
@@ -990,16 +1010,62 @@ async function runtimeBrowserSummary() {
   return fetchRuntimeJson("/health", {}, BROWSER_RUNTIME_TIMEOUT_MS);
 }
 
-async function requestRuntimeRestart(reason) {
+async function requestRuntimeRestart(reason, leaseId) {
   return fetchRuntimeJson(
     "/browser/restart",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ reason })
+      body: JSON.stringify({ reason, leaseId })
     },
     120_000
   );
+}
+
+async function acquireRuntimeLease(label, timeoutMs, taskContext) {
+  const payload = await fetchRuntimeJson(
+    "/browser/lease/acquire",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        owner: "douyin-service",
+        label,
+        waitMs: timeoutMs,
+        ttlMs: Math.max(timeoutMs + 120_000, 300_000)
+      })
+    },
+    Math.max(timeoutMs + 15_000, BROWSER_RUNTIME_TIMEOUT_MS)
+  );
+  taskContext?.throwIfCancelled?.();
+  return payload?.data || payload;
+}
+
+async function releaseRuntimeLease(leaseId) {
+  if (!leaseId) return;
+  await fetchRuntimeJson(
+    "/browser/lease/release",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ leaseId })
+    },
+    10_000
+  ).catch((error) => serviceLog("warn", "runtime", `Browser runtime lease release failed: ${errorMessage(error)}`));
+}
+
+async function exportViewerCookies(domains) {
+  const payload = await fetchRuntimeJson(
+    "/browser/cookies/export",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ domains })
+    },
+    BROWSER_RUNTIME_TIMEOUT_MS
+  );
+  const data = payload?.data || payload;
+  return Array.isArray(data?.cookies) ? data.cookies : [];
 }
 
 async function waitForCdpHttp() {
@@ -1034,7 +1100,8 @@ async function connectBrowserOverCdp() {
 }
 
 async function fetchRuntimeJson(endpoint, init = {}, timeoutMs = BROWSER_RUNTIME_TIMEOUT_MS) {
-  const url = `${BROWSER_RUNTIME_URL.replace(/\/$/, "")}${endpoint}`;
+  const baseUrl = endpoint === "/browser/cookies/export" ? VIEWER_RUNTIME_URL : BROWSER_RUNTIME_URL;
+  const url = `${baseUrl.replace(/\/$/, "")}${endpoint}`;
   const response = await fetchWithTimeout(url, init, timeoutMs);
   const text = await response.text();
   const data = text ? JSON.parse(text) : {};

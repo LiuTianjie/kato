@@ -22,8 +22,13 @@ try {
 const PORT = Number(process.env.PORT || 18060);
 const BROWSER_RUNTIME_URL =
   process.env.XHS_BROWSER_RUNTIME_URL ||
+  process.env.BROWSER_WORKER_RUNTIME_URL ||
   process.env.BROWSER_RUNTIME_URL ||
-  `http://127.0.0.1:${process.env.BROWSER_RUNTIME_PORT || process.env.XHS_BROWSER_RUNTIME_PORT || 18100}`;
+  `http://127.0.0.1:${process.env.BROWSER_RUNTIME_PORT || process.env.XHS_BROWSER_RUNTIME_PORT || 18101}`;
+const VIEWER_RUNTIME_URL =
+  process.env.XHS_VIEWER_RUNTIME_URL ||
+  process.env.BROWSER_VIEWER_RUNTIME_URL ||
+  "http://127.0.0.1:18100";
 const INTERNAL_CDP_PORT = Number(process.env.XHS_INTERNAL_CDP_PORT || process.env.BROWSER_CDP_PORT || process.env.XHS_CDP_PORT || 9224);
 const PROFILE_DIR = process.env.XHS_PROFILE_DIR || "/app/data/profile";
 const COOKIES_PATH = process.env.COOKIES_PATH || "/app/data/cookies.json";
@@ -77,6 +82,7 @@ const WINDOWS_UA_METADATA = {
 };
 const XHS_HOME_URL = "https://www.xiaohongshu.com/explore";
 const XHS_CREATOR_URL = "https://creator.xiaohongshu.com";
+const XHS_COOKIE_DOMAINS = [".xiaohongshu.com", "xiaohongshu.com", ".xhslink.com", "xhslink.com", ".xhscdn.com"];
 
 let contextPromise;
 let servicePagePromise;
@@ -221,8 +227,11 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && url.pathname === "/api/v1/browser/sync-cookies") {
-      const context = await ensureContext();
-      const exportedCookies = await persistContextCookies(context, "manual-sync");
+      const cookies = await exportViewerCookies(XHS_COOKIE_DOMAINS);
+      await persistCookies(cookies, "manual-sync");
+      const context = contextPromise ? await contextPromise.catch(() => undefined) : undefined;
+      if (context && cookies.length) await context.addCookies(cookies).catch(() => undefined);
+      const exportedCookies = cookies.length;
       serviceLog("info", "cookies", "Browser cookies synced manually.", { exportedCookies });
       sendJson(res, 200, { success: true, data: { cookiesPath: COOKIES_PATH, exportedCookies } });
       return;
@@ -425,6 +434,9 @@ function enqueueBrowserTask(label, task, options = {}) {
         signal: taskContext.signal
       });
       if (jitterMs > 0 && browserTaskActive?.id === id) browserTaskActive.delayMs = jitterMs;
+      const lease = await acquireRuntimeLease(label, timeoutMs, taskContext);
+      taskContext.leaseId = lease.leaseId;
+      if (browserTaskActive?.id === id) browserTaskActive.leaseId = lease.leaseId;
       return await runBrowserTaskWithTimeout(label, task, timeoutMs, taskContext);
     } finally {
       removeFromPending();
@@ -435,6 +447,7 @@ function enqueueBrowserTask(label, task, options = {}) {
         browserTaskActive = null;
       }
       await closeTaskServicePage(taskContext, "task finished").catch(() => undefined);
+      await releaseRuntimeLease(taskContext.leaseId).catch(() => undefined);
     }
   };
 
@@ -470,7 +483,7 @@ async function runBrowserTaskWithTimeout(label, task, timeoutMs, taskContext) {
   } catch (error) {
     if (error instanceof BrowserTaskTimeoutError) {
       taskPromise.catch(() => undefined);
-      await resetBrowserAfterTaskTimeout(label);
+      await resetBrowserAfterTaskTimeout(label, taskContext);
     } else if (error instanceof BrowserTaskCancelledError) {
       taskPromise.catch(() => undefined);
     }
@@ -480,7 +493,7 @@ async function runBrowserTaskWithTimeout(label, task, timeoutMs, taskContext) {
   }
 }
 
-async function resetBrowserAfterTaskTimeout(label) {
+async function resetBrowserAfterTaskTimeout(label, taskContext) {
   serviceLog("warn", "queue", `Browser task timed out; resetting Chromium before next task: ${label}`);
   const oldContextPromise = contextPromise;
   contextPromise = undefined;
@@ -493,7 +506,7 @@ async function resetBrowserAfterTaskTimeout(label) {
     await withTimeout(context?.browser()?.close(), 1_500, "Timed-out browser close timed out.").catch(() => undefined);
   }
 
-  await requestRuntimeRestart(`task timeout: ${label}`);
+  await requestRuntimeRestart(`task timeout: ${label}`, taskContext?.leaseId);
 }
 
 function createBrowserTaskContext(id, label, externalSignal) {
@@ -815,7 +828,7 @@ async function closeTaskServicePage(taskContext, reason) {
   await page.close({ runBeforeUnload: false }).catch(() => undefined);
 }
 
-async function restartBrowser(reason = "manual") {
+async function restartBrowser(reason = "manual", taskContext) {
   if (restartPromise) return restartPromise;
   restartPromise = withTimeout((async () => {
     serviceLog("warn", "browser", `Restarting runtime browser: ${reason}`);
@@ -831,7 +844,7 @@ async function restartBrowser(reason = "manual") {
       await withTimeout(context?.browser()?.close(), 1_500, "Old browser close timed out.").catch(() => undefined);
     }
 
-    await requestRuntimeRestart(reason);
+    await requestRuntimeRestart(reason, taskContext?.leaseId);
     await ensureContext();
     await warmServicePage();
     return {
@@ -855,7 +868,7 @@ async function withBrowserRecovery(label, task, taskContext) {
     taskContext?.throwIfCancelled?.();
     const message = error instanceof Error ? error.message : String(error);
     serviceLog("warn", "browser", `Recoverable browser error in ${label}; restarting.`, { error: message.slice(0, 240) });
-    await restartBrowser(`${label}: ${message.slice(0, 240)}`);
+    await restartBrowser(`${label}: ${message.slice(0, 240)}`, taskContext);
     taskContext?.throwIfCancelled?.();
     return task();
   }
@@ -1765,13 +1778,13 @@ async function runtimeBrowserSummary() {
   return payload?.runtime || payload;
 }
 
-async function requestRuntimeRestart(reason) {
+async function requestRuntimeRestart(reason, leaseId) {
   const payload = await fetchRuntimeJson(
     "/browser/restart",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ reason })
+      body: JSON.stringify({ reason, leaseId })
     },
     Math.max(BROWSER_RESTART_TIMEOUT_MS, 30_000)
   );
@@ -1779,8 +1792,58 @@ async function requestRuntimeRestart(reason) {
   return payload?.data || payload;
 }
 
+async function acquireRuntimeLease(label, timeoutMs, taskContext) {
+  const payload = await fetchRuntimeJson(
+    "/browser/lease/acquire",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        owner: "xhs-service",
+        label,
+        waitMs: timeoutMs,
+        ttlMs: Math.max(timeoutMs + 120_000, 300_000)
+      })
+    },
+    Math.max(timeoutMs + 15_000, BROWSER_RUNTIME_TIMEOUT_MS)
+  );
+  taskContext?.throwIfCancelled?.();
+  return payload?.data || payload;
+}
+
+async function releaseRuntimeLease(leaseId) {
+  if (!leaseId) return;
+  await fetchRuntimeJson(
+    "/browser/lease/release",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ leaseId })
+    },
+    10_000
+  ).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    serviceLog("warn", "runtime", `Browser runtime lease release failed: ${message}`);
+  });
+}
+
+async function exportViewerCookies(domains) {
+  const payload = await fetchRuntimeJson(
+    "/browser/cookies/export",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ domains })
+    },
+    BROWSER_RUNTIME_TIMEOUT_MS
+  );
+  const data = payload?.data || payload;
+  return Array.isArray(data?.cookies) ? data.cookies : [];
+}
+
 async function fetchRuntimeJson(endpoint, init = {}, timeoutMs = BROWSER_RUNTIME_TIMEOUT_MS) {
-  const url = `${BROWSER_RUNTIME_URL.replace(/\/$/, "")}${endpoint}`;
+  const baseUrl = endpoint === "/browser/cookies/export" ? VIEWER_RUNTIME_URL : BROWSER_RUNTIME_URL;
+  const url = `${baseUrl.replace(/\/$/, "")}${endpoint}`;
   const response = await fetchWithAbort(url, init, timeoutMs);
   const text = await response.text();
   const payload = text ? JSON.parse(text) : {};

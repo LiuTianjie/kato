@@ -13,10 +13,14 @@ env:
   PORT: "4173"
   XHS_SERVICE_PORT: "18060"
   DOUYIN_SERVICE_PORT: "18070"
-  BROWSER_RUNTIME_PORT: "18100"
-  BROWSER_RUNTIME_URL: http://127.0.0.1:18100
-  XHS_BROWSER_RUNTIME_URL: http://127.0.0.1:18100
-  DOUYIN_BROWSER_RUNTIME_URL: http://127.0.0.1:18100
+  XHS_VIEWER_RUNTIME_URL: http://127.0.0.1:18100
+  XHS_BROWSER_RUNTIME_URL: http://127.0.0.1:18101
+  DOUYIN_VIEWER_RUNTIME_URL: http://127.0.0.1:18110
+  DOUYIN_BROWSER_RUNTIME_URL: http://127.0.0.1:18111
+  BROWSER_VIEWER_RUNTIME_URL: http://127.0.0.1:18100
+  BROWSER_WORKER_RUNTIME_URL: http://127.0.0.1:18101
+  BROWSER_RUNTIME_URL: http://127.0.0.1:18101
+  BROWSER_RUNTIME_PORT: "18101"
   DOUYIN_SERVICE_URL: http://127.0.0.1:18070
   XHS_API_TOKEN: ${XHS_API_TOKEN}
   COMMENT_PROVIDER: ark
@@ -26,23 +30,9 @@ env:
   COMMENT_GENERATION_CONCURRENCY: "3"
   GENERATE_PUBLISH_CONCURRENCY: "3"
   BROWSER_BIN: /usr/local/bin/kato-chromium
-  BROWSER_CDP_HOST: 127.0.0.1
-  BROWSER_CDP_PORT: "9224"
-  BROWSER_DISPLAY: ":99"
-  BROWSER_VNC_ENABLED: "1"
-  BROWSER_VNC_PORT: "5900"
-  BROWSER_NOVNC_PORT: "6080"
-  BROWSER_PROFILE_DIR: /app/mcp/xiaohongshu/data/profile
-  BROWSER_COOKIES_PATH: /app/mcp/xiaohongshu/data/cookies.json
-  BROWSER_COOKIE_MIRROR_PATHS: /app/data/cookies.json
   XHS_BROWSER_BIN: /usr/local/bin/kato-chromium
-  XHS_CDP_HOST: 127.0.0.1
-  XHS_CDP_PORT: "9224"
-  XHS_INTERNAL_CDP_PORT: "9224"
-  XHS_DISPLAY: ":99"
-  XHS_VNC_ENABLED: "1"
-  XHS_VNC_PORT: "5900"
-  XHS_NOVNC_PORT: "6080"
+  XHS_INTERNAL_CDP_PORT: "9225"
+  DOUYIN_INTERNAL_CDP_PORT: "9235"
   XHS_REST_TIMEOUT_MS: "600000"
   XHS_PUBLIC_MCP_FETCH_TIMEOUT_MS: "600000"
   XHS_CDP_CONNECT_TIMEOUT_MS: "30000"
@@ -50,8 +40,9 @@ env:
   XHS_BROWSER_RESTART_TIMEOUT_MS: "120000"
   XHS_HEALTH_ENSURE_TIMEOUT_MS: "20000"
   XHS_BROWSER_TASK_TIMEOUT_MS: "180000"
-  XHS_PROFILE_DIR: /app/mcp/xiaohongshu/data/profile
+  XHS_PROFILE_DIR: /app/data/platforms/xhs/worker-profile
   COOKIES_PATH: /app/mcp/xiaohongshu/data/cookies.json
+  DOUYIN_PROFILE_DIR: /app/data/platforms/douyin/worker-profile
   DOUYIN_CDP_CONNECT_TIMEOUT_MS: "30000"
   DOUYIN_CDP_CONNECT_ATTEMPTS: "3"
   DOUYIN_BROWSER_TASK_TIMEOUT_MS: "180000"
@@ -71,7 +62,7 @@ volumes:
 healthcheck:
   test:
     - CMD-SHELL
-    - node -e "const urls=['http://127.0.0.1:4173/api/dashboard','http://127.0.0.1:18060/health?ensure=1','http://127.0.0.1:18070/health','http://127.0.0.1:18100/health?ensure=1']; Promise.all(urls.map((url)=>fetch(url,{signal:AbortSignal.timeout(20000)}).then((r)=>{if(!r.ok) throw new Error(url+' '+r.status)}))).then(()=>process.exit(0)).catch((e)=>{console.error(e.message);process.exit(1)})"
+    - node -e "const e=process.env; const urls=['http://127.0.0.1:'+(e.PORT||4173)+'/api/dashboard','http://127.0.0.1:'+(e.XHS_SERVICE_PORT||18060)+'/health?ensure=1','http://127.0.0.1:'+(e.DOUYIN_SERVICE_PORT||18070)+'/health?ensure=1','http://127.0.0.1:'+(e.XHS_VIEWER_RUNTIME_PORT||18100)+'/health?ensure=1','http://127.0.0.1:'+(e.XHS_WORKER_RUNTIME_PORT||e.BROWSER_RUNTIME_PORT||18101)+'/health?ensure=1','http://127.0.0.1:'+(e.DOUYIN_VIEWER_RUNTIME_PORT||18110)+'/health?ensure=1','http://127.0.0.1:'+(e.DOUYIN_WORKER_RUNTIME_PORT||18111)+'/health?ensure=1']; Promise.all(urls.map((url)=>fetch(url,{signal:AbortSignal.timeout(20000)}).then((r)=>{if(!r.ok) throw new Error(url+' '+r.status)}))).then(()=>process.exit(0)).catch((e)=>{console.error(e.message);process.exit(1)})"
   interval: 30s
   timeout: 25s
   retries: 3
@@ -80,7 +71,7 @@ healthcheck:
 resources:
   limits:
     cpus: "2.00"
-    memory: 4G
+    memory: 8G
   reservations:
     cpus: "1.00"
-    memory: 4G
+    memory: 6G

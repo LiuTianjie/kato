@@ -6,7 +6,7 @@
 
 ## 快速开始
 
-推荐直接用一个容器跑完整 Kato：dashboard、容器内 Chromium、CDP、XHS browser service 和可选 MCP 兼容层都在同一个镜像里。
+推荐直接用一个容器跑完整 Kato：dashboard、多平台 Browser Runtime、XHS/Douyin service 和可选 MCP 兼容层都在同一个镜像里。
 
 ```bash
 cp .env.example .env
@@ -25,8 +25,10 @@ http://localhost:4173
 Dashboard: http://localhost:4173
 XHS service REST: http://localhost:18060/api/v1/*
 XHS service MCP: http://localhost:18060/mcp
-CDP: http://127.0.0.1:9222/json
+Douyin service REST: http://localhost:18070/api/v1/*
 ```
+
+Chrome、CDP、VNC/noVNC 和平台 worker runtime 都只在容器内部监听。浏览器画面从 dashboard 的“浏览器接管”页进入，不需要也不应该暴露调试端口。
 
 如果要本地 Node 开发，再使用：
 
@@ -39,9 +41,9 @@ npm run dashboard
 
 打开看板后，先在“我的笔记库”录入你的真实小红书笔记，再手动发起搜索入队。队列里不合适的帖子直接跳过；合适的帖子可批量“评论并发布”。运行结果会输出到 `output/runs/`，包含 Markdown 和 CSV 两份队列。
 
-## 容器内 XHS browser service
+## 容器内 Browser Runtime 与平台 Service
 
-Kato 内置自有的 XHS browser service，负责启动容器内 Chromium、暴露本机 CDP、提供 REST API，并保留一个轻量 `/mcp` 兼容层给 agent/MCP 客户端使用。它和 dashboard 在同一个镜像、同一个容器里：
+Kato 内置通用 Browser Runtime，负责启动容器内 Google Chrome、Xvfb、noVNC、内部 CDP、健康检查和重启恢复。小红书、抖音等平台 service 只负责平台数据解析、登录态同步、搜索、详情、评论和分页。它们和 dashboard 在同一个镜像、同一个容器里：
 
 ```bash
 docker compose up -d --build
@@ -63,6 +65,7 @@ http://localhost:18060/mcp
 
 ```text
 http://localhost:18060/api/v1/*
+http://localhost:18070/api/v1/*
 ```
 
 本地 Node 开发时创建配置：
@@ -71,7 +74,7 @@ http://localhost:18060/api/v1/*
 cp xhs.config.example.json xhs.config.local.json
 ```
 
-这个项目会映射这些工具：
+小红书 MCP 兼容层会映射这些工具：
 
 - `search_feeds`
 - `get_feed_detail`
@@ -99,41 +102,55 @@ npm run mark -- --interaction-id 1 --status posted_by_user
 npm test
 ```
 
-## 容器 CDP 浏览器接管
+## noVNC 浏览器接管与登录态同步
 
-如果小红书登录被二次验证、扫码安全确认或页面验证拦住，可以让 Kato 容器里的 Chromium 暴露 CDP，再由人通过 CDP/DevTools 接管：
+如果小红书或抖音需要扫码登录、二次验证或人工确认，可以在 dashboard 里打开对应平台的 noVNC 画面。noVNC 是远程桌面画面，不向网页暴露公网 CDP：
 
 ```bash
 docker compose up -d --build
-npm run auth:cdp
 ```
 
-Kato 容器会把浏览器 CDP 映射到本机：
+推荐流程：
+
+1. 打开 dashboard 的“浏览器接管”页。
+2. 选择“小红书登录”或“抖音登录”，Kato 会打开该平台的 viewer runtime。
+3. 在 noVNC 画面里扫码或完成验证。
+4. 登录成功后，点击对应平台的“同步 Cookie”。
+
+viewer runtime 只给人登录和观察页面用；worker runtime 只给接口任务使用。两者不共享 Chrome profile，登录态会通过“同步 Cookie”从 viewer 导出并注入/持久化到 worker，避免人工操作把正在跑的接口任务导航走。
+
+小红书登录态会保存到：
 
 ```text
-http://127.0.0.1:9222/json
+mcp/xiaohongshu/data/cookies.json
+/app/data/platforms/xhs/cookies.json
 ```
 
-容器内 Chromium 默认通过 Xvfb 以有头模式运行，减少 headless 浏览器特征。只有显式设置 `XHS_CHROMIUM_HEADLESS=1` 时才会退回 headless。
+抖音登录态会保存到：
 
-`npm run auth:cdp` 不会启动宿主机浏览器；它会请求 Kato 容器打开登录页，并等待容器内 Chromium 的 CDP 端口就绪。你在看板“浏览器接管”Tab 里扫码/完成验证后，登录态会保存到 `mcp/xiaohongshu/data/cookies.json`。
+```text
+/app/data/platforms/douyin/cookies.json
+```
+
+容器内 Chrome 默认通过 Xvfb 以有头模式运行，减少 headless 浏览器特征。只有显式设置 `XHS_CHROMIUM_HEADLESS=1` 时才会退回 headless。
+
+旧命令名仍保留兼容，但它现在只是打开 dashboard/noVNC 登录入口，不再建议按 CDP 接管理解：
 
 常用参数：
 
 ```bash
+npm run auth:cdp
 npm run auth:cdp -- --wait
 npm run auth:cdp -- --wait --sync-cookies
 npm run auth:cdp -- --restart
 npm run auth:sync-cookies
 ```
 
-如果是通过 CDP 手动操作完成登录，登录等待流程通常会自动保存 cookies。需要手动从容器 CDP 再导出一次时，运行：
+如果已经在 noVNC 里完成登录，需要手动再同步一次小红书 Cookie，可以运行：
 
 ```bash
 npm run auth:sync-cookies
 ```
-
-也可以在看板左侧“账号 / MCP”里点“打开浏览器接管”，完成验证后按需点“同步 CDP 登录态”。CDP 端口只绑定本机，不要把 `9222` 暴露到公网。
 
 ## 标准业务 REST API
 
@@ -163,9 +180,18 @@ curl -X POST http://localhost:4173/api/v1/xhs/posts/search \
 
 ## AMD64 镜像与 Browser Runtime
 
-Kato 镜像只发布 `linux/amd64`。仓库内置一个可复用的 `browser-runtime` 镜像 target，负责 `google-chrome-stable`、Xvfb、x11vnc、noVNC、websockify、xdotool、内部 CDP、健康检查和重启恢复。最终 `kato` 镜像基于这个 runtime 构建，小红书是第一个完整平台 adapter，抖音已接入只读 adapter。后续接 B 站时按 [docs/platform-adapters.md](docs/platform-adapters.md) 的分层接入。
+Kato 镜像只发布 `linux/amd64`。仓库内置一个可复用的 `browser-runtime` 镜像 target，负责 `google-chrome-stable`、Xvfb、x11vnc、noVNC、websockify、xdotool、内部 CDP、健康检查、lease 和重启恢复。最终 `kato` 镜像基于这个 runtime 构建，小红书和抖音是第一批平台 adapter。后续接 B 站时按 [docs/platform-adapters.md](docs/platform-adapters.md) 的分层接入。
 
-Runtime 默认监听容器内部 `127.0.0.1:18100`；CDP 仅绑定容器内部 `127.0.0.1:9224`，不需要也不应该映射到公网。Dashboard 通过 `/novnc/*` 反代浏览器画面。
+默认 runtime slot：
+
+| Slot | 用途 | Runtime | CDP | noVNC |
+| --- | --- | ---: | ---: | ---: |
+| `xhs-viewer` | 小红书人工登录/观察 | `18100` | `9224` | `6080` |
+| `xhs-worker` | 小红书接口任务 | `18101` | `9225` | 关闭 |
+| `douyin-viewer` | 抖音人工登录/观察 | `18110` | `9234` | `6090` |
+| `douyin-worker` | 抖音接口任务 | `18111` | `9235` | 关闭 |
+
+B 站 viewer/worker slot 已预留配置，但默认不启动业务 service。所有 runtime、CDP、VNC/noVNC 端口都只在容器内部使用；Luma 和生产环境只暴露 dashboard `4173`。平台 service 执行浏览器任务前会获取本平台 worker lease，任务结束、取消或超时后释放，避免多个任务互相重启或导航同一个 Chrome。
 
 单独构建基础 runtime：
 
@@ -213,7 +239,7 @@ XHS_API_TOKEN_VALUE=your-token ./scripts/deploy-luma.sh
 DRY_RUN=1 ./scripts/deploy-luma.sh
 ```
 
-部署配置见 [deploy/kato.luma.yml](deploy/kato.luma.yml)。它只对外暴露 dashboard 的 `4173` 端口；XHS service、Douyin service 和 CDP 保持容器内部能力，不直接暴露到公网。
+部署配置见 [deploy/kato.luma.yml](deploy/kato.luma.yml)。它只对外暴露 dashboard 的 `4173` 端口；XHS service、Douyin service、Browser Runtime、CDP、VNC/noVNC 都保持容器内部能力，不直接暴露到公网。当前 manifest 给多 runtime 场景预留了较高内存，默认 limit 为 8G、reservation 为 6G。
 
 ## 操作面板
 
@@ -232,6 +258,7 @@ http://localhost:4173
 面板支持：
 
 - 查看 XHS service 登录状态并打开容器内浏览器接管
+- 打开小红书/抖音 noVNC 登录页并同步 Cookie 到对应 worker
 - 管理你的笔记库：标题、链接、摘要、关键词、适合场景、启用/停用
 - 手动搜索帖子入队，不立即消耗 LLM 生成评论
 - 队列全选或单选后批量评论并发布

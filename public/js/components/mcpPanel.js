@@ -1,8 +1,8 @@
 import { dashboardApi } from "../api.js";
-import { $, setText } from "../dom.js";
+import { $, $$, escapeHtml, setText } from "../dom.js";
 import { errorMessage } from "../format.js";
 import { withButtonLoading } from "../loading.js";
-import { connectCdpViewer, reconnectCdpViewer } from "./cdpViewer.js";
+import { connectCdpViewer, openPlatformViewer, reconnectCdpViewer } from "./cdpViewer.js";
 import { appendClientLog } from "./logPanel.js";
 import { activateTab } from "./tabs.js";
 
@@ -18,27 +18,34 @@ export async function refreshMcp(button) {
       setText("mcpState", data.is_logged_in ? `已登录 · ${data.username || "小红书"}` : "未登录");
       el.classList.remove("is-checking");
       el.classList.add(data.is_logged_in ? "ok" : "warn");
+      await refreshPlatformLoginList();
       appendClientLog(`成功 · MCP 登录状态：${el.textContent}`);
     } catch (error) {
       setText("mcpState", "MCP 不可用");
       el.classList.remove("is-checking");
       el.classList.add("warn");
+      await refreshPlatformLoginList();
       appendClientLog(`失败 · MCP 登录状态：${errorMessage(error)}`);
     }
   });
 }
 
 export async function openCdpLogin(button) {
-  appendClientLog("开始 · 打开浏览器接管");
+  return openPlatformLogin("xhs", button);
+}
+
+export async function openPlatformLogin(platform, button) {
+  const label = platformLabel(platform);
+  appendClientLog(`开始 · 打开${label}登录`);
   return withButtonLoading(button, "打开中", async () => {
     try {
-      setText("mcpState", "浏览器接管已打开");
+      setText("mcpState", `${label}登录页已打开`);
       $("mcpState").className = "mcp-state is-checking";
-      appendClientLog("提示 · 请在浏览器接管 Tab 内扫码/验证；远程画面通过 noVNC 显示容器 Chrome");
+      appendClientLog(`提示 · 请在浏览器接管 Tab 内完成${label}扫码/验证；远程画面通过 noVNC 显示容器 Chrome`);
       activateTab("browser");
-      await connectCdpViewer();
+      await openPlatformViewer(platform);
     } catch (error) {
-      appendClientLog(`失败 · 浏览器接管：${errorMessage(error)}`);
+      appendClientLog(`失败 · 打开${label}登录：${errorMessage(error)}`);
     }
   });
 }
@@ -63,16 +70,62 @@ export async function restartMcpBrowser(button) {
 }
 
 export async function syncCdpCookies(button) {
-  appendClientLog("开始 · 同步容器浏览器登录态到 MCP");
+  return syncPlatformCookies("xhs", button);
+}
+
+export async function syncPlatformCookies(platform, button) {
+  const label = platformLabel(platform);
+  appendClientLog(`开始 · 同步${label}登录态`);
   return withButtonLoading(button, "同步中", async () => {
     try {
-      const result = await dashboardApi.syncBrowserViewerCookies();
-      setText("mcpState", "浏览器登录态已同步");
+      const result = await dashboardApi.syncPlatformCookies(platform);
+      setText("mcpState", `${label}登录态已同步`);
       $("mcpState").className = "mcp-state ok";
-      appendClientLog(`成功 · 已导出 ${result.exportedCookies} 个 cookies 到 ${result.cookiesPath}`);
-      appendClientLog("提示 · 如果 Kato 容器正在运行，刷新登录状态即可复查");
+      appendClientLog(`成功 · ${label}已导出 ${result.exportedCookies ?? 0} 个 cookies 到 ${result.cookiesPath || "持久化目录"}`);
+      await refreshPlatformLoginList();
     } catch (error) {
-      appendClientLog(`失败 · 同步浏览器登录态：${errorMessage(error)}`);
+      appendClientLog(`失败 · 同步${label}登录态：${errorMessage(error)}`);
     }
   });
+}
+
+export function bindPlatformLoginActions() {
+  $$("[data-open-platform-login]").forEach((button) => {
+    button.addEventListener("click", () => openPlatformLogin(button.dataset.openPlatformLogin, button));
+  });
+  $$("[data-sync-platform-cookies]").forEach((button) => {
+    button.addEventListener("click", () => syncPlatformCookies(button.dataset.syncPlatformCookies, button));
+  });
+}
+
+async function refreshPlatformLoginList() {
+  const list = $("platformLoginList");
+  if (!list) return;
+  try {
+    const result = await dashboardApi.getPlatformLoginStatuses();
+    const platforms = (result.platforms || []).filter((platform) => platform.capabilities?.login !== false && platform.platform !== "bilibili");
+    list.innerHTML = platforms.map(renderPlatformStatus).join("");
+  } catch (error) {
+    list.innerHTML = `<div class="platform-login-row warn"><span>平台登录态</span><strong>${escapeHtml(errorMessage(error))}</strong></div>`;
+  }
+}
+
+function renderPlatformStatus(platform) {
+  const label = platform.label || platformLabel(platform.platform);
+  const state = platform.error ? "warn" : platform.is_logged_in ? "ok" : "warn";
+  const text = platform.error ? "不可用" : platform.is_logged_in ? "已登录" : "未登录";
+  const detail = platform.username || (platform.cookie_count !== undefined ? `${platform.cookie_count} cookies` : "");
+  return `
+    <div class="platform-login-row ${state}">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(text)}</strong>
+      ${detail ? `<small>${escapeHtml(detail)}</small>` : ""}
+    </div>
+  `;
+}
+
+function platformLabel(platform) {
+  if (platform === "douyin") return "抖音";
+  if (platform === "bilibili") return "B站";
+  return "小红书";
 }
