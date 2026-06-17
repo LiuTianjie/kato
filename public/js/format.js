@@ -1,4 +1,4 @@
-import { POSTED_STATUSES } from "./state.js";
+const POSTED_STATUSES = new Set(["posted", "published", "liked", "commented", "done"]);
 
 export function interactionLabel(value) {
   if (POSTED_STATUSES.has(value)) return "已互动";
