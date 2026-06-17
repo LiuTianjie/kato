@@ -654,6 +654,45 @@ function browserFingerprintSource() {
       toJSON: () => ({ brands, mobile: false, platform: "Windows" })
     };
     defineGetter(Navigator.prototype, "userAgentData", userAgentData);
+
+    const rewritePlatformUrl = (rawUrl) => {
+      try {
+        const url = new URL(String(rawUrl), location.href);
+        if (!/(^|\\.)douyin\\.com$/i.test(url.hostname)) return rawUrl;
+        if (url.searchParams.has("browser_platform")) url.searchParams.set("browser_platform", "Win32");
+        if (url.searchParams.has("os_name")) url.searchParams.set("os_name", "Windows");
+        if (url.searchParams.has("pc_libra_divert")) url.searchParams.set("pc_libra_divert", "Windows");
+        return url.href;
+      } catch {
+        return rawUrl;
+      }
+    };
+
+    const originalFetch = window.fetch;
+    if (typeof originalFetch === "function") {
+      window.fetch = function patchedFetch(input, init) {
+        try {
+          if (typeof input === "string" || input instanceof URL) {
+            return originalFetch.call(this, rewritePlatformUrl(input), init);
+          }
+          if (input instanceof Request) {
+            const rewritten = rewritePlatformUrl(input.url);
+            if (rewritten !== input.url) return originalFetch.call(this, new Request(rewritten, input), init);
+          }
+        } catch {}
+        return originalFetch.call(this, input, init);
+      };
+    }
+
+    const originalXhrOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function patchedXhrOpen(method, url, ...rest) {
+      return originalXhrOpen.call(this, method, rewritePlatformUrl(url), ...rest);
+    };
+
+    const originalSendBeacon = navigator.sendBeacon?.bind(navigator);
+    if (originalSendBeacon) {
+      navigator.sendBeacon = (url, data) => originalSendBeacon(rewritePlatformUrl(url), data);
+    }
   })()`;
 }
 
