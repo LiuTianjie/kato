@@ -6,7 +6,7 @@
 
 ## 快速开始
 
-推荐直接用一个容器跑完整 Kato：dashboard、多平台 Browser Runtime、XHS/Douyin service 和可选 MCP 兼容层都在同一个镜像里。
+推荐直接用一个容器跑完整 Kato：dashboard、多平台 Browser Runtime、XHS/Douyin/Bilibili service 和可选 MCP 兼容层都在同一个镜像里。
 
 ```bash
 cp .env.example .env
@@ -26,6 +26,7 @@ Dashboard: http://localhost:4173
 XHS service REST: http://localhost:18060/api/v1/*
 XHS service MCP: http://localhost:18060/mcp
 Douyin service REST: http://localhost:18070/api/v1/*
+Bilibili service REST: http://localhost:18080/api/v1/*
 ```
 
 Chrome、CDP、VNC/noVNC 和平台 worker runtime 都只在容器内部监听。浏览器画面从 dashboard 的“浏览器接管”页进入，不需要也不应该暴露调试端口。
@@ -43,7 +44,7 @@ npm run dashboard
 
 ## 容器内 Browser Runtime 与平台 Service
 
-Kato 内置通用 Browser Runtime，负责启动容器内 Google Chrome、Xvfb、noVNC、内部 CDP、健康检查和重启恢复。小红书、抖音等平台 service 只负责平台数据解析、登录态同步、搜索、详情、评论和分页。它们和 dashboard 在同一个镜像、同一个容器里：
+Kato 内置通用 Browser Runtime，负责启动容器内 Google Chrome、Xvfb、noVNC、内部 CDP、健康检查和重启恢复。小红书、抖音、B站等平台 service 只负责平台数据解析、登录态同步、搜索、详情、评论和分页。它们和 dashboard 在同一个镜像、同一个容器里：
 
 ```bash
 docker compose up -d --build
@@ -66,6 +67,7 @@ http://localhost:18060/mcp
 ```text
 http://localhost:18060/api/v1/*
 http://localhost:18070/api/v1/*
+http://localhost:18080/api/v1/*
 ```
 
 本地 Node 开发时创建配置：
@@ -104,7 +106,7 @@ npm test
 
 ## noVNC 浏览器接管与登录态同步
 
-如果小红书或抖音需要扫码登录、二次验证或人工确认，可以在 dashboard 里打开对应平台的 noVNC 画面。noVNC 是远程桌面画面，不向网页暴露公网 CDP：
+如果小红书、抖音或 B站需要扫码登录、二次验证或人工确认，可以在 dashboard 里打开对应平台的 noVNC 画面。noVNC 是远程桌面画面，不向网页暴露公网 CDP：
 
 ```bash
 docker compose up -d --build
@@ -113,7 +115,7 @@ docker compose up -d --build
 推荐流程：
 
 1. 打开 dashboard 的“浏览器接管”页。
-2. 选择“小红书登录”或“抖音登录”，Kato 会打开该平台的 viewer runtime。
+2. 选择“小红书登录”“抖音登录”或“B站登录”，Kato 会打开该平台的 viewer runtime。
 3. 在 noVNC 画面里扫码或完成验证。
 4. 登录成功后，点击对应平台的“同步 Cookie”。
 
@@ -130,6 +132,12 @@ mcp/xiaohongshu/data/cookies.json
 
 ```text
 /app/data/platforms/douyin/cookies.json
+```
+
+B站登录态会保存到：
+
+```text
+/app/data/platforms/bilibili/cookies.json
 ```
 
 容器内 Chrome 默认通过 Xvfb 以有头模式运行，减少 headless 浏览器特征。只有显式设置 `XHS_CHROMIUM_HEADLESS=1` 时才会退回 headless。
@@ -176,11 +184,11 @@ curl -X POST http://localhost:4173/api/v1/xhs/posts/search \
   -d '{"keywords":["AI工具"],"limit":10}'
 ```
 
-接口覆盖登录状态、帖子搜索、详情、我的笔记同步、评论草稿、评论发布和点赞。发布/点赞必须传 `confirm:true` 和 `idempotencyKey`，重复 key 不会重复调用 XHS service。完整契约见 [docs/public-xhs-api.md](docs/public-xhs-api.md)。
+接口覆盖登录状态、帖子搜索、详情、我的笔记同步、评论草稿、评论发布和点赞。发布/点赞必须传 `confirm:true` 和 `idempotencyKey`，重复 key 不会重复调用 XHS service。完整契约见 [docs/public-xhs-api.md](docs/public-xhs-api.md)；ServerX 舆情采集的抖音/B站兼容接口见 [docs/serverx-collection-api.md](docs/serverx-collection-api.md)。
 
 ## AMD64 镜像与 Browser Runtime
 
-Kato 镜像只发布 `linux/amd64`。仓库内置一个可复用的 `browser-runtime` 镜像 target，负责 `google-chrome-stable`、Xvfb、x11vnc、noVNC、websockify、xdotool、内部 CDP、健康检查、lease 和重启恢复。最终 `kato` 镜像基于这个 runtime 构建，小红书和抖音是第一批平台 adapter。后续接 B 站时按 [docs/platform-adapters.md](docs/platform-adapters.md) 的分层接入。
+Kato 镜像只发布 `linux/amd64`。仓库内置一个可复用的 `browser-runtime` 镜像 target，负责 `google-chrome-stable`、Xvfb、x11vnc、noVNC、websockify、xdotool、内部 CDP、健康检查、lease 和重启恢复。最终 `kato` 镜像基于这个 runtime 构建，小红书、抖音和 B站是第一批平台 adapter。
 
 默认 runtime slot：
 
@@ -190,8 +198,10 @@ Kato 镜像只发布 `linux/amd64`。仓库内置一个可复用的 `browser-run
 | `xhs-worker` | 小红书接口任务 | `18101` | `9225` | 关闭 |
 | `douyin-viewer` | 抖音人工登录/观察 | `18110` | `9234` | `6090` |
 | `douyin-worker` | 抖音接口任务 | `18111` | `9235` | 关闭 |
+| `bilibili-viewer` | B站人工登录/观察 | `18120` | `9244` | `6100` |
+| `bilibili-worker` | B站接口任务 | `18121` | `9245` | 关闭 |
 
-B 站 viewer/worker slot 已预留配置，但默认不启动业务 service。所有 runtime、CDP、VNC/noVNC 端口都只在容器内部使用；Luma 和生产环境只暴露 dashboard `4173`。平台 service 执行浏览器任务前会获取本平台 worker lease，任务结束、取消或超时后释放，避免多个任务互相重启或导航同一个 Chrome。
+所有 runtime、CDP、VNC/noVNC 端口都只在容器内部使用；Luma 和生产环境只暴露 dashboard `4173`。平台 service 执行浏览器任务前会获取本平台 worker lease，任务结束、取消或超时后释放，避免多个任务互相重启或导航同一个 Chrome。
 
 单独构建基础 runtime：
 
@@ -239,7 +249,7 @@ XHS_API_TOKEN_VALUE=your-token ./scripts/deploy-luma.sh
 DRY_RUN=1 ./scripts/deploy-luma.sh
 ```
 
-部署配置见 [deploy/kato.luma.yml](deploy/kato.luma.yml)。它只对外暴露 dashboard 的 `4173` 端口；XHS service、Douyin service、Browser Runtime、CDP、VNC/noVNC 都保持容器内部能力，不直接暴露到公网。当前 manifest 给多 runtime 场景预留了较高内存，默认 limit 为 8G、reservation 为 6G。
+部署配置见 [deploy/kato.luma.yml](deploy/kato.luma.yml)。它只对外暴露 dashboard 的 `4173` 端口；XHS service、Douyin service、Bilibili service、Browser Runtime、CDP、VNC/noVNC 都保持容器内部能力，不直接暴露到公网。当前 manifest 给多 runtime 场景预留了较高内存，默认 limit 为 8G、reservation 为 6G。
 
 ## 操作面板
 
@@ -258,7 +268,7 @@ http://localhost:4173
 面板支持：
 
 - 查看 XHS service 登录状态并打开容器内浏览器接管
-- 打开小红书/抖音 noVNC 登录页并同步 Cookie 到对应 worker
+- 打开小红书/抖音/B站 noVNC 登录页并同步 Cookie 到对应 worker
 - 管理你的笔记库：标题、链接、摘要、关键词、适合场景、启用/停用
 - 手动搜索帖子入队，不立即消耗 LLM 生成评论
 - 队列全选或单选后批量评论并发布

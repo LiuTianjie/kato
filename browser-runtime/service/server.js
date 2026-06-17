@@ -45,6 +45,7 @@ let vncSupervisor;
 let noVncSupervisor;
 let chromeProcess;
 let restartPromise;
+let ensureBrowserPromise;
 let activeLease;
 
 const server = createServer(async (req, res) => {
@@ -125,6 +126,17 @@ const server = createServer(async (req, res) => {
       const cookies = await exportCookies(domains);
       serviceLog("info", "cookies", `Exported ${cookies.length} browser cookies.`, { domains });
       sendJson(res, 200, { success: true, data: { exportedCookies: cookies.length, cookies } });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/browser/storage/export") {
+      await ensureRuntimeReady();
+      const body = await readJson(req);
+      const domains = Array.isArray(body.domains) ? body.domains.map((item) => String(item)).filter(Boolean) : [];
+      const origins = Array.isArray(body.origins) ? body.origins.map((item) => String(item)).filter(Boolean) : [];
+      const storage = await exportBrowserStorage({ domains, origins });
+      serviceLog("info", "storage", `Exported ${storage.length} browser storage origins.`, { domains, origins });
+      sendJson(res, 200, { success: true, data: { exportedOrigins: storage.length, storage } });
       return;
     }
 
@@ -236,11 +248,13 @@ async function ensureRuntimeReady() {
 
 async function runtimeStatus() {
   const cdp = await isHttpReady(`http://127.0.0.1:${CDP_PORT}/json/version`, 600);
+  const managedChromeRunning = Boolean(chromeProcess && chromeProcess.exitCode === null && chromeProcess.signalCode === null);
   return {
     name: RUNTIME_NAME,
     display: { value: DISPLAY, running: Boolean(xvfbProcess && xvfbProcess.exitCode === null && xvfbProcess.signalCode === null) },
     chrome: {
-      running: Boolean(chromeProcess && chromeProcess.exitCode === null && chromeProcess.signalCode === null),
+      running: managedChromeRunning || cdp.ok,
+      managed: managedChromeRunning,
       pid: chromeProcess?.pid,
       profileDir: PROFILE_DIR,
       bin: BROWSER_BIN
@@ -323,15 +337,28 @@ function leaseSummary() {
 }
 
 async function ensureBrowser() {
-  const running = chromeProcess && chromeProcess.exitCode === null && chromeProcess.signalCode === null;
-  const cdpReady = (await isHttpReady(`http://127.0.0.1:${CDP_PORT}/json/version`, 600)).ok;
-  if (running && cdpReady) return;
-  if (running && !cdpReady) {
-    terminateProcess(chromeProcess, "CDP not ready");
-    await waitForProcessExit(chromeProcess, PROCESS_EXIT_GRACE_MS + 500).catch(() => undefined);
-    chromeProcess = undefined;
-  }
-  await launchChrome();
+  if (ensureBrowserPromise) return ensureBrowserPromise;
+  ensureBrowserPromise = (async () => {
+    const running = chromeProcess && chromeProcess.exitCode === null && chromeProcess.signalCode === null;
+    const cdpReady = (await isHttpReady(`http://127.0.0.1:${CDP_PORT}/json/version`, 600)).ok;
+    if (running && cdpReady) return;
+    if (!running && cdpReady) {
+      serviceLog("warn", "chrome", "CDP is already ready but runtime has no Chrome process handle; reusing existing browser.", {
+        cdp: `${CDP_HOST}:${CDP_PORT}`,
+        profileDir: PROFILE_DIR
+      });
+      return;
+    }
+    if (running && !cdpReady) {
+      terminateProcess(chromeProcess, "CDP not ready");
+      await waitForProcessExit(chromeProcess, PROCESS_EXIT_GRACE_MS + 500).catch(() => undefined);
+      chromeProcess = undefined;
+    }
+    await launchChrome();
+  })().finally(() => {
+    ensureBrowserPromise = undefined;
+  });
+  return ensureBrowserPromise;
 }
 
 async function launchChrome() {
@@ -497,6 +524,47 @@ async function fetchCookiesFromCdp() {
   if (!page?.webSocketDebuggerUrl) return [];
   const network = await sendCdpCommand(page.webSocketDebuggerUrl, "Network.getAllCookies", {});
   return Array.isArray(network.cookies) ? network.cookies : [];
+}
+
+async function exportBrowserStorage({ domains = [], origins = [] } = {}) {
+  const filters = domains.map((item) => item.toLowerCase());
+  const originFilters = origins.map((item) => item.toLowerCase());
+  const targets = await fetchJson(`http://127.0.0.1:${CDP_PORT}/json/list`);
+  const pages = Array.isArray(targets) ? targets.filter((item) => item?.type === "page" && item.webSocketDebuggerUrl) : [];
+  const byOrigin = new Map();
+  for (const page of pages) {
+    const pageUrl = String(page.url || "");
+    if (!/^https?:\/\//i.test(pageUrl)) continue;
+    const origin = new URL(pageUrl).origin;
+    const host = new URL(pageUrl).hostname.toLowerCase();
+    const matched =
+      (!filters.length && !originFilters.length) ||
+      filters.some((filter) => host === filter.replace(/^\./, "") || host.endsWith(filter.replace(/^\./, ""))) ||
+      originFilters.some((filter) => origin.toLowerCase() === filter);
+    if (!matched || byOrigin.has(origin)) continue;
+    try {
+      await sendCdpCommand(page.webSocketDebuggerUrl, "Runtime.enable", {}).catch(() => undefined);
+      const result = await sendCdpCommand(page.webSocketDebuggerUrl, "Runtime.evaluate", {
+        returnByValue: true,
+        expression: `(() => {
+          const copy = (storage) => {
+            const out = {};
+            for (let i = 0; i < storage.length; i += 1) {
+              const key = storage.key(i);
+              out[key] = storage.getItem(key);
+            }
+            return out;
+          };
+          return { origin: location.origin, url: location.href, localStorage: copy(localStorage), sessionStorage: copy(sessionStorage) };
+        })()`
+      });
+      const value = result?.result?.value;
+      if (value?.origin) byOrigin.set(value.origin, value);
+    } catch (error) {
+      serviceLog("warn", "storage", `Storage export failed for ${pageUrl}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return [...byOrigin.values()];
 }
 
 function sendCdpCommand(webSocketUrl, method, params = {}) {

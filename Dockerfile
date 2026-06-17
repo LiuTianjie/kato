@@ -84,20 +84,27 @@ FROM browser-runtime AS kato
 ENV PORT=4173 \
     XHS_SERVICE_PORT=18060 \
     DOUYIN_SERVICE_PORT=18070 \
+    BILIBILI_SERVICE_PORT=18080 \
     XHS_VIEWER_RUNTIME_URL=http://127.0.0.1:18100 \
     XHS_BROWSER_RUNTIME_URL=http://127.0.0.1:18101 \
     DOUYIN_VIEWER_RUNTIME_URL=http://127.0.0.1:18110 \
     DOUYIN_BROWSER_RUNTIME_URL=http://127.0.0.1:18111 \
+    BILIBILI_VIEWER_RUNTIME_URL=http://127.0.0.1:18120 \
+    BILIBILI_BROWSER_RUNTIME_URL=http://127.0.0.1:18121 \
+    BILIBILI_SERVICE_URL=http://127.0.0.1:18080 \
     BROWSER_VIEWER_RUNTIME_URL=http://127.0.0.1:18100 \
     BROWSER_WORKER_RUNTIME_URL=http://127.0.0.1:18101 \
     BROWSER_RUNTIME_URL=http://127.0.0.1:18101 \
     BROWSER_RUNTIME_PORT=18101 \
     XHS_INTERNAL_CDP_PORT=9225 \
     DOUYIN_INTERNAL_CDP_PORT=9235 \
+    BILIBILI_INTERNAL_CDP_PORT=9245 \
     XHS_PROFILE_DIR=/app/data/platforms/xhs/worker-profile \
     DOUYIN_PROFILE_DIR=/app/data/platforms/douyin/worker-profile \
+    BILIBILI_PROFILE_DIR=/app/data/platforms/bilibili/worker-profile \
     COOKIES_PATH=/app/mcp/xiaohongshu/data/cookies.json \
-    DOUYIN_COOKIES_PATH=/app/data/platforms/douyin/cookies.json
+    DOUYIN_COOKIES_PATH=/app/data/platforms/douyin/cookies.json \
+    BILIBILI_COOKIES_PATH=/app/data/platforms/bilibili/cookies.json
 
 WORKDIR /app
 
@@ -108,15 +115,16 @@ COPY public ./public
 COPY xhs.config.example.json ./
 COPY mcp/xiaohongshu/service ./mcp/xiaohongshu/service
 COPY mcp/douyin/service ./mcp/douyin/service
+COPY mcp/bilibili/service ./mcp/bilibili/service
 COPY scripts/start-kato.sh ./scripts/start-kato.sh
 
 RUN chmod +x ./scripts/start-kato.sh \
   && mkdir -p /app/data /app/output /app/data/platforms/xhs /app/data/platforms/douyin /app/data/platforms/bilibili /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images \
   && chown -R kato:kato /home/kato /app/data /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images
 
-EXPOSE 4173 18060 18070
+EXPOSE 4173 18060 18070 18080
 
 HEALTHCHECK --interval=30s --timeout=25s --start-period=60s --retries=3 \
-  CMD node -e "const e=process.env; const urls=['http://127.0.0.1:'+(e.PORT||4173)+'/api/dashboard','http://127.0.0.1:'+(e.XHS_SERVICE_PORT||18060)+'/health?ensure=1','http://127.0.0.1:'+(e.DOUYIN_SERVICE_PORT||18070)+'/health?ensure=1','http://127.0.0.1:'+(e.XHS_VIEWER_RUNTIME_PORT||18100)+'/health?ensure=1','http://127.0.0.1:'+(e.XHS_WORKER_RUNTIME_PORT||e.BROWSER_RUNTIME_PORT||18101)+'/health?ensure=1','http://127.0.0.1:'+(e.DOUYIN_VIEWER_RUNTIME_PORT||18110)+'/health?ensure=1','http://127.0.0.1:'+(e.DOUYIN_WORKER_RUNTIME_PORT||18111)+'/health?ensure=1']; Promise.all(urls.map((url)=>fetch(url,{signal:AbortSignal.timeout(20000)}).then((r)=>{if(!r.ok) throw new Error(url+' '+r.status)}))).then(()=>process.exit(0)).catch((e)=>{console.error(e.message);process.exit(1)})"
+  CMD node -e "const e=process.env; const urls=['http://127.0.0.1:'+(e.PORT||4173)+'/api/dashboard','http://127.0.0.1:'+(e.XHS_SERVICE_PORT||18060)+'/health?ensure=1','http://127.0.0.1:'+(e.DOUYIN_SERVICE_PORT||18070)+'/health?ensure=1','http://127.0.0.1:'+(e.BILIBILI_SERVICE_PORT||18080)+'/health','http://127.0.0.1:'+(e.XHS_VIEWER_RUNTIME_PORT||18100)+'/health?ensure=1','http://127.0.0.1:'+(e.XHS_WORKER_RUNTIME_PORT||e.BROWSER_RUNTIME_PORT||18101)+'/health?ensure=1','http://127.0.0.1:'+(e.DOUYIN_VIEWER_RUNTIME_PORT||18110)+'/health?ensure=1','http://127.0.0.1:'+(e.DOUYIN_WORKER_RUNTIME_PORT||18111)+'/health?ensure=1','http://127.0.0.1:'+(e.BILIBILI_VIEWER_RUNTIME_PORT||18120)+'/health?ensure=1','http://127.0.0.1:'+(e.BILIBILI_WORKER_RUNTIME_PORT||18121)+'/health?ensure=1']; Promise.all(urls.map((url)=>fetch(url,{signal:AbortSignal.timeout(20000)}).then((r)=>{if(!r.ok) throw new Error(url+' '+r.status)}))).then(()=>process.exit(0)).catch((e)=>{console.error(e.message);process.exit(1)})"
 
 CMD ["./scripts/start-kato.sh"]

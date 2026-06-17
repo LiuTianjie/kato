@@ -46,6 +46,7 @@ export COOKIES_PATH="${COOKIES_PATH:-/app/mcp/xiaohongshu/data/cookies.json}"
 export DOUYIN_COOKIES_PATH="${DOUYIN_COOKIES_PATH:-/app/data/platforms/douyin/cookies.json}"
 export BILIBILI_COOKIES_PATH="${BILIBILI_COOKIES_PATH:-/app/data/platforms/bilibili/cookies.json}"
 export DOUYIN_SERVICE_URL="${DOUYIN_SERVICE_URL:-http://127.0.0.1:${DOUYIN_SERVICE_PORT:-18070}}"
+export BILIBILI_SERVICE_URL="${BILIBILI_SERVICE_URL:-http://127.0.0.1:${BILIBILI_SERVICE_PORT:-18080}}"
 
 mkdir -p \
   /app/data /app/output \
@@ -108,14 +109,12 @@ start_runtime xhs viewer "$XHS_VIEWER_RUNTIME_PORT" "${XHS_VIEWER_DISPLAY:-:99}"
 start_runtime xhs worker "$XHS_WORKER_RUNTIME_PORT" "${XHS_WORKER_DISPLAY:-:100}" "$XHS_INTERNAL_CDP_PORT" 0 "${XHS_WORKER_VNC_PORT:-5901}" "${XHS_WORKER_NOVNC_PORT:-6081}" "$XHS_PROFILE_DIR" "$COOKIES_PATH" ""
 start_runtime douyin viewer "$DOUYIN_VIEWER_RUNTIME_PORT" "${DOUYIN_VIEWER_DISPLAY:-:101}" "${DOUYIN_VIEWER_CDP_PORT:-9234}" 1 "${DOUYIN_VIEWER_VNC_PORT:-5910}" "${DOUYIN_VIEWER_NOVNC_PORT:-6090}" "${DOUYIN_VIEWER_PROFILE_DIR:-/app/data/browser-runtimes/douyin-viewer/profile}" "${DOUYIN_VIEWER_COOKIES_PATH:-/app/data/browser-runtimes/douyin-viewer/cookies.json}" ""
 start_runtime douyin worker "$DOUYIN_WORKER_RUNTIME_PORT" "${DOUYIN_WORKER_DISPLAY:-:102}" "$DOUYIN_INTERNAL_CDP_PORT" 0 "${DOUYIN_WORKER_VNC_PORT:-5911}" "${DOUYIN_WORKER_NOVNC_PORT:-6091}" "$DOUYIN_PROFILE_DIR" "$DOUYIN_COOKIES_PATH" ""
-
-if [ "${BILIBILI_BROWSER_RUNTIME_ENABLED:-0}" = "1" ]; then
-  start_runtime bilibili viewer "$BILIBILI_VIEWER_RUNTIME_PORT" "${BILIBILI_VIEWER_DISPLAY:-:103}" "${BILIBILI_VIEWER_CDP_PORT:-9244}" 1 "${BILIBILI_VIEWER_VNC_PORT:-5920}" "${BILIBILI_VIEWER_NOVNC_PORT:-6100}" "${BILIBILI_VIEWER_PROFILE_DIR:-/app/data/browser-runtimes/bilibili-viewer/profile}" "${BILIBILI_VIEWER_COOKIES_PATH:-/app/data/browser-runtimes/bilibili-viewer/cookies.json}" ""
-  start_runtime bilibili worker "$BILIBILI_WORKER_RUNTIME_PORT" "${BILIBILI_WORKER_DISPLAY:-:104}" "$BILIBILI_INTERNAL_CDP_PORT" 0 "${BILIBILI_WORKER_VNC_PORT:-5921}" "${BILIBILI_WORKER_NOVNC_PORT:-6101}" "$BILIBILI_PROFILE_DIR" "$BILIBILI_COOKIES_PATH" ""
-fi
+start_runtime bilibili viewer "$BILIBILI_VIEWER_RUNTIME_PORT" "${BILIBILI_VIEWER_DISPLAY:-:103}" "${BILIBILI_VIEWER_CDP_PORT:-9244}" 1 "${BILIBILI_VIEWER_VNC_PORT:-5920}" "${BILIBILI_VIEWER_NOVNC_PORT:-6100}" "${BILIBILI_VIEWER_PROFILE_DIR:-/app/data/browser-runtimes/bilibili-viewer/profile}" "${BILIBILI_VIEWER_COOKIES_PATH:-/app/data/browser-runtimes/bilibili-viewer/cookies.json}" ""
+start_runtime bilibili worker "$BILIBILI_WORKER_RUNTIME_PORT" "${BILIBILI_WORKER_DISPLAY:-:104}" "$BILIBILI_INTERNAL_CDP_PORT" 0 "${BILIBILI_WORKER_VNC_PORT:-5921}" "${BILIBILI_WORKER_NOVNC_PORT:-6101}" "$BILIBILI_PROFILE_DIR" "$BILIBILI_COOKIES_PATH" ""
 
 start_process xhs-service env PORT="${XHS_SERVICE_PORT:-18060}" node mcp/xiaohongshu/service/server.js
 start_process douyin-service env PORT="${DOUYIN_SERVICE_PORT:-18070}" node mcp/douyin/service/server.js
+start_process bilibili-service env PORT="${BILIBILI_SERVICE_PORT:-18080}" node mcp/bilibili/service/server.js
 start_process dashboard env PORT="${PORT:-4173}" node dist/dashboard/server.js
 
 set +e

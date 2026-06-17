@@ -32,6 +32,7 @@
           </div>
           <button class="secondary full" id="openCdpLogin">打开小红书登录</button>
           <button class="secondary full" data-open-platform-login="douyin" type="button">打开抖音登录</button>
+          <button class="secondary full" data-open-platform-login="bilibili" type="button">打开 B站登录</button>
           <button class="danger ghost full" id="restartMcpBrowser">重启浏览器</button>
         </section>
 
@@ -160,10 +161,35 @@
               <div class="platform-shortcuts" aria-label="平台登录快捷入口">
                 <button class="secondary small" data-open-platform-login="xhs" type="button">小红书登录</button>
                 <button class="secondary small" data-open-platform-login="douyin" type="button">抖音登录</button>
+                <button class="secondary small" data-open-platform-login="bilibili" type="button">B站登录</button>
               </div>
               <div class="platform-shortcuts" aria-label="同步平台 Cookie">
                 <button class="secondary small" data-sync-platform-cookies="xhs" type="button">同步小红书 Cookie</button>
                 <button class="secondary small" data-sync-platform-cookies="douyin" type="button">同步抖音 Cookie</button>
+                <button class="secondary small" data-sync-platform-cookies="bilibili" type="button">同步 B站 Cookie</button>
+              </div>
+            </div>
+            <div class="browser-challenge-flow" aria-label="平台验证处理流程">
+              <div class="challenge-flow-head">
+                <strong>验证处理</strong>
+                <span id="challengeFlowStatus">遇到验证码时，从这里打开平台画面，通过后同步状态。</span>
+              </div>
+              <div class="challenge-flow-grid">
+                <div class="challenge-flow-row">
+                  <span>小红书</span>
+                  <button class="secondary small" data-open-platform-challenge="xhs" type="button">打开验证页</button>
+                  <button class="secondary small" data-sync-platform-cookies="xhs" type="button">同步状态</button>
+                </div>
+                <div class="challenge-flow-row">
+                  <span>抖音</span>
+                  <button class="secondary small" data-open-platform-challenge="douyin" type="button">打开验证页</button>
+                  <button class="secondary small" data-sync-platform-cookies="douyin" type="button">同步状态</button>
+                </div>
+                <div class="challenge-flow-row">
+                  <span>B站</span>
+                  <button class="secondary small" data-open-platform-challenge="bilibili" type="button">打开验证页</button>
+                  <button class="secondary small" data-sync-platform-cookies="bilibili" type="button">同步状态</button>
+                </div>
               </div>
             </div>
             <div class="cdp-screen-wrap" id="cdpScreenWrap" tabindex="0">

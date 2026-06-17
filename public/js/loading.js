@@ -4,7 +4,9 @@ export function setButtonLoading(button, loading, label = "处理中") {
     button.dataset.idleText = button.textContent;
     button.disabled = true;
     button.classList.add("is-loading");
-    button.innerHTML = button.classList.contains("icon-button")
+    button.innerHTML = button.classList.contains("small")
+      ? `<span>${label}</span>`
+      : button.classList.contains("icon-button")
       ? `<span class="spinner small-spinner"></span>`
       : `<span class="spinner small-spinner"></span><span>${label}</span>`;
     return;

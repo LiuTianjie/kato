@@ -533,6 +533,29 @@ test("TikHub-compatible XHS API accepts official pagination parameters", async (
   }
 });
 
+test("TikHub-compatible XHS API supports image and video detail endpoints", async () => {
+  const fixture = createFixture();
+  const originalToken = process.env.XHS_API_TOKEN;
+  process.env.XHS_API_TOKEN = "secret-token";
+  try {
+    for (const endpoint of ["get_image_note_detail", "get_video_note_detail"]) {
+      const detail = await callApi(fixture.config, fixture.db, {
+        method: "GET",
+        pathname: `/api/v1/xiaohongshu/app_v2/${endpoint}?note_id=post-1&xsec_token=token-1`,
+        token: "secret-token"
+      });
+      assert.equal(detail.status, 200);
+      assert.equal(detail.payload.success, true);
+      assert.equal(detail.payload.data.note_id, "post-1");
+      assert.equal(detail.payload.data.xsec_token, "token-1");
+      assert.equal(new URL(detail.payload.data.url).searchParams.get("xsec_token"), "token-1");
+    }
+  } finally {
+    restoreEnv("XHS_API_TOKEN", originalToken);
+    cleanupFixture(fixture);
+  }
+});
+
 async function postJson(config: AppConfig, db: Db, pathname: string, body: unknown, token: string): Promise<{ status: number; payload: any }> {
   return callApi(config, db, {
     method: "POST",

@@ -45,6 +45,7 @@ import {
 } from "./queries.js";
 import { handlePublicXhsApi, isPublicXhsApiPath } from "./publicXhsApi.js";
 import { handlePublicDouyinApi, isPublicDouyinApiPath } from "./publicDouyinApi.js";
+import { handlePublicBilibiliApi, isPublicBilibiliApiPath } from "./publicBilibiliApi.js";
 import { getPlatformSpec, listPlatformSpecs, normalizePlatformViewerUrl, requirePlatformSpec } from "../platforms/registry.js";
 import type { PlatformId } from "../platforms/types.js";
 
@@ -62,6 +63,7 @@ const defaultBrowserRuntimeUrl =
   process.env.XHS_BROWSER_RUNTIME_URL ||
   `http://127.0.0.1:${process.env.BROWSER_RUNTIME_PORT || process.env.XHS_BROWSER_RUNTIME_PORT || 18100}`;
 const douyinServiceUrl = process.env.DOUYIN_SERVICE_URL || `http://127.0.0.1:${process.env.DOUYIN_SERVICE_PORT || 18070}`;
+const bilibiliServiceUrl = process.env.BILIBILI_SERVICE_URL || `http://127.0.0.1:${process.env.BILIBILI_SERVICE_PORT || 18080}`;
 const defaultNoVncHost = process.env.BROWSER_NOVNC_HOST || process.env.XHS_NOVNC_HOST || "127.0.0.1";
 const legacyCdpLoginEnabled =
   process.env.KATO_ENABLE_LEGACY_CDP_LOGIN === "1" || process.env.XHS_LEGACY_CDP_LOGIN_ENABLED === "1";
@@ -93,7 +95,12 @@ const server = createServer(async (req, res) => {
       proxyNoVncHttp(req, res, url);
       return;
     }
-    if (url.pathname.startsWith("/api/") || isPublicXhsApiPath(url.pathname) || isPublicDouyinApiPath(url.pathname)) {
+    if (
+      url.pathname.startsWith("/api/") ||
+      isPublicXhsApiPath(url.pathname) ||
+      isPublicDouyinApiPath(url.pathname) ||
+      isPublicBilibiliApiPath(url.pathname)
+    ) {
       await handleApi(req, res, url);
       return;
     }
@@ -124,6 +131,7 @@ process.on("SIGINT", () => {
 async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   if (await handlePublicXhsApi(req, res, url, { config, db })) return;
   if (await handlePublicDouyinApi(req, res, url)) return;
+  if (await handlePublicBilibiliApi(req, res, url)) return;
 
   if (req.method === "GET" && url.pathname === "/api/dashboard") {
     sendJson(res, 200, {
@@ -155,6 +163,31 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     const body = await readJson(req);
     const platform = requirePlatformSpec(body.platform);
     sendJson(res, 200, await syncPlatformCookies(platform.id));
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/hybrid/update_cookie") {
+    if (!hasSharedApiToken(req)) {
+      sendJson(res, 401, { code: 40101, message: "Missing or invalid API token.", data: null });
+      return;
+    }
+    try {
+      const body = await readJson(req);
+      const service = String(body.service || body.platform || "").trim().toLowerCase();
+      if (service === "douyin" || service === "dy" || service === "抖音") {
+        await postDouyinJson("/api/v1/browser/update-cookie", body, 35_000);
+        sendJson(res, 200, { code: 200, message: "success", data: { message: "Cookie for douyin updated successfully" } });
+        return;
+      }
+      if (service === "bilibili" || service === "bili" || service === "b站") {
+        await postBilibiliJson("/api/v1/browser/update-cookie", body, 35_000);
+        sendJson(res, 200, { code: 200, message: "success", data: { message: "Cookie for bilibili updated successfully" } });
+        return;
+      }
+      sendJson(res, 400, { code: 40001, message: "invalid service", data: null });
+    } catch (error) {
+      sendJson(res, 500, { code: 50001, message: error instanceof Error ? error.message : String(error), data: null });
+    }
     return;
   }
 
@@ -667,6 +700,15 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
   res.end(JSON.stringify(payload));
 }
 
+function hasSharedApiToken(req: IncomingMessage): boolean {
+  const expectedToken = process.env.XHS_API_TOKEN?.trim() || "LiuTao0.1";
+  const authorization = req.headers.authorization ?? "";
+  const bearerToken = typeof authorization === "string" && authorization.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "";
+  const apiKey = req.headers["x-api-key"];
+  const apiKeyToken = Array.isArray(apiKey) ? String(apiKey[0] ?? "").trim() : String(apiKey ?? "").trim();
+  return (bearerToken || apiKeyToken) === expectedToken;
+}
+
 function optionalNumber(value: string | number | boolean | null | undefined): number | undefined {
   if (!value) return undefined;
   const numberValue = Number(value);
@@ -753,6 +795,30 @@ async function postDouyinJson(endpoint: string, body: Record<string, unknown>, t
   return data;
 }
 
+async function fetchBilibiliJson(endpoint: string, timeoutMs = 20_000): Promise<unknown> {
+  const response = await fetchWithTimeout(`${bilibiliServiceUrl.replace(/\/$/, "")}${endpoint}`, {}, timeoutMs);
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!response.ok || isMcpFailure(data)) {
+    throw new Error(mcpErrorMessage(data, `Bilibili ${endpoint} failed: HTTP ${response.status}`));
+  }
+  return data;
+}
+
+async function postBilibiliJson(endpoint: string, body: Record<string, unknown>, timeoutMs = 35_000): Promise<unknown> {
+  const response = await fetchWithTimeout(`${bilibiliServiceUrl.replace(/\/$/, "")}${endpoint}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  }, timeoutMs);
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!response.ok || isMcpFailure(data)) {
+    throw new Error(mcpErrorMessage(data, `Bilibili ${endpoint} failed: HTTP ${response.status}`));
+  }
+  return data;
+}
+
 async function fetchRuntimeJson(baseUrl: string, endpoint: string, timeoutMs = 20_000): Promise<unknown> {
   const response = await fetchWithTimeout(`${baseUrl.replace(/\/$/, "")}${endpoint}`, {}, timeoutMs);
   const text = await response.text();
@@ -808,7 +874,12 @@ async function getPlatformLoginStatus(platform: PlatformId): Promise<Record<stri
     return { platform: spec.id, label: spec.label, implemented: false, is_logged_in: false, error: "未接入登录能力" };
   }
   try {
-    const payload = platform === "douyin" ? await fetchDouyinJson("/api/v1/login/status", 35_000) : await fetchMcpJson("/api/v1/login/status", 35_000);
+    const payload =
+      platform === "douyin"
+        ? await fetchDouyinJson("/api/v1/login/status", 35_000)
+        : platform === "bilibili"
+          ? await fetchBilibiliJson("/api/v1/login/status", 35_000)
+          : await fetchMcpJson("/api/v1/login/status", 35_000);
     const data = unwrapMcpData(payload) as Record<string, unknown>;
     return { platform: spec.id, label: spec.label, implemented: true, ...data };
   } catch (error) {
@@ -830,7 +901,9 @@ async function syncPlatformCookies(platform: PlatformId): Promise<Record<string,
   const payload =
     platform === "douyin"
       ? await postDouyinJson("/api/v1/browser/sync-cookies", {}, 35_000)
-      : await postMcpJson("/api/v1/browser/sync-cookies", {}, 35_000);
+      : platform === "bilibili"
+        ? await postBilibiliJson("/api/v1/browser/sync-cookies", {}, 35_000)
+        : await postMcpJson("/api/v1/browser/sync-cookies", {}, 35_000);
   const data = unwrapMcpData(payload) as Record<string, unknown>;
   return { platform: spec.id, label: spec.label, synced: true, ...data };
 }

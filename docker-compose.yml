@@ -17,23 +17,30 @@ services:
       - PORT=4173
       - XHS_SERVICE_PORT=18060
       - DOUYIN_SERVICE_PORT=18070
+      - BILIBILI_SERVICE_PORT=18080
       - XHS_VIEWER_RUNTIME_URL=http://127.0.0.1:18100
       - XHS_BROWSER_RUNTIME_URL=http://127.0.0.1:18101
       - DOUYIN_VIEWER_RUNTIME_URL=http://127.0.0.1:18110
       - DOUYIN_BROWSER_RUNTIME_URL=http://127.0.0.1:18111
+      - BILIBILI_VIEWER_RUNTIME_URL=http://127.0.0.1:18120
+      - BILIBILI_BROWSER_RUNTIME_URL=http://127.0.0.1:18121
       - BROWSER_VIEWER_RUNTIME_URL=http://127.0.0.1:18100
       - BROWSER_WORKER_RUNTIME_URL=http://127.0.0.1:18101
       - BROWSER_RUNTIME_URL=http://127.0.0.1:18101
       - BROWSER_RUNTIME_PORT=18101
       - DOUYIN_SERVICE_URL=http://127.0.0.1:18070
+      - BILIBILI_SERVICE_URL=http://127.0.0.1:18080
       - BROWSER_BIN=/usr/local/bin/kato-chromium
       - XHS_BROWSER_BIN=/usr/local/bin/kato-chromium
       - XHS_INTERNAL_CDP_PORT=9225
       - DOUYIN_INTERNAL_CDP_PORT=9235
+      - BILIBILI_INTERNAL_CDP_PORT=9245
       - XHS_PROFILE_DIR=/app/data/platforms/xhs/worker-profile
       - DOUYIN_PROFILE_DIR=/app/data/platforms/douyin/worker-profile
+      - BILIBILI_PROFILE_DIR=/app/data/platforms/bilibili/worker-profile
       - COOKIES_PATH=/app/mcp/xiaohongshu/data/cookies.json
       - DOUYIN_COOKIES_PATH=/app/data/platforms/douyin/cookies.json
+      - BILIBILI_COOKIES_PATH=/app/data/platforms/bilibili/cookies.json
       - LANG=zh_CN.UTF-8
       - LC_ALL=zh_CN.UTF-8
       - LANGUAGE=zh_CN:zh
@@ -41,3 +48,4 @@ services:
       - "4173:4173"
       - "18060:18060"
       - "18070:18070"
+      - "18080:18080"

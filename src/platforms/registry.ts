@@ -40,15 +40,17 @@ export const PLATFORM_SPECS: Record<PlatformId, PlatformSpec> = {
     loginUrl: "https://www.bilibili.com",
     cookieDomains: [".bilibili.com", ".biligame.com"],
     defaultDataDir: "/app/data/platforms/bilibili",
+    defaultServicePort: 18080,
     viewerRuntimeUrl: BILIBILI_VIEWER_RUNTIME_URL,
     workerRuntimeUrl: BILIBILI_WORKER_RUNTIME_URL,
-    implemented: false,
+    serviceUrl: process.env.BILIBILI_SERVICE_URL || "http://127.0.0.1:18080",
+    implemented: true,
     capabilities: {
-      search: false,
-      detail: false,
-      comments: false,
+      search: true,
+      detail: true,
+      comments: true,
       write: false,
-      login: false
+      login: true
     },
     searchUrl: (query) => `https://search.bilibili.com/all?keyword=${encodeURIComponent(query)}`
   },

@@ -50,6 +50,23 @@ export async function openPlatformLogin(platform, button) {
   });
 }
 
+export async function openPlatformChallenge(platform, button) {
+  const label = platformLabel(platform);
+  const url = platformChallengeUrl(platform);
+  appendClientLog(`开始 · 打开${label}验证页`);
+  return withButtonLoading(button, "打开中", async () => {
+    try {
+      setChallengeFlowStatus(`${label}验证页已打开，通过后点击同步状态`);
+      appendClientLog(`提示 · 请在 noVNC 中完成${label}验证码/安全验证，通过后点击“同步状态”`);
+      activateTab("browser");
+      await openPlatformViewer(platform, { url });
+    } catch (error) {
+      setChallengeFlowStatus(`${label}验证页打开失败`);
+      appendClientLog(`失败 · 打开${label}验证页：${errorMessage(error)}`);
+    }
+  });
+}
+
 export async function restartMcpBrowser(button) {
   appendClientLog("开始 · 重启容器 Chromium");
   return withButtonLoading(button, "重启中", async () => {
@@ -81,9 +98,13 @@ export async function syncPlatformCookies(platform, button) {
       const result = await dashboardApi.syncPlatformCookies(platform);
       setText("mcpState", `${label}登录态已同步`);
       $("mcpState").className = "mcp-state ok";
-      appendClientLog(`成功 · ${label}已导出 ${result.exportedCookies ?? 0} 个 cookies 到 ${result.cookiesPath || "持久化目录"}`);
+      setChallengeFlowStatus(`${label}状态已同步，可以重试刚才的任务`);
+      appendClientLog(
+        `成功 · ${label}已导出 ${result.exportedCookies ?? 0} 个 cookies${result.exportedStorageOrigins !== undefined ? ` / ${result.exportedStorageOrigins} 个 storage` : ""} 到 ${result.cookiesPath || "持久化目录"}`
+      );
       await refreshPlatformLoginList();
     } catch (error) {
+      setChallengeFlowStatus(`${label}状态同步失败`);
       appendClientLog(`失败 · 同步${label}登录态：${errorMessage(error)}`);
     }
   });
@@ -92,6 +113,9 @@ export async function syncPlatformCookies(platform, button) {
 export function bindPlatformLoginActions() {
   $$("[data-open-platform-login]").forEach((button) => {
     button.addEventListener("click", () => openPlatformLogin(button.dataset.openPlatformLogin, button));
+  });
+  $$("[data-open-platform-challenge]").forEach((button) => {
+    button.addEventListener("click", () => openPlatformChallenge(button.dataset.openPlatformChallenge, button));
   });
   $$("[data-sync-platform-cookies]").forEach((button) => {
     button.addEventListener("click", () => syncPlatformCookies(button.dataset.syncPlatformCookies, button));
@@ -103,7 +127,7 @@ async function refreshPlatformLoginList() {
   if (!list) return;
   try {
     const result = await dashboardApi.getPlatformLoginStatuses();
-    const platforms = (result.platforms || []).filter((platform) => platform.capabilities?.login !== false && platform.platform !== "bilibili");
+    const platforms = (result.platforms || []).filter((platform) => platform.capabilities?.login !== false);
     list.innerHTML = platforms.map(renderPlatformStatus).join("");
   } catch (error) {
     list.innerHTML = `<div class="platform-login-row warn"><span>平台登录态</span><strong>${escapeHtml(errorMessage(error))}</strong></div>`;
@@ -128,4 +152,15 @@ function platformLabel(platform) {
   if (platform === "douyin") return "抖音";
   if (platform === "bilibili") return "B站";
   return "小红书";
+}
+
+function platformChallengeUrl(platform) {
+  if (platform === "douyin") return "https://www.douyin.com/search/%E7%BE%8E%E9%A3%9F?type=video";
+  if (platform === "bilibili") return "https://search.bilibili.com/all?keyword=%E8%AF%BE%E7%A8%8B";
+  return "https://www.xiaohongshu.com/explore";
+}
+
+function setChallengeFlowStatus(text) {
+  const el = $("challengeFlowStatus");
+  if (el) el.textContent = text;
 }

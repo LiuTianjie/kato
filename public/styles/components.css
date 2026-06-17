@@ -629,11 +629,59 @@
   min-width: 0;
 }
 
+.browser-challenge-flow {
+  display: grid;
+  gap: 8px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.84);
+}
+
+.challenge-flow-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.challenge-flow-head strong {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.challenge-flow-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(160px, 1fr));
+  gap: 8px;
+}
+
+.challenge-flow-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 7px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(246, 248, 251, 0.78);
+}
+
+.challenge-flow-row span {
+  flex: 1;
+  min-width: 46px;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 900;
+}
+
 .cdp-screen-wrap {
   display: grid;
   place-items: stretch;
   flex: 1;
-  min-height: calc(100vh - 220px);
+  min-height: calc(100vh - 300px);
   padding: 0;
   background: #fff;
   outline: none;
@@ -1481,6 +1529,7 @@
 
   .metrics,
   .sync-strip,
+  .challenge-flow-grid,
   .history-filters,
   .history-row,
   .content-layout,
@@ -1517,6 +1566,11 @@
   .row-actions {
     display: grid;
     min-width: 0;
+  }
+
+  .challenge-flow-row {
+    display: grid;
+    grid-template-columns: 1fr;
   }
 
   .row-check {

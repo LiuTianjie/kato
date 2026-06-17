@@ -29,6 +29,7 @@ const VIEWER_RUNTIME_URL =
 const INTERNAL_CDP_PORT = Number(process.env.DOUYIN_INTERNAL_CDP_PORT || process.env.BROWSER_CDP_PORT || 9224);
 const PROFILE_DIR = process.env.DOUYIN_PROFILE_DIR || process.env.BROWSER_PROFILE_DIR || "/app/data/platforms/douyin/worker-profile";
 const COOKIES_PATH = process.env.DOUYIN_COOKIES_PATH || "/app/data/platforms/douyin/cookies.json";
+const STORAGE_PATH = process.env.DOUYIN_STORAGE_PATH || "/app/data/platforms/douyin/storage.json";
 const CDP_CONNECT_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_CDP_CONNECT_TIMEOUT_MS", 30_000);
 const CDP_CONNECT_ATTEMPTS = normalizePositiveEnv("DOUYIN_CDP_CONNECT_ATTEMPTS", 3);
 const BROWSER_STATUS_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_BROWSER_STATUS_TIMEOUT_MS", 2_000);
@@ -89,6 +90,16 @@ class BrowserTaskCancelledError extends Error {
   }
 }
 
+class DouyinChallengeRequiredError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = "DouyinChallengeRequiredError";
+    this.statusCode = 428;
+    this.code = "CHALLENGE_REQUIRED";
+    this.details = details;
+  }
+}
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
@@ -117,12 +128,34 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/v1/browser/sync-cookies") {
       const cookies = await exportViewerCookies(DOUYIN_COOKIE_DOMAINS);
+      const storage = await exportViewerStorage(DOUYIN_COOKIE_DOMAINS).catch((error) => {
+        serviceLog("warn", "storage", `Douyin browser storage sync failed: ${errorMessage(error)}`);
+        return [];
+      });
       await persistCookies(cookies, "manual-sync");
+      if (storage.length) await persistStorage(storage, "manual-sync");
       const context = contextPromise ? await contextPromise.catch(() => undefined) : undefined;
       if (context && cookies.length) await context.addCookies(cookies).catch(() => undefined);
+      if (context && storage.length) await restoreStorage(context, storage).catch((error) => {
+        serviceLog("warn", "storage", `Douyin worker storage restore after sync failed: ${errorMessage(error)}`);
+      });
       const exportedCookies = cookies.length;
-      serviceLog("info", "cookies", "Douyin browser cookies synced manually.", { exportedCookies });
-      sendJson(res, 200, { success: true, data: { cookiesPath: COOKIES_PATH, exportedCookies } });
+      serviceLog("info", "cookies", "Douyin browser cookies synced manually.", { exportedCookies, exportedStorageOrigins: storage.length });
+      sendJson(res, 200, { success: true, data: { cookiesPath: COOKIES_PATH, storagePath: STORAGE_PATH, exportedCookies, exportedStorageOrigins: storage.length } });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/v1/browser/update-cookie") {
+      const body = await readJson(req);
+      const cookieHeader = String(body.cookie || body.cookies || "").trim();
+      if (!cookieHeader) throw new Error("cookie is required.");
+      const cookies = parseCookieHeader(cookieHeader, ".douyin.com");
+      if (!cookies.length) throw new Error("No valid cookie pairs found.");
+      await persistCookies(cookies, "serverx-update");
+      const context = contextPromise ? await contextPromise.catch(() => undefined) : undefined;
+      if (context) await context.addCookies(cookies).catch(() => undefined);
+      serviceLog("info", "cookies", "Douyin cookies updated from API.", { count: cookies.length });
+      sendJson(res, 200, { success: true, data: { cookiesPath: COOKIES_PATH, updatedCookies: cookies.length } });
       return;
     }
 
@@ -190,6 +223,11 @@ const server = createServer(async (req, res) => {
     if (error instanceof BrowserTaskCancelledError) {
       serviceLog("warn", "request", `${req.method || "GET"} ${req.url || "/"} cancelled: ${message}`);
       sendJson(res, 499, { success: false, error: { code: "CLIENT_CLOSED_REQUEST", message } });
+      return;
+    }
+    if (error instanceof DouyinChallengeRequiredError) {
+      serviceLog("warn", "request", `${req.method || "GET"} ${req.url || "/"} requires Douyin challenge: ${message}`, error.details);
+      sendJson(res, error.statusCode, { success: false, error: { code: error.code, message, details: error.details } });
       return;
     }
     serviceLog("error", "request", `${req.method || "GET"} ${req.url || "/"} failed: ${message}`);
@@ -277,6 +315,7 @@ async function launchContext() {
     const context = browser.contexts()[0] || (await browser.newContext({ viewport: { width: 1440, height: 980 }, locale: "zh-CN" }));
     await configureContextFingerprint(context);
     await loadCookies(context);
+    await loadStorage(context);
     startCookieAutoPersist(context);
     context.on("page", (page) => {
       page.setDefaultTimeout(30_000);
@@ -618,12 +657,17 @@ async function searchPosts(keyword, limit, options = {}) {
       const posts = uniquePosts([...extractPostsFromPayloads(payloads), ...(await scrapePosts(page))]);
       const start = (pageNumber - 1) * limit;
       const result = posts.slice(start, start + limit);
+      const pageTitle = await page.title().catch(() => "");
+      const bodyPreview = result.length ? "" : await page.locator("body").innerText({ timeout: 2_000 }).catch(() => "");
+      assertNoDouyinChallenge({ pageTitle, bodyPreview, url: page.url(), task: "searchPosts" });
       serviceLog("info", "posts", "Douyin search completed.", {
         keyword,
         capturedPayloads: payloads.length,
         parsed: posts.length,
         returned: result.length,
-        currentUrl: safeLogUrl(page.url())
+        currentUrl: safeLogUrl(page.url()),
+        title: pageTitle,
+        bodyPreview: sanitizeLogText(bodyPreview).slice(0, 160)
       });
       return result;
     },
@@ -643,13 +687,22 @@ async function getPostDetail(body, taskContext) {
       const capture = startDouyinResponseCapture(page, ["detail", "comment"]);
       let payloads = [];
       try {
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 35_000 });
         await humanDelay("detail:settle", 2_000, 5_000, { signal: taskContext?.signal });
       } finally {
         payloads = await capture.stop();
       }
+      await assertPageNotChallenged(page, "getPostDetail");
       const posts = extractPostsFromPayloads(payloads);
-      const detail = posts.find((post) => !resolved.awemeId || post.id === resolved.awemeId) || posts[0] || (await scrapeDetail(page, resolved));
+      let detail = posts.find((post) => !resolved.awemeId || post.id === resolved.awemeId) || posts[0] || null;
+      if (!detail && resolved.awemeId) {
+        const fallback = await fetchDetailInPage(page, resolved.awemeId).catch((error) => {
+          serviceLog("warn", "detail", `In-page detail fetch failed: ${errorMessage(error)}`);
+          return null;
+        });
+        detail = fallback ? extractPostsFromPayloads([fallback]).find((post) => post.id === resolved.awemeId) || extractPostsFromPayloads([fallback])[0] || null : null;
+      }
+      detail ||= await scrapeDetail(page, resolved);
       return detail || normalizePost({ aweme_id: resolved.awemeId, share_url: url, desc: "", raw: { url } });
     },
     taskContext
@@ -673,6 +726,7 @@ async function getPostComments(body, limit, taskContext) {
       } finally {
         payloads = await capture.stop();
       }
+      await assertPageNotChallenged(page, "getPostComments");
       let extracted = extractCommentsPayload(payloads, "");
       if (!extracted.comments.length && resolved.awemeId) {
         const fallback = await fetchCommentsInPage(page, "list", { aweme_id: resolved.awemeId, cursor, count: limit }).catch((error) => {
@@ -707,21 +761,20 @@ async function getCommentReplies(body, limit, taskContext) {
       if (!itemId || !commentId) throw new Error("item_id/aweme_id and comment_id are required.");
       const cursor = normalizeCursor(body.cursor, 0);
       const page = await newTaskPage(taskContext);
-      const capture = startDouyinResponseCapture(page, ["commentReply"]);
-      let payloads = [];
+      let extracted = { comments: [], cursor: "", hasMore: false };
       try {
-        await page.goto(canonicalPostUrl(itemId), { waitUntil: "domcontentloaded", timeout: 60_000 });
-        await humanDelay("replies:settle", 1_800, 4_500, { signal: taskContext?.signal });
-      } finally {
-        payloads = await capture.stop();
+        await prepareDouyinApiPage(page, "replies:api");
+        const fallback = await withTimeout(
+          fetchCommentsInPage(page, "reply", { item_id: itemId, comment_id: commentId, cursor, count: limit }),
+          25_000,
+          "Douyin replies API timed out."
+        );
+        extracted = extractCommentsPayload([fallback], commentId);
+      } catch (error) {
+        serviceLog("warn", "comments", `Direct replies fetch failed: ${errorMessage(error)}`);
       }
-      let extracted = extractCommentsPayload(payloads, commentId);
       if (!extracted.comments.length) {
-        const fallback = await fetchCommentsInPage(page, "reply", { item_id: itemId, comment_id: commentId, cursor, count: limit }).catch((error) => {
-          serviceLog("warn", "comments", `In-page replies fetch failed: ${errorMessage(error)}`);
-          return null;
-        });
-        if (fallback) extracted = extractCommentsPayload([fallback], commentId);
+        extracted = await expandRepliesFromPage(page, { itemId, commentId, cursor, limit, signal: taskContext?.signal });
       }
       const comments = uniqueComments(extracted.comments.map((comment) => ({ ...comment, parentId: comment.parentId || commentId }))).slice(0, limit);
       return {
@@ -768,6 +821,69 @@ async function resolveDouyinLink(input, taskContext) {
   };
 }
 
+async function expandRepliesFromPage(page, { itemId, commentId, cursor, limit, signal }) {
+  const capture = startDouyinResponseCapture(page, ["commentReply"]);
+  const matchedPayloads = [];
+  try {
+    await page.goto(canonicalPostUrl(itemId), { waitUntil: "domcontentloaded", timeout: 35_000 });
+    await humanDelay("replies:page-settle", 1_500, 3_000, { signal });
+    await assertPageNotChallenged(page, "expandRepliesFromPage");
+
+    for (let scrollIndex = 0; scrollIndex < 10; scrollIndex += 1) {
+      signal?.throwIfAborted?.();
+      const clicked = await clickVisibleReplyExpander(page);
+      await humanDelay("replies:expand", 700, 1_600, { signal });
+      const payloads = await capture.drain();
+      matchedPayloads.push(...payloads.filter((entry) => responseMatchesCommentId(entry.url, commentId)));
+      if (matchedPayloads.length) break;
+      await page.mouse.wheel(0, clicked ? 360 : 760);
+      await humanDelay("replies:scroll", 500, 1_200, { signal });
+    }
+  } finally {
+    const payloads = await capture.stop();
+    matchedPayloads.push(...payloads.filter((entry) => responseMatchesCommentId(entry.url, commentId)));
+  }
+
+  const extracted = extractCommentsPayload(matchedPayloads, commentId);
+  serviceLog("info", "comments", "Douyin reply page expansion completed.", {
+    commentId,
+    matchedPayloads: matchedPayloads.length,
+    returned: extracted.comments.length,
+    cursor,
+    limit
+  });
+  return extracted;
+}
+
+async function clickVisibleReplyExpander(page) {
+  const selectors = [
+    "text=/展开\\d+条回复/",
+    "text=/展开.*回复/",
+    "text=/查看.*回复/"
+  ];
+  for (const selector of selectors) {
+    const locator = page.locator(selector);
+    const count = await locator.count().catch(() => 0);
+    for (let index = 0; index < count; index += 1) {
+      const item = locator.nth(index);
+      const visible = await item.isVisible().catch(() => false);
+      if (!visible) continue;
+      await item.scrollIntoViewIfNeeded({ timeout: 2_000 }).catch(() => undefined);
+      await item.click({ timeout: 3_000 }).catch(() => undefined);
+      return true;
+    }
+  }
+  return false;
+}
+
+function responseMatchesCommentId(url, commentId) {
+  try {
+    return String(new URL(url).searchParams.get("comment_id") || "") === String(commentId || "");
+  } catch {
+    return false;
+  }
+}
+
 function startDouyinResponseCapture(page, kinds) {
   const payloads = [];
   const targets = new Set(kinds);
@@ -784,10 +900,14 @@ function startDouyinResponseCapture(page, kinds) {
   };
   page.on("response", onResponse);
   return {
+    async drain() {
+      await delay(250);
+      return payloads.splice(0);
+    },
     async stop() {
       await delay(250);
       page.off("response", onResponse);
-      return payloads;
+      return payloads.splice(0);
     }
   };
 }
@@ -836,16 +956,68 @@ async function fetchCommentsInPage(page, type, params) {
     if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
   }
   return page.evaluate(async (requestUrl) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(new Error("Douyin comment fetch timed out.")), 20_000);
     const response = await fetch(requestUrl, {
       credentials: "include",
+      signal: controller.signal,
       headers: {
         accept: "application/json, text/plain, */*",
         "accept-language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
       }
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+    }).finally(() => clearTimeout(timeout));
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 500)}`);
     return response.json();
   }, url.toString());
+}
+
+async function fetchDetailInPage(page, awemeId) {
+  await prepareDouyinApiPage(page, "detail:api");
+  const url = new URL("https://www.douyin.com/aweme/v1/web/aweme/detail/");
+  const defaults = {
+    device_platform: "webapp",
+    aid: "6383",
+    channel: "channel_pc_web",
+    aweme_id: awemeId,
+    update_version_code: "170400",
+    pc_client_type: "1",
+    pc_libra_divert: "Windows",
+    support_h265: "0",
+    support_dash: "1",
+    cpu_core_num: "12",
+    device_memory: "8",
+    platform: "PC",
+    downlink: "10",
+    effective_type: "4g",
+    round_trip_time: "50"
+  };
+  for (const [key, value] of Object.entries(defaults)) url.searchParams.set(key, String(value));
+  return page.evaluate(async (requestUrl) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(new Error("Douyin detail fetch timed out.")), 20_000);
+    const response = await fetch(requestUrl, {
+      credentials: "include",
+      signal: controller.signal,
+      headers: {
+        accept: "application/json, text/plain, */*",
+        "accept-language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+      }
+    }).finally(() => clearTimeout(timeout));
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 500)}`);
+    return response.json();
+  }, url.toString());
+}
+
+async function prepareDouyinApiPage(page, task) {
+  if (/^https:\/\/www\.douyin\.com\//i.test(page.url())) {
+    await assertPageNotChallenged(page, task);
+    return;
+  }
+  await page.goto("https://www.douyin.com/", { waitUntil: "domcontentloaded", timeout: 30_000 }).catch((error) => {
+    serviceLog("warn", "browser", `Douyin API origin navigation warning: ${errorMessage(error)}`);
+  });
+  await humanDelay(task, 500, 1_200);
+  await assertPageNotChallenged(page, task);
 }
 
 function extractPostsFromPayloads(payloads) {
@@ -855,13 +1027,32 @@ function extractPostsFromPayloads(payloads) {
     for (const item of walkObjects(payload)) {
       const candidate = item.aweme_info || item.aweme_detail || item.aweme || item.item || item;
       if (!candidate || typeof candidate !== "object") continue;
-      if (candidate.aweme_id || candidate.item_id || candidate.id) {
+      if (isLikelyDouyinPost(candidate, item)) {
         const post = normalizePost(candidate);
         if (post.id && (post.title || post.snippet || post.url)) posts.push(post);
       }
     }
   }
   return posts;
+}
+
+function isLikelyDouyinPost(candidate, wrapper = {}) {
+  if (!candidate || typeof candidate !== "object") return false;
+  if (wrapper.aweme_info || wrapper.aweme_detail || wrapper.aweme) return Boolean(candidate.aweme_id || candidate.item_id || candidate.id);
+  if (candidate.aweme_id || candidate.item_id) return true;
+  if (!candidate.id) return false;
+  if (candidate.word && ["recom", "sug", "suggest", "history"].includes(String(candidate.type || "").toLowerCase())) return false;
+  return Boolean(
+    candidate.desc ||
+      candidate.title ||
+      candidate.caption ||
+      candidate.aweme_title ||
+      candidate.share_url ||
+      candidate.share_info ||
+      candidate.author ||
+      candidate.statistics ||
+      candidate.video
+  );
 }
 
 function normalizePost(item) {
@@ -924,6 +1115,26 @@ function normalizeComment(item, parentId = "") {
     parentId: stringValue(item.reply_id ?? item.reply_comment_id ?? item.parent_id ?? parentId),
     raw: item
   };
+}
+
+async function assertPageNotChallenged(page, task) {
+  const pageTitle = await page.title().catch(() => "");
+  const bodyPreview = await page.locator("body").innerText({ timeout: 2_000 }).catch(() => "");
+  assertNoDouyinChallenge({ pageTitle, bodyPreview, url: page.url(), task });
+}
+
+function assertNoDouyinChallenge({ pageTitle, bodyPreview, url, task }) {
+  const haystack = `${pageTitle}\n${bodyPreview}`;
+  if (!/验证码中间页|验证码|验证|captcha|verifycenter|安全验证/i.test(haystack)) return;
+  throw new DouyinChallengeRequiredError(
+    "Douyin challenge required. Open the Douyin noVNC viewer, complete the verification, sync cookies/storage, then retry.",
+    {
+      task,
+      title: sanitizeLogText(pageTitle),
+      url: safeLogUrl(url),
+      action: "open_douyin_novnc_then_sync_cookies"
+    }
+  );
 }
 
 async function scrapePosts(page) {
@@ -1068,6 +1279,20 @@ async function exportViewerCookies(domains) {
   return Array.isArray(data?.cookies) ? data.cookies : [];
 }
 
+async function exportViewerStorage(domains) {
+  const payload = await fetchRuntimeJson(
+    "/browser/storage/export",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ domains })
+    },
+    BROWSER_RUNTIME_TIMEOUT_MS
+  );
+  const data = payload?.data || payload;
+  return Array.isArray(data?.storage) ? data.storage : [];
+}
+
 async function waitForCdpHttp() {
   const deadline = Date.now() + CDP_CONNECT_TIMEOUT_MS;
   let lastError = "";
@@ -1100,7 +1325,7 @@ async function connectBrowserOverCdp() {
 }
 
 async function fetchRuntimeJson(endpoint, init = {}, timeoutMs = BROWSER_RUNTIME_TIMEOUT_MS) {
-  const baseUrl = endpoint === "/browser/cookies/export" ? VIEWER_RUNTIME_URL : BROWSER_RUNTIME_URL;
+  const baseUrl = endpoint === "/browser/cookies/export" || endpoint === "/browser/storage/export" ? VIEWER_RUNTIME_URL : BROWSER_RUNTIME_URL;
   const url = `${baseUrl.replace(/\/$/, "")}${endpoint}`;
   const response = await fetchWithTimeout(url, init, timeoutMs);
   const text = await response.text();
@@ -1135,6 +1360,47 @@ async function loadCookies(context) {
   }
 }
 
+async function loadStorage(context) {
+  try {
+    const raw = await readFile(STORAGE_PATH, "utf8");
+    const storage = JSON.parse(raw);
+    if (Array.isArray(storage) && storage.length) {
+      await restoreStorage(context, storage);
+      serviceLog("info", "storage", `Loaded ${storage.length} Douyin storage origins.`, { storagePath: STORAGE_PATH });
+    }
+  } catch {
+    // Missing storage files are normal on first boot.
+  }
+}
+
+async function restoreStorage(context, storage) {
+  for (const entry of storage) {
+    const origin = stringValue(entry?.origin);
+    if (!/^https:\/\/([^/]+\.)?douyin\.com$/i.test(origin)) continue;
+    const page = await context.newPage();
+    try {
+      await applyPageFingerprint(page).catch(() => undefined);
+      await page.goto(origin, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
+      await page.evaluate(({ localStorageData, sessionStorageData }) => {
+        const apply = (target, data) => {
+          if (!data || typeof data !== "object") return;
+          for (const [key, value] of Object.entries(data)) {
+            try {
+              target.setItem(key, String(value ?? ""));
+            } catch {
+              // Ignore storage quota and blocked key failures.
+            }
+          }
+        };
+        apply(localStorage, localStorageData);
+        apply(sessionStorage, sessionStorageData);
+      }, { localStorageData: entry.localStorage || {}, sessionStorageData: entry.sessionStorage || {} });
+    } finally {
+      await page.close({ runBeforeUnload: false }).catch(() => undefined);
+    }
+  }
+}
+
 function startCookieAutoPersist(context) {
   stopCookieAutoPersist();
   cookiePersistTimer = setInterval(() => {
@@ -1158,6 +1424,38 @@ async function persistCookies(cookies, source) {
   await mkdir(path.dirname(COOKIES_PATH), { recursive: true });
   await writeFile(COOKIES_PATH, JSON.stringify(cookies, null, 2));
   serviceLog("info", "cookies", `Persisted ${cookies.length} Douyin cookies.`, { source, cookiesPath: COOKIES_PATH });
+}
+
+async function persistStorage(storage, source) {
+  await mkdir(path.dirname(STORAGE_PATH), { recursive: true });
+  await writeFile(STORAGE_PATH, JSON.stringify(storage, null, 2));
+  serviceLog("info", "storage", `Persisted ${storage.length} Douyin storage origins.`, { source, storagePath: STORAGE_PATH });
+}
+
+function parseCookieHeader(cookieHeader, domain) {
+  const expires = Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60;
+  return cookieHeader
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const separator = part.indexOf("=");
+      if (separator <= 0) return null;
+      const name = part.slice(0, separator).trim();
+      const value = part.slice(separator + 1).trim();
+      if (!name || ["path", "domain", "expires", "max-age", "secure", "httponly", "samesite"].includes(name.toLowerCase())) return null;
+      return {
+        name,
+        value,
+        domain,
+        path: "/",
+        expires,
+        httpOnly: false,
+        secure: true,
+        sameSite: "Lax"
+      };
+    })
+    .filter(Boolean);
 }
 
 function isDouyinCookie(cookie) {

@@ -13,15 +13,19 @@ env:
   PORT: "4173"
   XHS_SERVICE_PORT: "18060"
   DOUYIN_SERVICE_PORT: "18070"
+  BILIBILI_SERVICE_PORT: "18080"
   XHS_VIEWER_RUNTIME_URL: http://127.0.0.1:18100
   XHS_BROWSER_RUNTIME_URL: http://127.0.0.1:18101
   DOUYIN_VIEWER_RUNTIME_URL: http://127.0.0.1:18110
   DOUYIN_BROWSER_RUNTIME_URL: http://127.0.0.1:18111
+  BILIBILI_VIEWER_RUNTIME_URL: http://127.0.0.1:18120
+  BILIBILI_BROWSER_RUNTIME_URL: http://127.0.0.1:18121
   BROWSER_VIEWER_RUNTIME_URL: http://127.0.0.1:18100
   BROWSER_WORKER_RUNTIME_URL: http://127.0.0.1:18101
   BROWSER_RUNTIME_URL: http://127.0.0.1:18101
   BROWSER_RUNTIME_PORT: "18101"
   DOUYIN_SERVICE_URL: http://127.0.0.1:18070
+  BILIBILI_SERVICE_URL: http://127.0.0.1:18080
   XHS_API_TOKEN: ${XHS_API_TOKEN}
   COMMENT_PROVIDER: ark
   ARK_API_KEY: ${ARK_API_KEY}
@@ -33,6 +37,7 @@ env:
   XHS_BROWSER_BIN: /usr/local/bin/kato-chromium
   XHS_INTERNAL_CDP_PORT: "9225"
   DOUYIN_INTERNAL_CDP_PORT: "9235"
+  BILIBILI_INTERNAL_CDP_PORT: "9245"
   XHS_REST_TIMEOUT_MS: "600000"
   XHS_PUBLIC_MCP_FETCH_TIMEOUT_MS: "600000"
   XHS_CDP_CONNECT_TIMEOUT_MS: "30000"
@@ -43,12 +48,14 @@ env:
   XHS_PROFILE_DIR: /app/data/platforms/xhs/worker-profile
   COOKIES_PATH: /app/mcp/xiaohongshu/data/cookies.json
   DOUYIN_PROFILE_DIR: /app/data/platforms/douyin/worker-profile
+  BILIBILI_PROFILE_DIR: /app/data/platforms/bilibili/worker-profile
   DOUYIN_CDP_CONNECT_TIMEOUT_MS: "30000"
   DOUYIN_CDP_CONNECT_ATTEMPTS: "3"
   DOUYIN_BROWSER_TASK_TIMEOUT_MS: "180000"
   DOUYIN_REST_TIMEOUT_MS: "600000"
   DOUYIN_PUBLIC_FETCH_TIMEOUT_MS: "600000"
   DOUYIN_COOKIES_PATH: /app/data/platforms/douyin/cookies.json
+  BILIBILI_COOKIES_PATH: /app/data/platforms/bilibili/cookies.json
   LANG: zh_CN.UTF-8
   LC_ALL: zh_CN.UTF-8
   LANGUAGE: zh_CN:zh
@@ -62,7 +69,7 @@ volumes:
 healthcheck:
   test:
     - CMD-SHELL
-    - node -e "const e=process.env; const urls=['http://127.0.0.1:'+(e.PORT||4173)+'/api/dashboard','http://127.0.0.1:'+(e.XHS_SERVICE_PORT||18060)+'/health?ensure=1','http://127.0.0.1:'+(e.DOUYIN_SERVICE_PORT||18070)+'/health?ensure=1','http://127.0.0.1:'+(e.XHS_VIEWER_RUNTIME_PORT||18100)+'/health?ensure=1','http://127.0.0.1:'+(e.XHS_WORKER_RUNTIME_PORT||e.BROWSER_RUNTIME_PORT||18101)+'/health?ensure=1','http://127.0.0.1:'+(e.DOUYIN_VIEWER_RUNTIME_PORT||18110)+'/health?ensure=1','http://127.0.0.1:'+(e.DOUYIN_WORKER_RUNTIME_PORT||18111)+'/health?ensure=1']; Promise.all(urls.map((url)=>fetch(url,{signal:AbortSignal.timeout(20000)}).then((r)=>{if(!r.ok) throw new Error(url+' '+r.status)}))).then(()=>process.exit(0)).catch((e)=>{console.error(e.message);process.exit(1)})"
+    - node -e "const e=process.env; const urls=['http://127.0.0.1:'+(e.PORT||4173)+'/api/dashboard','http://127.0.0.1:'+(e.XHS_SERVICE_PORT||18060)+'/health?ensure=1','http://127.0.0.1:'+(e.DOUYIN_SERVICE_PORT||18070)+'/health?ensure=1','http://127.0.0.1:'+(e.BILIBILI_SERVICE_PORT||18080)+'/health','http://127.0.0.1:'+(e.XHS_VIEWER_RUNTIME_PORT||18100)+'/health?ensure=1','http://127.0.0.1:'+(e.XHS_WORKER_RUNTIME_PORT||e.BROWSER_RUNTIME_PORT||18101)+'/health?ensure=1','http://127.0.0.1:'+(e.DOUYIN_VIEWER_RUNTIME_PORT||18110)+'/health?ensure=1','http://127.0.0.1:'+(e.DOUYIN_WORKER_RUNTIME_PORT||18111)+'/health?ensure=1','http://127.0.0.1:'+(e.BILIBILI_VIEWER_RUNTIME_PORT||18120)+'/health?ensure=1','http://127.0.0.1:'+(e.BILIBILI_WORKER_RUNTIME_PORT||18121)+'/health?ensure=1']; Promise.all(urls.map((url)=>fetch(url,{signal:AbortSignal.timeout(20000)}).then((r)=>{if(!r.ok) throw new Error(url+' '+r.status)}))).then(()=>process.exit(0)).catch((e)=>{console.error(e.message);process.exit(1)})"
   interval: 30s
   timeout: 25s
   retries: 3
