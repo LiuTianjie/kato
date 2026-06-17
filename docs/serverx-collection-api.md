@@ -9,8 +9,10 @@ https://kato.itool.tech
 所有接口都需要共享 Kato token：
 
 ```bash
--H "Authorization: Bearer $XHS_API_TOKEN"
+-H "Authorization: Bearer $KATO_API_TOKEN"
 ```
+
+`KATO_API_TOKEN` 是小红书、抖音、B站和 Kato Console 共用的统一 token。旧名 `XHS_API_TOKEN` 仅保留为兼容别名。
 
 成功返回：
 
@@ -50,7 +52,7 @@ serverx 也可以主动写入 Cookie：
 
 ```bash
 curl -X POST "$KATO_BASE/api/hybrid/update_cookie" \
-  -H "Authorization: Bearer $XHS_API_TOKEN" \
+  -H "Authorization: Bearer $KATO_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"service":"douyin","cookie":"sid_guard=xxx; sessionid=xxx;"}'
 ```
@@ -59,7 +61,7 @@ curl -X POST "$KATO_BASE/api/hybrid/update_cookie" \
 
 ```bash
 curl -X POST "$KATO_BASE/api/bilibili/web/update_cookie" \
-  -H "Authorization: Bearer $XHS_API_TOKEN" \
+  -H "Authorization: Bearer $KATO_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"service":"bilibili","cookie":"SESSDATA=xxx; bili_jct=xxx;"}'
 ```
@@ -84,7 +86,7 @@ GET /api/douyin/web/search_videos
 
 ```bash
 curl "$KATO_BASE/api/douyin/web/search_videos?keyword=课程&count=20" \
-  -H "Authorization: Bearer $XHS_API_TOKEN"
+  -H "Authorization: Bearer $KATO_API_TOKEN"
 ```
 
 返回字段兼容：
@@ -104,7 +106,7 @@ GET /api/douyin/web/get_aweme_id
 
 ```bash
 curl "$KATO_BASE/api/douyin/web/get_aweme_id?url=https%3A%2F%2Fwww.douyin.com%2Fvideo%2F738xxx" \
-  -H "Authorization: Bearer $XHS_API_TOKEN"
+  -H "Authorization: Bearer $KATO_API_TOKEN"
 ```
 
 返回：
@@ -121,7 +123,7 @@ GET /api/douyin/web/fetch_one_video
 
 ```bash
 curl "$KATO_BASE/api/douyin/web/fetch_one_video?aweme_id=738xxx" \
-  -H "Authorization: Bearer $XHS_API_TOKEN"
+  -H "Authorization: Bearer $KATO_API_TOKEN"
 ```
 
 返回在 `data.aweme_detail` 下。
@@ -134,7 +136,7 @@ GET /api/douyin/web/fetch_video_comments
 
 ```bash
 curl "$KATO_BASE/api/douyin/web/fetch_video_comments?aweme_id=738xxx&cursor=0&count=20" \
-  -H "Authorization: Bearer $XHS_API_TOKEN"
+  -H "Authorization: Bearer $KATO_API_TOKEN"
 ```
 
 返回字段兼容：
@@ -152,7 +154,7 @@ GET /api/douyin/web/fetch_video_comment_replies
 
 ```bash
 curl "$KATO_BASE/api/douyin/web/fetch_video_comment_replies?aweme_id=738xxx&comment_id=comment_1&cursor=0&count=20" \
-  -H "Authorization: Bearer $XHS_API_TOKEN"
+  -H "Authorization: Bearer $KATO_API_TOKEN"
 ```
 
 子评论会带：
@@ -181,7 +183,7 @@ GET /api/bilibili/web/search_videos
 
 ```bash
 curl "$KATO_BASE/api/bilibili/web/search_videos?keyword=课程&pn=1&ps=20" \
-  -H "Authorization: Bearer $XHS_API_TOKEN"
+  -H "Authorization: Bearer $KATO_API_TOKEN"
 ```
 
 Kato 会过滤搜索结果中没有 `bvid` 的课程/广告卡片，只返回可继续抓详情和评论的视频项。
@@ -202,7 +204,7 @@ GET /api/bilibili/web/fetch_one_video
 
 ```bash
 curl "$KATO_BASE/api/bilibili/web/fetch_one_video?bvid=BV1xx" \
-  -H "Authorization: Bearer $XHS_API_TOKEN"
+  -H "Authorization: Bearer $KATO_API_TOKEN"
 ```
 
 字段兼容：
@@ -223,7 +225,7 @@ GET /api/bilibili/web/fetch_video_comments
 
 ```bash
 curl "$KATO_BASE/api/bilibili/web/fetch_video_comments?bvid=BV1xx&pn=1&ps=20" \
-  -H "Authorization: Bearer $XHS_API_TOKEN"
+  -H "Authorization: Bearer $KATO_API_TOKEN"
 ```
 
 返回字段：
@@ -244,7 +246,7 @@ GET /api/bilibili/web/fetch_comment_reply
 
 ```bash
 curl "$KATO_BASE/api/bilibili/web/fetch_comment_reply?bvid=BV1xx&root=111&pn=1&ps=20" \
-  -H "Authorization: Bearer $XHS_API_TOKEN"
+  -H "Authorization: Bearer $KATO_API_TOKEN"
 ```
 
 `root`、`rpid` 或 `comment_id` 都可以作为父评论 ID。

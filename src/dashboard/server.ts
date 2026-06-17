@@ -1,4 +1,5 @@
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
+import { randomUUID } from "node:crypto";
 import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { connect as connectTcp } from "node:net";
 import type { Duplex } from "node:stream";
@@ -46,6 +47,7 @@ import {
 import { handlePublicXhsApi, isPublicXhsApiPath } from "./publicXhsApi.js";
 import { handlePublicDouyinApi, isPublicDouyinApiPath } from "./publicDouyinApi.js";
 import { handlePublicBilibiliApi, isPublicBilibiliApiPath } from "./publicBilibiliApi.js";
+import { getConfiguredApiToken, isAuthorizedRequest, isValidApiToken } from "./apiAuth.js";
 import { getPlatformSpec, listPlatformSpecs, normalizePlatformViewerUrl, requirePlatformSpec } from "../platforms/registry.js";
 import type { PlatformId } from "../platforms/types.js";
 
@@ -67,6 +69,8 @@ const bilibiliServiceUrl = process.env.BILIBILI_SERVICE_URL || `http://127.0.0.1
 const defaultNoVncHost = process.env.BROWSER_NOVNC_HOST || process.env.XHS_NOVNC_HOST || "127.0.0.1";
 const legacyCdpLoginEnabled =
   process.env.KATO_ENABLE_LEGACY_CDP_LOGIN === "1" || process.env.XHS_LEGACY_CDP_LOGIN_ENABLED === "1";
+const noVncViewerTickets = new Map<string, { platform: PlatformId; expiresAt: number }>();
+const NO_VNC_VIEWER_TICKET_TTL_MS = 12 * 60 * 60 * 1000;
 type OperationState = "running" | "completed" | "failed" | "cancelled";
 class OperationCancelledError extends Error {
   constructor(message = "操作已取消") {
@@ -92,6 +96,10 @@ const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
     if (url.pathname.startsWith("/novnc")) {
+      if (isNoVncProtectedPath(url) && !isAuthorizedNoVncRequest(req, url)) {
+        sendJson(res, 401, { error: { code: "UNAUTHORIZED", message: "Missing or invalid noVNC viewer token." } });
+        return;
+      }
       proxyNoVncHttp(req, res, url);
       return;
     }
@@ -112,7 +120,7 @@ const server = createServer(async (req, res) => {
 
 server.on("upgrade", (req, socket, head) => {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
-  if (!url.pathname.startsWith("/novnc")) {
+  if (!url.pathname.startsWith("/novnc") || !isAuthorizedNoVncRequest(req, url)) {
     socket.destroy();
     return;
   }
@@ -132,6 +140,27 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
   if (await handlePublicXhsApi(req, res, url, { config, db })) return;
   if (await handlePublicDouyinApi(req, res, url)) return;
   if (await handlePublicBilibiliApi(req, res, url)) return;
+
+  if (req.method === "GET" && url.pathname === "/api/auth/status") {
+    sendJson(res, 200, { authenticated: isAuthorizedRequest(req), tokenConfigured: Boolean(getConfiguredApiToken()) });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/auth/login") {
+    const body = await readJson(req);
+    const token = String(body.token || "").trim();
+    if (!token || !isValidApiToken(token)) {
+      sendJson(res, 401, { error: { code: "UNAUTHORIZED", message: "API token 不正确" } });
+      return;
+    }
+    sendJson(res, 200, { authenticated: true });
+    return;
+  }
+
+  if (!isAuthorizedRequest(req)) {
+    sendJson(res, 401, { error: { code: "UNAUTHORIZED", message: "Missing or invalid Kato API token." } });
+    return;
+  }
 
   if (req.method === "GET" && url.pathname === "/api/dashboard") {
     sendJson(res, 200, {
@@ -701,12 +730,7 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
 }
 
 function hasSharedApiToken(req: IncomingMessage): boolean {
-  const expectedToken = process.env.XHS_API_TOKEN?.trim() || "LiuTao0.1";
-  const authorization = req.headers.authorization ?? "";
-  const bearerToken = typeof authorization === "string" && authorization.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "";
-  const apiKey = req.headers["x-api-key"];
-  const apiKeyToken = Array.isArray(apiKey) ? String(apiKey[0] ?? "").trim() : String(apiKey ?? "").trim();
-  return (bearerToken || apiKeyToken) === expectedToken;
+  return isAuthorizedRequest(req);
 }
 
 function optionalNumber(value: string | number | boolean | null | undefined): number | undefined {
@@ -1050,7 +1074,15 @@ function proxyNoVncUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer, u
 }
 
 function noVncViewerUrl(platform: PlatformId): string {
-  return `/novnc/${platform}/vnc.html?autoconnect=1&resize=scale&path=novnc/${platform}/websockify`;
+  const ticket = createNoVncViewerTicket(platform);
+  const websocketPath = `novnc/${platform}/websockify?kato_viewer_ticket=${encodeURIComponent(ticket)}`;
+  const query = new URLSearchParams({
+    autoconnect: "1",
+    resize: "scale",
+    path: websocketPath,
+    kato_viewer_ticket: ticket
+  });
+  return `/novnc/${platform}/vnc.html?${query.toString()}`;
 }
 
 function noVncTarget(url: URL): { host: string; port: number; path: string } {
@@ -1063,6 +1095,44 @@ function noVncTarget(url: URL): { host: string; port: number; path: string } {
     port: noVncPortForPlatform(platform),
     path: `/${rest.join("/") || ""}${url.search}`
   };
+}
+
+function createNoVncViewerTicket(platform: PlatformId): string {
+  cleanupNoVncViewerTickets();
+  const ticket = randomUUID();
+  noVncViewerTickets.set(ticket, { platform, expiresAt: Date.now() + NO_VNC_VIEWER_TICKET_TTL_MS });
+  return ticket;
+}
+
+function cleanupNoVncViewerTickets(): void {
+  const now = Date.now();
+  for (const [ticket, state] of noVncViewerTickets.entries()) {
+    if (state.expiresAt <= now) noVncViewerTickets.delete(ticket);
+  }
+}
+
+function isNoVncProtectedPath(url: URL): boolean {
+  const pathname = url.pathname.toLowerCase();
+  return pathname.endsWith("/vnc.html") || pathname.endsWith("/websockify");
+}
+
+function isAuthorizedNoVncRequest(req: IncomingMessage, url: URL): boolean {
+  if (isAuthorizedRequest(req)) return true;
+  cleanupNoVncViewerTickets();
+  const ticket = url.searchParams.get("kato_viewer_ticket") || "";
+  const state = noVncViewerTickets.get(ticket);
+  if (!state) return false;
+  if (state.expiresAt <= Date.now()) {
+    noVncViewerTickets.delete(ticket);
+    return false;
+  }
+  return state.platform === platformFromNoVncUrl(url);
+}
+
+function platformFromNoVncUrl(url: URL): PlatformId {
+  const parts = url.pathname.split("/").filter(Boolean);
+  const parsedPlatform = parts[0] === "novnc" ? parts[1] : "";
+  return (parsedPlatform === "douyin" || parsedPlatform === "bilibili" || parsedPlatform === "xhs" ? parsedPlatform : "xhs") as PlatformId;
 }
 
 function noVncPortForPlatform(platform: PlatformId): number {

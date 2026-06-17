@@ -9,6 +9,7 @@ import { generateInteractionDraft } from "../runs/commentProvider.js";
 import { DEFAULT_KEYWORDS, parseKeywordArg } from "../runs/keywords.js";
 import { scorePost } from "../runs/scorer.js";
 import { searchOnlyPosts } from "../runs/searchOnly.js";
+import { getRequestApiToken, isValidApiToken } from "./apiAuth.js";
 
 interface PublicXhsApiContext {
   config: AppConfig;
@@ -50,7 +51,6 @@ class PublicFetchTimeoutError extends Error {
 }
 
 const idempotencyResults = new Map<string, Promise<unknown>>();
-const DEFAULT_XHS_API_TOKEN = "LiuTao0.1";
 const MCP_FETCH_TIMEOUT_MS = normalizePositiveEnv("XHS_PUBLIC_MCP_FETCH_TIMEOUT_MS", 600_000);
 
 export async function handlePublicXhsApi(
@@ -413,19 +413,9 @@ async function likePost(config: AppConfig, body: Record<string, unknown>, option
 }
 
 function assertAuthorized(req: IncomingMessage): void {
-  const expectedToken = process.env.XHS_API_TOKEN?.trim() || DEFAULT_XHS_API_TOKEN;
-  const actualToken = getRequestToken(req);
+  const actualToken = getRequestApiToken(req);
   if (!actualToken) throw new PublicApiError(401, "UNAUTHORIZED", "Missing API token.");
-  if (actualToken !== expectedToken) throw new PublicApiError(403, "FORBIDDEN", "Invalid API token.");
-}
-
-function getRequestToken(req: IncomingMessage): string {
-  const header = req.headers.authorization;
-  if (typeof header === "string" && header.toLowerCase().startsWith("bearer ")) {
-    return header.slice("bearer ".length).trim();
-  }
-  const apiKey = req.headers["x-api-key"];
-  return Array.isArray(apiKey) ? String(apiKey[0] ?? "").trim() : String(apiKey ?? "").trim();
+  if (!isValidApiToken(actualToken)) throw new PublicApiError(403, "FORBIDDEN", "Invalid API token.");
 }
 
 function normalizeKeywords(body: Record<string, unknown>): string[] {

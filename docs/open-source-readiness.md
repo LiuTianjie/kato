@@ -28,7 +28,7 @@
 ## 本地自检命令
 
 ```bash
-rg -n "(/Users/|web_session|id_token|xsec_token=|Authorization: Bearer|XHS_API_TOKEN=.+[^e]$)" \
+rg -n "(/Users/|web_session|id_token|xsec_token=|Authorization: Bearer|(KATO_API_TOKEN|XHS_API_TOKEN)=.+[^e]$)" \
   -g '!node_modules' \
   -g '!dist' \
   -g '!data' \

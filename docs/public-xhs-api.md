@@ -19,7 +19,7 @@ https://kato.itool.tech/api/v1/xhs/*
 启动 dashboard 前设置：
 
 ```bash
-export XHS_API_TOKEN=change-me
+export KATO_API_TOKEN=change-me
 npm run dashboard
 ```
 
@@ -30,7 +30,7 @@ Authorization: Bearer change-me
 X-API-Key: change-me
 ```
 
-未携带 token 返回 `401`；token 不正确返回 `403`。如果服务端未设置 `XHS_API_TOKEN`，会使用部署脚本默认 token `LiuTao0.1`。
+未携带 token 返回 `401`；token 不正确返回 `403`。如果服务端未设置 `KATO_API_TOKEN`，会使用部署脚本默认 token `LiuTao0.1`。旧环境里的 `XHS_API_TOKEN` 仍作为兼容别名被接受，但新部署和 ServerX 对接都应使用 `KATO_API_TOKEN`。
 
 ## 响应格式
 
@@ -59,7 +59,7 @@ X-API-Key: change-me
 返回本地服务、XHS service 健康和登录态摘要。
 
 ```bash
-curl -H "X-API-Key: $XHS_API_TOKEN" \
+curl -H "X-API-Key: $KATO_API_TOKEN" \
   http://localhost:4173/api/v1/xhs/health
 ```
 
@@ -68,7 +68,7 @@ curl -H "X-API-Key: $XHS_API_TOKEN" \
 返回 XHS service 当前登录状态。
 
 ```bash
-curl -H "X-API-Key: $XHS_API_TOKEN" \
+curl -H "X-API-Key: $KATO_API_TOKEN" \
   http://localhost:4173/api/v1/xhs/auth/status
 ```
 
@@ -79,7 +79,7 @@ curl -H "X-API-Key: $XHS_API_TOKEN" \
 ```bash
 curl -X POST http://localhost:4173/api/v1/xhs/posts/search \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: $XHS_API_TOKEN" \
+  -H "X-API-Key: $KATO_API_TOKEN" \
   -d '{"keywords":["AI工具","效率工具"],"limit":20}'
 ```
 
@@ -90,7 +90,7 @@ curl -X POST http://localhost:4173/api/v1/xhs/posts/search \
 ```bash
 curl -X POST http://localhost:4173/api/v1/xhs/posts/detail \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: $XHS_API_TOKEN" \
+  -H "X-API-Key: $KATO_API_TOKEN" \
   -d '{"id":"笔记ID","url":"https://www.xiaohongshu.com/explore/笔记ID","xsecToken":"搜索结果中的 token"}'
 ```
 
@@ -101,7 +101,7 @@ curl -X POST http://localhost:4173/api/v1/xhs/posts/detail \
 ```bash
 curl -X POST http://localhost:4173/api/v1/xhs/notes/sync \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: $XHS_API_TOKEN" \
+  -H "X-API-Key: $KATO_API_TOKEN" \
   -d '{"limit":30}'
 ```
 
@@ -112,7 +112,7 @@ curl -X POST http://localhost:4173/api/v1/xhs/notes/sync \
 ```bash
 curl -X POST http://localhost:4173/api/v1/xhs/comments/draft \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: $XHS_API_TOKEN" \
+  -H "X-API-Key: $KATO_API_TOKEN" \
   -d '{"post":{"id":"笔记ID","url":"https://www.xiaohongshu.com/explore/笔记ID","title":"标题","snippet":"内容摘要"},"keywords":["AI工具"]}'
 ```
 
@@ -123,7 +123,7 @@ curl -X POST http://localhost:4173/api/v1/xhs/comments/draft \
 ```bash
 curl -X POST http://localhost:4173/api/v1/xhs/comments/publish \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: $XHS_API_TOKEN" \
+  -H "X-API-Key: $KATO_API_TOKEN" \
   -d '{"post":{"id":"笔记ID","url":"https://www.xiaohongshu.com/explore/笔记ID","xsecToken":"搜索结果中的 token"},"content":"确认发布的评论","confirm":true,"idempotencyKey":"publish-20260612-001"}'
 ```
 
@@ -134,13 +134,13 @@ curl -X POST http://localhost:4173/api/v1/xhs/comments/publish \
 ```bash
 curl -X POST http://localhost:4173/api/v1/xhs/posts/like \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: $XHS_API_TOKEN" \
+  -H "X-API-Key: $KATO_API_TOKEN" \
   -d '{"post":{"id":"笔记ID","url":"https://www.xiaohongshu.com/explore/笔记ID","xsecToken":"搜索结果中的 token"},"confirm":true,"idempotencyKey":"like-20260612-001"}'
 ```
 
 ## Serverx 舆情采集兼容接口
 
-这些接口用于让 `serverx` 直接接入 Kato，替换 TikHub 小红书采集。它们同样要求 `XHS_API_TOKEN`，并返回 `serverx` 舆情模块可直接归一化的字段。
+这些接口用于让 `serverx` 直接接入 Kato，替换 TikHub 小红书采集。它们同样要求 `KATO_API_TOKEN`，并返回 `serverx` 舆情模块可直接归一化的字段。
 
 根路径和 namespaced 路径都可用：
 
@@ -169,7 +169,7 @@ https://kato.itool.tech
 ```bash
 curl -X POST https://kato.itool.tech/search_notes \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: $XHS_API_TOKEN" \
+  -H "X-API-Key: $KATO_API_TOKEN" \
   -d '{"keyword":"提分侠","limit":20,"max_comments":20}'
 ```
 
@@ -180,7 +180,7 @@ curl -X POST https://kato.itool.tech/search_notes \
 ```bash
 curl -X POST https://kato.itool.tech/note_detail \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: $XHS_API_TOKEN" \
+  -H "X-API-Key: $KATO_API_TOKEN" \
   -d '{"note_id":"笔记ID","url":"https://www.xiaohongshu.com/explore/笔记ID","xsec_token":"搜索结果中的 token","max_comments":50}'
 ```
 
@@ -191,7 +191,7 @@ curl -X POST https://kato.itool.tech/note_detail \
 ```bash
 curl -X POST https://kato.itool.tech/note_comments \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: $XHS_API_TOKEN" \
+  -H "X-API-Key: $KATO_API_TOKEN" \
   -d '{"note_id":"笔记ID","url":"https://www.xiaohongshu.com/explore/笔记ID","xsec_token":"搜索结果中的 token","limit":50}'
 ```
 

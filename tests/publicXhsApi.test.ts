@@ -51,6 +51,43 @@ test("public XHS API searches posts with token and standard success envelope", a
   }
 });
 
+test("public XHS API accepts unified Kato token and legacy XHS token", async () => {
+  const fixture = createFixture();
+  const originalKatoToken = process.env.KATO_API_TOKEN;
+  const originalXhsToken = process.env.XHS_API_TOKEN;
+  process.env.KATO_API_TOKEN = "kato-token";
+  process.env.XHS_API_TOKEN = "legacy-token";
+  try {
+    const unified = await callApi(fixture.config, fixture.db, {
+      method: "POST",
+      pathname: "/api/v1/xhs/posts/search",
+      token: "kato-token",
+      body: { keywords: ["AI工具"], limit: 1 }
+    });
+    assert.equal(unified.status, 200);
+
+    const legacy = await callApi(fixture.config, fixture.db, {
+      method: "POST",
+      pathname: "/api/v1/xhs/posts/search",
+      token: "legacy-token",
+      body: { keywords: ["AI工具"], limit: 1 }
+    });
+    assert.equal(legacy.status, 200);
+
+    const wrong = await callApi(fixture.config, fixture.db, {
+      method: "POST",
+      pathname: "/api/v1/xhs/posts/search",
+      token: "wrong-token",
+      body: { keywords: ["AI工具"], limit: 1 }
+    });
+    assert.equal(wrong.status, 403);
+  } finally {
+    restoreEnv("KATO_API_TOKEN", originalKatoToken);
+    restoreEnv("XHS_API_TOKEN", originalXhsToken);
+    cleanupFixture(fixture);
+  }
+});
+
 test("public XHS API validates detail and publish guard fields", async () => {
   const fixture = createFixture();
   const originalToken = process.env.XHS_API_TOKEN;

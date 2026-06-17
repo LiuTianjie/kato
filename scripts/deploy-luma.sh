@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANIFEST="${MANIFEST:-$ROOT_DIR/deploy/kato.luma.yml}"
-XHS_API_TOKEN_VALUE="${XHS_API_TOKEN_VALUE:-LiuTao0.1}"
+KATO_API_TOKEN_VALUE="${KATO_API_TOKEN_VALUE:-LiuTao0.1}"
 ARK_API_KEY_VALUE="${ARK_API_KEY_VALUE:-${ARK_API_KEY:-}}"
 ARK_MODEL_VALUE="${ARK_MODEL_VALUE:-${ARK_MODEL:-}}"
 DEPLOY_TIMEOUT="${DEPLOY_TIMEOUT:-1800}"
@@ -36,7 +36,8 @@ set_or_require_secret() {
   exit 1
 }
 
-luma secret set XHS_API_TOKEN --value "$XHS_API_TOKEN_VALUE"
+luma secret set KATO_API_TOKEN --value "$KATO_API_TOKEN_VALUE"
+luma secret set XHS_API_TOKEN --value "$KATO_API_TOKEN_VALUE"
 set_or_require_secret ARK_API_KEY "$ARK_API_KEY_VALUE"
 set_or_require_secret ARK_MODEL "$ARK_MODEL_VALUE"
 

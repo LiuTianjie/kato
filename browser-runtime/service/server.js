@@ -24,6 +24,8 @@ const COOKIE_MIRROR_PATHS = uniquePaths([
 ]);
 const HEADLESS = stringEnv(["BROWSER_HEADLESS", "XHS_CHROMIUM_HEADLESS"], "0") === "1";
 const CHROME_NO_SANDBOX = stringEnv(["BROWSER_CHROME_NO_SANDBOX", "XHS_CHROME_NO_SANDBOX"], "1") === "1";
+const ENABLE_WEBGL = stringEnv(["BROWSER_ENABLE_WEBGL", "XHS_ENABLE_WEBGL"], "1") !== "0";
+const WEBGL_BACKEND = stringEnv(["BROWSER_WEBGL_BACKEND", "XHS_WEBGL_BACKEND"], "swiftshader");
 const ACCEPT_LANGUAGE = stringEnv(["BROWSER_ACCEPT_LANGUAGE", "XHS_BROWSER_ACCEPT_LANGUAGE"], "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7");
 const WINDOWS_PLATFORM_VERSION = stringEnv(["BROWSER_PLATFORM_VERSION", "XHS_BROWSER_PLATFORM_VERSION"], "10.0.0");
 const BROWSER_VERSION = detectChromeVersion();
@@ -367,6 +369,7 @@ async function launchChrome() {
   const args = [
     ...(HEADLESS ? ["--headless=new"] : []),
     ...(CHROME_NO_SANDBOX ? ["--no-sandbox"] : []),
+    ...webglArgs(),
     "--disable-dev-shm-usage",
     "--disable-notifications",
     "--disable-session-crashed-bubble",
@@ -394,6 +397,22 @@ async function launchChrome() {
     if (chromeProcess === child) chromeProcess = undefined;
   });
   await waitForCdpHttp(START_TIMEOUT_MS);
+}
+
+function webglArgs() {
+  if (!ENABLE_WEBGL) return [];
+  const base = [
+    "--enable-webgl",
+    "--enable-webgl2",
+    "--ignore-gpu-blocklist",
+    "--enable-unsafe-swiftshader",
+    "--disable-gpu-sandbox"
+  ];
+  if (WEBGL_BACKEND === "swiftshader") {
+    return [...base, "--use-gl=angle", "--use-angle=swiftshader"];
+  }
+  if (WEBGL_BACKEND) return [...base, `--use-gl=${WEBGL_BACKEND}`];
+  return base;
 }
 
 async function restartBrowser(reason = "manual") {

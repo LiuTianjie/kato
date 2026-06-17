@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createDouyinAdapter } from "../adapters/douyin.js";
+import { getRequestApiToken, isValidApiToken } from "./apiAuth.js";
 
 interface RouteOptions {
   signal?: AbortSignal;
@@ -23,7 +24,6 @@ class PublicRequestCancelledError extends Error {
   }
 }
 
-const DEFAULT_API_TOKEN = "LiuTao0.1";
 const FETCH_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_PUBLIC_FETCH_TIMEOUT_MS", 600_000);
 
 export async function handlePublicDouyinApi(req: IncomingMessage, res: ServerResponse, url: URL): Promise<boolean> {
@@ -206,10 +206,8 @@ async function parseServiceResponse(response: Response, endpoint: string): Promi
 }
 
 function assertAuthorized(req: IncomingMessage): void {
-  const expectedToken = process.env.XHS_API_TOKEN?.trim() || DEFAULT_API_TOKEN;
-  const authorization = req.headers.authorization ?? "";
-  const token = authorization.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "";
-  if (!token || token !== expectedToken) {
+  const token = getRequestApiToken(req);
+  if (!token || !isValidApiToken(token)) {
     throw new PublicApiError(401, "UNAUTHORIZED", "Missing or invalid API token.");
   }
 }

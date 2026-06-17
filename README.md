@@ -171,7 +171,7 @@ http://localhost:4173/api/v1/xhs/*
 启动前设置本地 API token：
 
 ```bash
-export XHS_API_TOKEN=change-me
+export KATO_API_TOKEN=change-me
 npm run dashboard
 ```
 
@@ -180,7 +180,7 @@ npm run dashboard
 ```bash
 curl -X POST http://localhost:4173/api/v1/xhs/posts/search \
   -H "Content-Type: application/json" \
-  -H "X-API-Key: $XHS_API_TOKEN" \
+  -H "X-API-Key: $KATO_API_TOKEN" \
   -d '{"keywords":["AI工具"],"limit":10}'
 ```
 
@@ -202,6 +202,8 @@ Kato 镜像只发布 `linux/amd64`。仓库内置一个可复用的 `browser-run
 | `bilibili-worker` | B站接口任务 | `18121` | `9245` | 关闭 |
 
 所有 runtime、CDP、VNC/noVNC 端口都只在容器内部使用；Luma 和生产环境只暴露 dashboard `4173`。平台 service 执行浏览器任务前会获取本平台 worker lease，任务结束、取消或超时后释放，避免多个任务互相重启或导航同一个 Chrome。
+
+Browser Runtime 默认启用 WebGL 并使用 Chrome 自带的 SwiftShader 软件渲染后端，适合 `linux/amd64` 容器没有真实 GPU 的部署环境。可通过 `BROWSER_ENABLE_WEBGL=0` 关闭，或用 `BROWSER_WEBGL_BACKEND` 调整后端；本地 Docker on Mac 跑 amd64 镜像时可能因 Rosetta/容器组合只拿到 WebGL1，线上原生 amd64 Linux 会少一层模拟。
 
 单独构建基础 runtime：
 
@@ -235,12 +237,12 @@ ARK_MODEL_VALUE=your-ark-model-or-endpoint \
 ./scripts/deploy-luma.sh
 ```
 
-脚本会写入 `XHS_API_TOKEN` secret，默认值是 `LiuTao0.1`。生产评论生成还需要 Luma secret `ARK_API_KEY` 和 `ARK_MODEL`；第一次部署可以通过上面的环境变量写入，后续如果 secret 已存在，直接运行脚本即可。
+脚本会写入统一的 `KATO_API_TOKEN` secret，默认值是 `LiuTao0.1`，并同步写入旧名 `XHS_API_TOKEN` 作为兼容别名。生产评论生成还需要 Luma secret `ARK_API_KEY` 和 `ARK_MODEL`；第一次部署可以通过上面的环境变量写入，后续如果 secret 已存在，直接运行脚本即可。
 
 需要覆盖 REST API token 时：
 
 ```bash
-XHS_API_TOKEN_VALUE=your-token ./scripts/deploy-luma.sh
+KATO_API_TOKEN_VALUE=your-token ./scripts/deploy-luma.sh
 ```
 
 只做校验和 dry-run：

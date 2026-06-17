@@ -8,6 +8,23 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <section class="login-gate" id="loginGate" aria-label="Kato Console 登录">
+      <form class="login-card" id="loginForm">
+        <div class="brand login-brand">
+          <span class="brand-mark">R</span>
+          <div>
+            <h1>Kato Console</h1>
+            <p>统一 API Token 登录</p>
+          </div>
+        </div>
+        <label class="field">
+          <span>Kato API Token</span>
+          <input id="apiTokenInput" type="password" autocomplete="current-password" placeholder="输入 Kato API Token" />
+        </label>
+        <button class="primary full" id="loginButton" type="submit">登录控制台</button>
+        <div class="run-message" id="loginMessage"></div>
+      </form>
+    </section>
     <main class="shell">
       <aside class="rail">
         <div class="brand">
@@ -33,6 +50,7 @@
           <button class="secondary full" id="openCdpLogin">打开小红书登录</button>
           <button class="secondary full" data-open-platform-login="douyin" type="button">打开抖音登录</button>
           <button class="secondary full" data-open-platform-login="bilibili" type="button">打开 B站登录</button>
+          <button class="secondary ghost full" id="logoutConsole" type="button">退出控制台</button>
           <button class="danger ghost full" id="restartMcpBrowser">重启浏览器</button>
         </section>
 

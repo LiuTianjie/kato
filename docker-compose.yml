@@ -15,6 +15,7 @@ services:
       - ./mcp/xiaohongshu/images:/app/mcp/xiaohongshu/images
     environment:
       - PORT=4173
+      - KATO_API_TOKEN=${KATO_API_TOKEN:-LiuTao0.1}
       - XHS_SERVICE_PORT=18060
       - DOUYIN_SERVICE_PORT=18070
       - BILIBILI_SERVICE_PORT=18080

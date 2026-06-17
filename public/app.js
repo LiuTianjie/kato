@@ -1,4 +1,4 @@
-import { dashboardApi } from "./js/api.js";
+import { dashboardApi, getApiToken, setApiToken } from "./js/api.js";
 import { $, $$ } from "./js/dom.js";
 import {
   renderDebugScreenshots,
@@ -36,8 +36,7 @@ configureNotes({
   onToggleNote: operations.toggleNote,
 });
 
-await refreshAll();
-await refreshMcp($("refreshMcp"));
+await bootstrapAuth();
 
 function bindEvents() {
   bindTabs();
@@ -46,8 +45,14 @@ function bindEvents() {
   bindPlatformLoginActions();
   bindContentWorkspace();
   bindPostSearch();
+  window.addEventListener("kato:unauthorized", () => {
+    setApiToken("");
+    showLogin(true);
+  });
   $("refreshAll").addEventListener("click", () => withButtonLoading($("refreshAll"), "刷新中", refreshAll));
   $("refreshMcp").addEventListener("click", () => refreshMcp($("refreshMcp")));
+  $("loginForm").addEventListener("submit", loginConsole);
+  $("logoutConsole").addEventListener("click", logoutConsole);
   $("openCdpLogin").addEventListener("click", () => openCdpLogin($("openCdpLogin")));
   $("restartMcpBrowser").addEventListener("click", () => restartMcpBrowser($("restartMcpBrowser")));
   $("startRun").addEventListener("click", () => operations.startRun($("startRun")));
@@ -69,6 +74,56 @@ function bindEvents() {
     operations.generatePublishSelected($("generatePublishSelected"))
   );
   $("skipSelected").addEventListener("click", () => operations.bulkStatus($("skipSelected"), "skipped"));
+}
+
+async function bootstrapAuth() {
+  const token = getApiToken();
+  if (token) $("apiTokenInput").value = token;
+  try {
+    if (!token) throw new Error("missing token");
+    const status = await dashboardApi.getAuthStatus();
+    if (!status.authenticated) throw new Error("invalid token");
+    showLogin(false);
+    await refreshAll();
+    await refreshMcp($("refreshMcp"));
+  } catch {
+    showLogin(true);
+  }
+}
+
+async function loginConsole(event) {
+  event.preventDefault();
+  const token = $("apiTokenInput").value.trim();
+  const message = $("loginMessage");
+  message.textContent = "";
+  if (!token) {
+    message.textContent = "请输入 Kato API Token";
+    return;
+  }
+  try {
+    setApiToken(token);
+    await dashboardApi.login(token);
+    showLogin(false);
+    appendClientLog("成功 · Kato Console 已登录");
+    await refreshAll();
+    await refreshMcp($("refreshMcp"));
+  } catch (error) {
+    setApiToken("");
+    message.textContent = error instanceof Error ? error.message : String(error);
+    showLogin(true);
+  }
+}
+
+function logoutConsole() {
+  setApiToken("");
+  appendClientLog("提示 · 已退出 Kato Console");
+  showLogin(true);
+}
+
+function showLogin(show) {
+  $("loginGate").classList.toggle("is-hidden", !show);
+  document.body.classList.toggle("is-authenticated", !show);
+  if (show) $("apiTokenInput").focus();
 }
 
 async function refreshAll() {
