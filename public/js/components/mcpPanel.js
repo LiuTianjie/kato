@@ -256,15 +256,15 @@ function renderWorkerQueueStatus(platform) {
   const state = !isHealthy ? "warn" : isBusy ? "busy" : "ok";
   const statusText = !isHealthy ? "异常" : isBusy ? "忙碌" : "空闲";
   const summary = [
-    `pending ${pending}${queue.maxPending ? `/${queue.maxPending}` : ""}`,
-    `active ${active?.label || "无"}`,
-    `generation ${queue.generation ?? "-"}`
+    `排队 ${pending}${queue.maxPending ? ` / 最多 ${queue.maxPending}` : ""}`,
+    `运行 ${active?.label || "无"}`
   ];
   const runtimeDetails = [
-    `lease ${lease.active ? `${lease.owner || "runtime"}:${lease.label || ""}` : "无"}`,
-    `chrome ${chromeRunning ? "on" : "off"}`,
-    `cdp ${cdpReady ? "ready" : "down"}`,
-    runtime.chrome?.pid ? `pid ${runtime.chrome.pid}` : ""
+    `Lease ${lease.active ? `${lease.owner || "runtime"}:${lease.label || ""}` : "无"}`,
+    `Chrome ${chromeRunning ? "运行中" : "未运行"}`,
+    `CDP ${cdpReady ? "就绪" : "断开"}`,
+    `重置代数 ${queue.generation ?? "-"}`,
+    runtime.chrome?.pid ? `PID ${runtime.chrome.pid}` : ""
   ].filter(Boolean);
   const tasks = Array.isArray(queue.tasks) ? queue.tasks : [];
   const recent = Array.isArray(queue.recent) ? queue.recent : [];
@@ -274,14 +274,16 @@ function renderWorkerQueueStatus(platform) {
       <div class="worker-platform-head">
         <div class="worker-platform-title">
           <h4>${escapeHtml(label)}</h4>
-          <p>${escapeHtml(summary.join(" · "))}</p>
+          <p>${escapeHtml(runtimeDetails.join(" · "))}${error ? ` · ${escapeHtml(error)}` : ""}</p>
         </div>
-        <strong>${escapeHtml(statusText)}</strong>
-        <button class="secondary small" data-open-platform-worker-challenge="${escapeHtml(platform.platform)}" type="button">打开 Worker 验证</button>
-        <button class="secondary small" data-recover-platform-worker="${escapeHtml(platform.platform)}" type="button">重置队列 / 重启 Worker</button>
+        <span class="worker-status-pill ${state}">${escapeHtml(statusText)}</span>
+        <div class="worker-platform-actions">
+          <button class="secondary small" data-open-platform-worker-challenge="${escapeHtml(platform.platform)}" type="button">打开 Worker 验证</button>
+          <button class="secondary small danger-soft" data-recover-platform-worker="${escapeHtml(platform.platform)}" type="button">重启 Worker</button>
+        </div>
       </div>
-      <div class="worker-runtime-line" title="${escapeHtml(runtimeDetails.join(" · "))}${error ? ` · ${escapeHtml(error)}` : ""}">
-        ${escapeHtml(runtimeDetails.join(" · "))}${error ? ` · ${escapeHtml(error)}` : ""}
+      <div class="worker-metrics" aria-label="${escapeHtml(label)} worker 指标">
+        ${summary.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}
       </div>
       ${renderCurrentWorkerTasks(tasks)}
       ${renderRecentWorkerTasks(recent)}

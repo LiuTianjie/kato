@@ -734,25 +734,29 @@
 
 .worker-queue-grid {
   display: grid;
-  gap: 12px;
+  gap: 10px;
 }
 
 .worker-platform-tabs {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 12px;
+  gap: 6px;
+  margin-bottom: 10px;
+  padding: 4px;
+  border: 1px solid rgba(25, 31, 40, 0.08);
+  border-radius: 8px;
+  background: rgba(246, 248, 251, 0.72);
 }
 
 .worker-platform-tab {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  min-height: 34px;
-  padding: 7px 11px;
-  border: 1px solid var(--line);
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px solid transparent;
   border-radius: 8px;
-  background: rgba(246, 248, 251, 0.82);
+  background: transparent;
   color: var(--ink);
   font-size: 12px;
   font-weight: 900;
@@ -781,7 +785,7 @@
   border-color: rgba(25, 31, 40, 0.42);
   background: var(--ink);
   color: #f7f9fc;
-  box-shadow: 0 10px 24px rgba(25, 31, 40, 0.14);
+  box-shadow: 0 8px 18px rgba(25, 31, 40, 0.12);
 }
 
 .worker-platform-tab.active strong {
@@ -790,18 +794,20 @@
 
 .worker-platform-card {
   display: grid;
-  gap: 10px;
+  gap: 9px;
   min-width: 0;
-  padding: 12px;
+  padding: 12px 14px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.82);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(248, 250, 252, 0.86)),
+    rgba(255, 255, 255, 0.86);
 }
 
 .worker-platform-head {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
-  gap: 10px;
+  gap: 12px;
   align-items: center;
 }
 
@@ -814,12 +820,11 @@
 .worker-platform-title h4 {
   margin: 0;
   color: var(--ink);
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 900;
 }
 
 .worker-platform-title p,
-.worker-runtime-line,
 .worker-task-recent summary {
   margin: 0;
   color: var(--muted);
@@ -827,33 +832,80 @@
   font-weight: 760;
 }
 
-.worker-platform-card strong {
-  color: var(--ink);
-  font-size: 12px;
-  font-weight: 900;
-}
-
-.worker-platform-card.ok strong {
-  color: var(--green);
-}
-
-.worker-platform-card.warn strong {
-  color: #a46a12;
-}
-
-.worker-platform-card.busy strong {
-  color: #c94c55;
-}
-
-.worker-runtime-line {
+.worker-platform-title p {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.worker-status-pill {
+  display: inline-grid;
+  place-items: center;
+  min-width: 46px;
+  height: 26px;
+  padding: 0 9px;
+  border-radius: 999px;
+  background: rgba(25, 31, 40, 0.06);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.worker-status-pill.ok {
+  background: rgba(44, 150, 108, 0.1);
+  color: var(--green);
+}
+
+.worker-status-pill.warn {
+  background: rgba(164, 106, 18, 0.12);
+  color: #a46a12;
+}
+
+.worker-status-pill.busy {
+  background: rgba(201, 76, 85, 0.1);
+  color: #c94c55;
+}
+
+.worker-platform-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.worker-platform-actions .secondary {
+  min-height: 30px;
+  padding: 6px 10px;
+}
+
+.danger-soft {
+  color: #9f313b;
+  background: rgba(201, 76, 85, 0.07);
+  border-color: rgba(201, 76, 85, 0.18);
+}
+
+.worker-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.worker-metrics span {
+  display: inline-flex;
+  min-height: 24px;
+  align-items: center;
+  padding: 3px 8px;
+  border: 1px solid rgba(25, 31, 40, 0.08);
+  border-radius: 999px;
+  background: rgba(246, 248, 251, 0.78);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 850;
+}
+
 .worker-task-table {
   display: grid;
-  gap: 6px;
+  gap: 5px;
 }
 
 .worker-task-row {
@@ -861,11 +913,11 @@
   grid-template-columns: 64px 76px minmax(160px, 1fr) 74px 74px 120px minmax(160px, 1.2fr);
   gap: 8px;
   align-items: center;
-  min-height: 34px;
-  padding: 7px 8px;
-  border: 1px solid rgba(25, 31, 40, 0.1);
+  min-height: 32px;
+  padding: 6px 8px;
+  border: 1px solid rgba(25, 31, 40, 0.08);
   border-radius: 7px;
-  background: rgba(246, 248, 251, 0.78);
+  background: rgba(246, 248, 251, 0.66);
 }
 
 .worker-task-row.is-head {
@@ -897,18 +949,24 @@
 }
 
 .worker-task-empty {
-  padding: 10px;
+  padding: 14px 12px;
   border: 1px dashed rgba(25, 31, 40, 0.16);
   border-radius: 8px;
   color: var(--muted);
-  background: rgba(246, 248, 251, 0.54);
+  background: rgba(246, 248, 251, 0.48);
   font-size: 12px;
-  font-weight: 760;
+  font-weight: 850;
+  text-align: center;
 }
 
 .worker-task-recent {
   display: grid;
   gap: 6px;
+}
+
+.worker-task-recent summary {
+  cursor: pointer;
+  user-select: none;
 }
 
 .worker-platform-card.is-checking strong::before {
