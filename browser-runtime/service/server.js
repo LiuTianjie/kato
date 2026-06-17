@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { connect as connectTcp } from "node:net";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { execFileSync, spawn } from "node:child_process";
 import path from "node:path";
 
@@ -26,13 +26,44 @@ const HEADLESS = stringEnv(["BROWSER_HEADLESS", "XHS_CHROMIUM_HEADLESS"], "0") =
 const CHROME_NO_SANDBOX = stringEnv(["BROWSER_CHROME_NO_SANDBOX", "XHS_CHROME_NO_SANDBOX"], "1") === "1";
 const ENABLE_WEBGL = stringEnv(["BROWSER_ENABLE_WEBGL", "XHS_ENABLE_WEBGL"], "1") !== "0";
 const WEBGL_BACKEND = stringEnv(["BROWSER_WEBGL_BACKEND", "XHS_WEBGL_BACKEND"], "swiftshader");
+const BLOCK_EXTERNAL_PROTOCOLS = stringEnv(["BROWSER_BLOCK_EXTERNAL_PROTOCOLS"], "1") !== "0";
+const FINGERPRINT_ENABLED = stringEnv(["BROWSER_FINGERPRINT_ENABLED", "XHS_BROWSER_FINGERPRINT_ENABLED"], "1") !== "0";
+const FINGERPRINT_INTERVAL_MS = numberEnv(["BROWSER_FINGERPRINT_INTERVAL_MS"], 2_000);
+const EXTERNAL_PROTOCOL_SCHEMES = stringEnv(
+  ["BROWSER_EXTERNAL_PROTOCOL_SCHEMES"],
+  "douyin,snssdk1128,snssdk2329,snssdk1233,aweme,bytedance,iesdouyin,xhsdiscover,xiaohongshu,bilibili,bilibiliapp,intent"
+)
+  .split(",")
+  .map((item) => item.trim().toLowerCase())
+  .filter(Boolean);
 const ACCEPT_LANGUAGE = stringEnv(["BROWSER_ACCEPT_LANGUAGE", "XHS_BROWSER_ACCEPT_LANGUAGE"], "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7");
+const NAVIGATOR_PLATFORM = stringEnv(["BROWSER_NAVIGATOR_PLATFORM", "XHS_NAVIGATOR_PLATFORM"], "Win32");
 const WINDOWS_PLATFORM_VERSION = stringEnv(["BROWSER_PLATFORM_VERSION", "XHS_BROWSER_PLATFORM_VERSION"], "10.0.0");
 const BROWSER_VERSION = detectChromeVersion();
 const BROWSER_MAJOR_VERSION = stringEnv(["BROWSER_MAJOR_VERSION", "XHS_BROWSER_MAJOR_VERSION"], BROWSER_VERSION.major);
 const USER_AGENT =
   stringEnv(["BROWSER_USER_AGENT", "XHS_BROWSER_USER_AGENT"], "") ||
   `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${BROWSER_VERSION.full} Safari/537.36`;
+const USER_AGENT_METADATA = {
+  brands: [
+    { brand: "Google Chrome", version: BROWSER_MAJOR_VERSION },
+    { brand: "Chromium", version: BROWSER_MAJOR_VERSION },
+    { brand: "Not/A)Brand", version: "24" }
+  ],
+  fullVersionList: [
+    { brand: "Google Chrome", version: BROWSER_VERSION.full },
+    { brand: "Chromium", version: BROWSER_VERSION.full },
+    { brand: "Not/A)Brand", version: "24.0.0.0" }
+  ],
+  fullVersion: BROWSER_VERSION.full,
+  platform: "Windows",
+  platformVersion: WINDOWS_PLATFORM_VERSION,
+  architecture: "x86",
+  bitness: "64",
+  model: "",
+  mobile: false,
+  wow64: false
+};
 const START_TIMEOUT_MS = numberEnv(["BROWSER_START_TIMEOUT_MS", "XHS_HEALTH_ENSURE_TIMEOUT_MS"], 20_000);
 const RESTART_TIMEOUT_MS = numberEnv(["BROWSER_RESTART_TIMEOUT_MS", "XHS_BROWSER_RESTART_TIMEOUT_MS"], 120_000);
 const PROCESS_EXIT_GRACE_MS = numberEnv(["BROWSER_PROCESS_EXIT_GRACE_MS", "XHS_PROCESS_EXIT_GRACE_MS"], 2_000);
@@ -49,6 +80,8 @@ let chromeProcess;
 let restartPromise;
 let ensureBrowserPromise;
 let activeLease;
+let fingerprintSupervisorTimer;
+let fingerprintedTargets = new Set();
 
 const server = createServer(async (req, res) => {
   try {
@@ -343,12 +376,19 @@ async function ensureBrowser() {
   ensureBrowserPromise = (async () => {
     const running = chromeProcess && chromeProcess.exitCode === null && chromeProcess.signalCode === null;
     const cdpReady = (await isHttpReady(`http://127.0.0.1:${CDP_PORT}/json/version`, 600)).ok;
-    if (running && cdpReady) return;
+    if (running && cdpReady) {
+      startFingerprintSupervisor();
+      return;
+    }
     if (!running && cdpReady) {
       serviceLog("warn", "chrome", "CDP is already ready but runtime has no Chrome process handle; reusing existing browser.", {
         cdp: `${CDP_HOST}:${CDP_PORT}`,
         profileDir: PROFILE_DIR
       });
+      await applyFingerprintToAllPageTargets("reuse").catch((error) => {
+        serviceLog("warn", "fingerprint", `Browser fingerprint apply on reused CDP failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+      startFingerprintSupervisor();
       return;
     }
     if (running && !cdpReady) {
@@ -394,9 +434,17 @@ async function launchChrome() {
   captureChildLogs(child, "chrome");
   child.on("exit", (code) => {
     serviceLog("error", "chrome", `Chrome exited with code ${code ?? "unknown"}.`);
-    if (chromeProcess === child) chromeProcess = undefined;
+    if (chromeProcess === child) {
+      chromeProcess = undefined;
+      stopFingerprintSupervisor();
+    }
   });
   await waitForCdpHttp(START_TIMEOUT_MS);
+  fingerprintedTargets = new Set();
+  await applyFingerprintToAllPageTargets("launch").catch((error) => {
+    serviceLog("warn", "fingerprint", `Initial browser fingerprint apply failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
+  startFingerprintSupervisor();
 }
 
 function webglArgs() {
@@ -421,6 +469,8 @@ async function restartBrowser(reason = "manual") {
     serviceLog("warn", "chrome", `Restarting Chrome: ${reason}`);
     const oldProcess = chromeProcess;
     chromeProcess = undefined;
+    stopFingerprintSupervisor();
+    fingerprintedTargets = new Set();
     if (oldProcess) {
       terminateProcess(oldProcess, reason);
       await waitForProcessExit(oldProcess, PROCESS_EXIT_GRACE_MS + 500).catch(() => undefined);
@@ -473,6 +523,9 @@ async function navigateWithCdp(url) {
   const pages = Array.isArray(targets) ? targets.filter((item) => item?.type === "page" && item.webSocketDebuggerUrl) : [];
   const page = pickViewerPageTarget(pages);
   if (!page?.webSocketDebuggerUrl) throw new Error("No Chrome page target is available.");
+  await applyFingerprintToPageTarget(page, "navigate").catch((error) => {
+    serviceLog("warn", "fingerprint", `Viewer fingerprint apply failed before navigation: ${error instanceof Error ? error.message : String(error)}`);
+  });
   await sendCdpCommand(page.webSocketDebuggerUrl, "Page.enable", {}).catch(() => undefined);
   await sendCdpCommand(page.webSocketDebuggerUrl, "Page.bringToFront", {}).catch(() => undefined);
   await sendCdpCommand(page.webSocketDebuggerUrl, "Page.navigate", { url });
@@ -485,6 +538,127 @@ function pickViewerPageTarget(pages) {
     return !value.startsWith("devtools://") && !value.startsWith("chrome-extension://");
   });
   return normalPages.at(-1) || pages.at(-1);
+}
+
+function startFingerprintSupervisor() {
+  if (!FINGERPRINT_ENABLED || fingerprintSupervisorTimer) return;
+  fingerprintSupervisorTimer = setInterval(() => {
+    applyFingerprintToAllPageTargets("supervisor").catch((error) => {
+      serviceLog("warn", "fingerprint", `Browser fingerprint supervisor failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }, FINGERPRINT_INTERVAL_MS);
+  fingerprintSupervisorTimer.unref?.();
+}
+
+function stopFingerprintSupervisor() {
+  if (!fingerprintSupervisorTimer) return;
+  clearInterval(fingerprintSupervisorTimer);
+  fingerprintSupervisorTimer = undefined;
+}
+
+async function applyFingerprintToAllPageTargets(reason) {
+  if (!FINGERPRINT_ENABLED) return;
+  const targets = await fetchJson(`http://127.0.0.1:${CDP_PORT}/json/list`);
+  const pages = Array.isArray(targets) ? targets.filter((item) => item?.type === "page" && item.webSocketDebuggerUrl) : [];
+  await Promise.all(pages.map((page) => applyFingerprintToPageTarget(page, reason)));
+}
+
+async function applyFingerprintToPageTarget(page, reason) {
+  if (!FINGERPRINT_ENABLED || !page?.webSocketDebuggerUrl) return;
+  const targetKey = String(page.id || page.webSocketDebuggerUrl);
+  const alreadyInitialized = fingerprintedTargets.has(targetKey);
+  await sendCdpCommand(page.webSocketDebuggerUrl, "Network.enable", {}).catch(() => undefined);
+  await setUserAgentOverride(page.webSocketDebuggerUrl);
+  await sendCdpCommand(page.webSocketDebuggerUrl, "Emulation.setLocaleOverride", { locale: "zh-CN" }).catch(() => undefined);
+  await sendCdpCommand(page.webSocketDebuggerUrl, "Page.enable", {}).catch(() => undefined);
+  const source = browserFingerprintSource();
+  if (!alreadyInitialized) {
+    await sendCdpCommand(page.webSocketDebuggerUrl, "Page.addScriptToEvaluateOnNewDocument", { source });
+    fingerprintedTargets.add(targetKey);
+    serviceLog("info", "fingerprint", "Applied browser fingerprint init script.", {
+      target: targetKey,
+      reason,
+      platform: NAVIGATOR_PLATFORM,
+      userAgent: redactUserAgent(USER_AGENT)
+    });
+  }
+  await sendCdpCommand(page.webSocketDebuggerUrl, "Runtime.enable", {}).catch(() => undefined);
+  await sendCdpCommand(page.webSocketDebuggerUrl, "Runtime.evaluate", {
+    expression: source,
+    awaitPromise: false,
+    returnByValue: true
+  }).catch((error) => {
+    serviceLog("warn", "fingerprint", `Runtime fingerprint patch failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
+}
+
+async function setUserAgentOverride(webSocketDebuggerUrl) {
+  const params = {
+    userAgent: USER_AGENT,
+    acceptLanguage: ACCEPT_LANGUAGE,
+    platform: "Windows",
+    userAgentMetadata: USER_AGENT_METADATA
+  };
+  try {
+    await sendCdpCommand(webSocketDebuggerUrl, "Network.setUserAgentOverride", params);
+  } catch (error) {
+    serviceLog("warn", "fingerprint", `UA metadata override failed; retrying basic UA override: ${error instanceof Error ? error.message : String(error)}`);
+    await sendCdpCommand(webSocketDebuggerUrl, "Network.setUserAgentOverride", {
+      userAgent: USER_AGENT,
+      acceptLanguage: ACCEPT_LANGUAGE,
+      platform: "Windows"
+    });
+  }
+}
+
+function browserFingerprintSource() {
+  return `(() => {
+    const userAgent = ${JSON.stringify(USER_AGENT)};
+    const platform = ${JSON.stringify(NAVIGATOR_PLATFORM)};
+    const platformVersion = ${JSON.stringify(WINDOWS_PLATFORM_VERSION)};
+    const languages = ${JSON.stringify(["zh-CN", "zh", "en-US", "en"])};
+    const brands = ${JSON.stringify(USER_AGENT_METADATA.brands)};
+    const fullVersionList = ${JSON.stringify(USER_AGENT_METADATA.fullVersionList)};
+    const defineGetter = (target, key, value) => {
+      try {
+        Object.defineProperty(target, key, { get: () => value, configurable: true });
+      } catch {}
+    };
+    defineGetter(Navigator.prototype, "platform", platform);
+    defineGetter(Navigator.prototype, "userAgent", userAgent);
+    defineGetter(Navigator.prototype, "appVersion", userAgent.replace(/^Mozilla\\//, ""));
+    defineGetter(Navigator.prototype, "languages", languages);
+    defineGetter(Navigator.prototype, "language", languages[0]);
+    defineGetter(Navigator.prototype, "webdriver", undefined);
+    defineGetter(Navigator.prototype, "maxTouchPoints", 0);
+    defineGetter(Navigator.prototype, "hardwareConcurrency", 12);
+    defineGetter(Navigator.prototype, "deviceMemory", 8);
+    const userAgentData = {
+      brands,
+      mobile: false,
+      platform: "Windows",
+      getHighEntropyValues: async (hints = []) => {
+        const values = {
+          brands,
+          mobile: false,
+          platform: "Windows",
+          architecture: "x86",
+          bitness: "64",
+          model: "",
+          platformVersion,
+          uaFullVersion: fullVersionList[0]?.version || "",
+          fullVersionList
+        };
+        return Object.fromEntries(hints.map((hint) => [hint, values[hint]]).filter(([, value]) => value !== undefined));
+      },
+      toJSON: () => ({ brands, mobile: false, platform: "Windows" })
+    };
+    defineGetter(Navigator.prototype, "userAgentData", userAgentData);
+  })()`;
+}
+
+function redactUserAgent(userAgent) {
+  return String(userAgent || "").replace(/Chrome\/[\d.]+/i, "Chrome/[version]");
 }
 
 async function navigateWithXdotool(url) {
@@ -629,6 +803,10 @@ async function persistCookies(cookies) {
 async function ensureRuntimeDirs() {
   await mkdir(PROFILE_DIR, { recursive: true });
   await mkdir(path.dirname(COOKIES_PATH), { recursive: true });
+  if (BLOCK_EXTERNAL_PROTOCOLS) {
+    await ensureChromeManagedPolicy();
+    await ensureChromeProfilePreferences();
+  }
   if (CHROME_USER) {
     try {
       execFileSync("chown", ["-R", `${CHROME_USER}:${CHROME_USER}`, PROFILE_DIR, path.dirname(COOKIES_PATH)], {
@@ -647,6 +825,61 @@ async function clearStaleProfileLocks() {
       rm(path.join(PROFILE_DIR, name), { force: true, recursive: true }).catch(() => undefined)
     )
   );
+}
+
+async function ensureChromeManagedPolicy() {
+  const policyDir = "/etc/opt/chrome/policies/managed";
+  const policyPath = path.join(policyDir, "kato-browser-runtime.json");
+  const urlBlocklist = EXTERNAL_PROTOCOL_SCHEMES.map((scheme) => `${scheme}://*`);
+  try {
+    await mkdir(policyDir, { recursive: true });
+    await writeFile(
+      policyPath,
+      `${JSON.stringify(
+        {
+          URLBlocklist: urlBlocklist,
+          AutoLaunchProtocolsFromOrigins: []
+        },
+        null,
+        2
+      )}\n`,
+      "utf8"
+    );
+  } catch (error) {
+    serviceLog("warn", "chrome", `Unable to write Chrome managed policy: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function ensureChromeProfilePreferences() {
+  const defaultProfileDir = path.join(PROFILE_DIR, "Default");
+  const preferencesPath = path.join(defaultProfileDir, "Preferences");
+  try {
+    await mkdir(defaultProfileDir, { recursive: true });
+    const preferences = await readJsonFile(preferencesPath);
+    const excludedSchemes = Object.fromEntries(EXTERNAL_PROTOCOL_SCHEMES.map((scheme) => [scheme, true]));
+    preferences.protocol_handler = {
+      ...(preferences.protocol_handler || {}),
+      excluded_schemes: {
+        ...(preferences.protocol_handler?.excluded_schemes || {}),
+        ...excludedSchemes
+      }
+    };
+    preferences.custom_handlers = {
+      ...(preferences.custom_handlers || {}),
+      enabled: false
+    };
+    await writeFile(preferencesPath, `${JSON.stringify(preferences, null, 2)}\n`, "utf8");
+  } catch (error) {
+    serviceLog("warn", "chrome", `Unable to write Chrome profile preferences: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function readJsonFile(filePath) {
+  try {
+    return JSON.parse(await readFile(filePath, "utf8"));
+  } catch {
+    return {};
+  }
 }
 
 function captureChildLogs(child, source) {
@@ -880,6 +1113,7 @@ function uniquePaths(paths) {
 
 async function shutdown() {
   server.close();
+  stopFingerprintSupervisor();
   if (chromeProcess) terminateProcess(chromeProcess, "shutdown");
   for (const supervisor of [vncSupervisor, noVncSupervisor]) {
     if (!supervisor) continue;
