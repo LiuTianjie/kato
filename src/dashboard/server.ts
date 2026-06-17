@@ -39,7 +39,9 @@ const bilibiliServiceUrl = process.env.BILIBILI_SERVICE_URL || `http://127.0.0.1
 const defaultNoVncHost = process.env.BROWSER_NOVNC_HOST || process.env.XHS_NOVNC_HOST || "127.0.0.1";
 const legacyCdpLoginEnabled =
   process.env.KATO_ENABLE_LEGACY_CDP_LOGIN === "1" || process.env.XHS_LEGACY_CDP_LOGIN_ENABLED === "1";
-const noVncViewerTickets = new Map<string, { platform: PlatformId; expiresAt: number }>();
+type RuntimeKind = "viewer" | "worker";
+
+const noVncViewerTickets = new Map<string, { platform: PlatformId; kind: RuntimeKind; expiresAt: number }>();
 const NO_VNC_VIEWER_TICKET_TTL_MS = 12 * 60 * 60 * 1000;
 
 const server = createServer(async (req, res) => {
@@ -196,13 +198,15 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
   if (req.method === "POST" && url.pathname === "/api/browser-viewer/open") {
     const body = await readJson(req);
     const platform = getPlatformSpec(body.platform);
+    const kind = normalizeRuntimeKind(body.kind ?? body.runtimeKind);
     const targetUrl = normalizePlatformViewerUrl(platform, String(body.url ?? body.query ?? ""));
-    await postRuntimeJson(platform.viewerRuntimeUrl || defaultBrowserRuntimeUrl, "/browser/open", { url: targetUrl }, 45_000);
-    await waitForBrowserViewerReady(platform.id, 10_000);
+    await postRuntimeJson(runtimeUrlForKind(platform, kind), "/browser/open", { url: targetUrl }, 45_000);
+    await waitForBrowserViewerReady(platform.id, kind, 10_000);
     sendJson(res, 200, {
       opened: true,
       platform: platform.id,
-      viewerUrl: noVncViewerUrl(platform.id),
+      kind,
+      viewerUrl: noVncViewerUrl(platform.id, kind),
       loginUrl: targetUrl,
       homeUrl: platform.homeUrl
     });
@@ -628,8 +632,9 @@ function isLeaseBusyError(error: unknown): boolean {
 async function runBrowserViewerAction(body: Record<string, unknown>): Promise<{ ok: true }> {
   const action = String(body.action ?? "");
   const platform = getPlatformSpec(body.platform);
+  const kind = normalizeRuntimeKind(body.kind ?? body.runtimeKind);
   const payload = action === "navigate" ? { ...body, url: normalizePlatformViewerUrl(platform, String(body.url ?? "")) } : body;
-  await postRuntimeJson(platform.viewerRuntimeUrl || defaultBrowserRuntimeUrl, "/browser/action", payload, 20_000);
+  await postRuntimeJson(runtimeUrlForKind(platform, kind), "/browser/action", payload, 20_000);
   return { ok: true };
 }
 
@@ -687,13 +692,13 @@ function runtimeLogTargets(platform: ReturnType<typeof getPlatformSpec>, kindPar
   return targets;
 }
 
-async function waitForBrowserViewerReady(platform: PlatformId, timeoutMs: number): Promise<void> {
+async function waitForBrowserViewerReady(platform: PlatformId, kind: RuntimeKind, timeoutMs: number): Promise<void> {
   const spec = getPlatformSpec(platform);
   const deadline = Date.now() + timeoutMs;
   let lastError = "";
   while (Date.now() < deadline) {
     try {
-      const runtime = await fetchRuntimeJson(spec.viewerRuntimeUrl || defaultBrowserRuntimeUrl, "/health?ensure=1", 3_000);
+      const runtime = await fetchRuntimeJson(runtimeUrlForKind(spec, kind), "/health?ensure=1", 3_000);
       const ready = (runtime as { runtime?: { noVnc?: { ready?: boolean } } }).runtime?.noVnc?.ready === true;
       if (ready) return;
       lastError = "runtime noVNC not ready";
@@ -766,34 +771,36 @@ function proxyNoVncUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer, u
   socket.on("error", close);
 }
 
-function noVncViewerUrl(platform: PlatformId): string {
-  const ticket = createNoVncViewerTicket(platform);
-  const websocketPath = `novnc/${platform}/websockify?kato_viewer_ticket=${encodeURIComponent(ticket)}`;
+function noVncViewerUrl(platform: PlatformId, kind: RuntimeKind): string {
+  const ticket = createNoVncViewerTicket(platform, kind);
+  const websocketPath = `novnc/${platform}/${kind}/websockify?kato_viewer_ticket=${encodeURIComponent(ticket)}`;
   const query = new URLSearchParams({
     autoconnect: "1",
     resize: "scale",
     path: websocketPath,
     kato_viewer_ticket: ticket
   });
-  return `/novnc/${platform}/vnc.html?${query.toString()}`;
+  return `/novnc/${platform}/${kind}/vnc.html?${query.toString()}`;
 }
 
 function noVncTarget(url: URL): { host: string; port: number; path: string } {
   const parts = url.pathname.split("/").filter(Boolean);
   const parsedPlatform = parts[0] === "novnc" ? parts[1] : "";
   const platform = (parsedPlatform === "douyin" || parsedPlatform === "bilibili" || parsedPlatform === "xhs" ? parsedPlatform : "xhs") as PlatformId;
-  const rest = platform === parsedPlatform ? parts.slice(2) : parts.slice(1);
+  const maybeKind = platform === parsedPlatform ? parts[2] : "";
+  const kind = normalizeRuntimeKind(maybeKind);
+  const rest = platform === parsedPlatform ? (maybeKind === "viewer" || maybeKind === "worker" ? parts.slice(3) : parts.slice(2)) : parts.slice(1);
   return {
     host: defaultNoVncHost,
-    port: noVncPortForPlatform(platform),
+    port: noVncPortForPlatform(platform, kind),
     path: `/${rest.join("/") || ""}${url.search}`
   };
 }
 
-function createNoVncViewerTicket(platform: PlatformId): string {
+function createNoVncViewerTicket(platform: PlatformId, kind: RuntimeKind): string {
   cleanupNoVncViewerTickets();
   const ticket = randomUUID();
-  noVncViewerTickets.set(ticket, { platform, expiresAt: Date.now() + NO_VNC_VIEWER_TICKET_TTL_MS });
+  noVncViewerTickets.set(ticket, { platform, kind, expiresAt: Date.now() + NO_VNC_VIEWER_TICKET_TTL_MS });
   return ticket;
 }
 
@@ -819,19 +826,38 @@ function isAuthorizedNoVncRequest(req: IncomingMessage, url: URL): boolean {
     noVncViewerTickets.delete(ticket);
     return false;
   }
-  return state.platform === platformFromNoVncUrl(url);
+  const target = platformAndKindFromNoVncUrl(url);
+  return state.platform === target.platform && state.kind === target.kind;
 }
 
 function platformFromNoVncUrl(url: URL): PlatformId {
-  const parts = url.pathname.split("/").filter(Boolean);
-  const parsedPlatform = parts[0] === "novnc" ? parts[1] : "";
-  return (parsedPlatform === "douyin" || parsedPlatform === "bilibili" || parsedPlatform === "xhs" ? parsedPlatform : "xhs") as PlatformId;
+  return platformAndKindFromNoVncUrl(url).platform;
 }
 
-function noVncPortForPlatform(platform: PlatformId): number {
-  if (platform === "douyin") return Number(process.env.DOUYIN_VIEWER_NOVNC_PORT || 6090);
-  if (platform === "bilibili") return Number(process.env.BILIBILI_VIEWER_NOVNC_PORT || 6100);
+function platformAndKindFromNoVncUrl(url: URL): { platform: PlatformId; kind: RuntimeKind } {
+  const parts = url.pathname.split("/").filter(Boolean);
+  const parsedPlatform = parts[0] === "novnc" ? parts[1] : "";
+  const platform = (parsedPlatform === "douyin" || parsedPlatform === "bilibili" || parsedPlatform === "xhs" ? parsedPlatform : "xhs") as PlatformId;
+  return { platform, kind: normalizeRuntimeKind(platform === parsedPlatform ? parts[2] : undefined) };
+}
+
+function noVncPortForPlatform(platform: PlatformId, kind: RuntimeKind): number {
+  if (platform === "douyin") {
+    return kind === "worker" ? Number(process.env.DOUYIN_WORKER_NOVNC_PORT || 6091) : Number(process.env.DOUYIN_VIEWER_NOVNC_PORT || 6090);
+  }
+  if (platform === "bilibili") {
+    return kind === "worker" ? Number(process.env.BILIBILI_WORKER_NOVNC_PORT || 6101) : Number(process.env.BILIBILI_VIEWER_NOVNC_PORT || 6100);
+  }
+  if (kind === "worker") return Number(process.env.XHS_WORKER_NOVNC_PORT || 6081);
   return Number(process.env.XHS_VIEWER_NOVNC_PORT || process.env.BROWSER_NOVNC_PORT || process.env.XHS_NOVNC_PORT || 6080);
+}
+
+function normalizeRuntimeKind(value: unknown): RuntimeKind {
+  return String(value || "").trim().toLowerCase() === "worker" ? "worker" : "viewer";
+}
+
+function runtimeUrlForKind(platform: ReturnType<typeof getPlatformSpec>, kind: RuntimeKind): string {
+  return kind === "worker" ? platform.workerRuntimeUrl || platform.viewerRuntimeUrl || defaultBrowserRuntimeUrl : platform.viewerRuntimeUrl || defaultBrowserRuntimeUrl;
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {

@@ -59,18 +59,31 @@ export async function openPlatformLogin(platform, button) {
 }
 
 export async function openPlatformChallenge(platform, button) {
+  return openPlatformChallengeRuntime(platform, "viewer", button);
+}
+
+export async function openPlatformWorkerChallenge(platform, button) {
+  return openPlatformChallengeRuntime(platform, "worker", button);
+}
+
+async function openPlatformChallengeRuntime(platform, kind, button) {
   const label = platformLabel(platform);
   const url = platformChallengeUrl(platform);
-  appendClientLog(`开始 · 打开${label}验证页`);
+  const kindLabel = kind === "worker" ? "Worker " : "";
+  appendClientLog(`开始 · 打开${label}${kindLabel}验证页`);
   return withButtonLoading(button, "打开中", async () => {
     try {
-      setChallengeFlowStatus(`${label}验证页已打开，通过后点击同步状态`);
-      appendClientLog(`提示 · 请在 noVNC 中完成${label}验证码/安全验证，通过后点击“同步状态”`);
+      setChallengeFlowStatus(`${label}${kindLabel}验证页已打开`);
+      appendClientLog(
+        kind === "worker"
+          ? `提示 · 这是接口任务实际使用的${label} Worker 浏览器。请在 noVNC 中完成验证，通过后直接重试任务。`
+          : `提示 · 请在 noVNC 中完成${label}验证码/安全验证，通过后点击“同步状态”`
+      );
       activateTab("browser");
-      await openPlatformViewer(platform, { url });
+      await openPlatformViewer(platform, { url, kind });
     } catch (error) {
-      setChallengeFlowStatus(`${label}验证页打开失败`);
-      appendClientLog(`失败 · 打开${label}验证页：${errorMessage(error)}`);
+      setChallengeFlowStatus(`${label}${kindLabel}验证页打开失败`);
+      appendClientLog(`失败 · 打开${label}${kindLabel}验证页：${errorMessage(error)}`);
     }
   });
 }
@@ -137,6 +150,9 @@ export function bindPlatformLoginActions() {
   });
   $$("[data-open-platform-challenge]").forEach((button) => {
     button.addEventListener("click", () => openPlatformChallenge(button.dataset.openPlatformChallenge, button));
+  });
+  $$("[data-open-platform-worker-challenge]").forEach((button) => {
+    button.addEventListener("click", () => openPlatformWorkerChallenge(button.dataset.openPlatformWorkerChallenge, button));
   });
   $$("[data-sync-platform-cookies]").forEach((button) => {
     button.addEventListener("click", () => syncPlatformCookies(button.dataset.syncPlatformCookies, button));
@@ -221,6 +237,9 @@ function bindWorkerRecoveryButtons(root) {
   root.querySelectorAll("[data-recover-platform-worker]").forEach((button) => {
     button.addEventListener("click", () => recoverPlatformWorker(button.dataset.recoverPlatformWorker, button));
   });
+  root.querySelectorAll("[data-open-platform-worker-challenge]").forEach((button) => {
+    button.addEventListener("click", () => openPlatformWorkerChallenge(button.dataset.openPlatformWorkerChallenge, button));
+  });
 }
 
 function renderWorkerQueueStatus(platform) {
@@ -258,6 +277,7 @@ function renderWorkerQueueStatus(platform) {
           <p>${escapeHtml(summary.join(" · "))}</p>
         </div>
         <strong>${escapeHtml(statusText)}</strong>
+        <button class="secondary small" data-open-platform-worker-challenge="${escapeHtml(platform.platform)}" type="button">打开 Worker 验证</button>
         <button class="secondary small" data-recover-platform-worker="${escapeHtml(platform.platform)}" type="button">重置队列 / 重启 Worker</button>
       </div>
       <div class="worker-runtime-line" title="${escapeHtml(runtimeDetails.join(" · "))}${error ? ` · ${escapeHtml(error)}` : ""}">

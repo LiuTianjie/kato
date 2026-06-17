@@ -5,6 +5,8 @@ import { appendClientLog } from "./logPanel.js";
 
 let connected = false;
 let viewerUrl = "";
+let currentPlatform = "xhs";
+let currentKind = "viewer";
 const DEFAULT_VIEWER_URL = "/novnc/vnc.html?autoconnect=1&resize=scale&path=novnc/websockify";
 
 export function bindCdpViewer() {
@@ -30,7 +32,7 @@ export async function connectCdpViewer(options = {}) {
 }
 
 export async function openPlatformViewer(platform, options = {}) {
-  return openBrowserViewer({ platform, url: options.url || "" }, { ...options, force: true });
+  return openBrowserViewer({ platform, kind: options.kind || "viewer", url: options.url || "" }, { ...options, force: true });
 }
 
 async function openBrowserViewer(body = {}, options = {}) {
@@ -39,21 +41,24 @@ async function openBrowserViewer(body = {}, options = {}) {
     clearViewerFrame();
   }
   connected = true;
+  currentPlatform = body.platform || currentPlatform || "xhs";
+  currentKind = body.kind || currentKind || "viewer";
   setViewerStatus("连接中");
   const platformLabel = platformDisplayName(body.platform);
-  appendClientLog(platformLabel ? `开始 · 打开${platformLabel}登录页面` : "开始 · 连接容器浏览器远程画面");
+  const kindLabel = body.kind === "worker" ? "Worker " : "";
+  appendClientLog(platformLabel ? `开始 · 打开${platformLabel}${kindLabel}浏览器` : "开始 · 连接容器浏览器远程画面");
   try {
     const result = await dashboardApi.openBrowserViewer(body);
     viewerUrl = withViewerNonce(result.viewerUrl || DEFAULT_VIEWER_URL);
     ensureViewerFrame(viewerUrl);
     setAddressValue(result.loginUrl || result.homeUrl || "https://www.xiaohongshu.com/explore");
     setViewerStatus("noVNC 已打开");
-    appendClientLog(platformLabel ? `成功 · ${platformLabel}页面已在 noVNC 中打开` : "成功 · 已打开 noVNC 浏览器画面");
+    appendClientLog(platformLabel ? `成功 · ${platformLabel}${kindLabel}页面已在 noVNC 中打开` : "成功 · 已打开 noVNC 浏览器画面");
   } catch (error) {
     connected = false;
     clearViewerFrame();
     setViewerStatus(`连接失败：${errorMessage(error)}`, true);
-    appendClientLog(platformLabel ? `失败 · 打开${platformLabel}页面：${errorMessage(error)}` : `失败 · 容器浏览器远程画面：${errorMessage(error)}`);
+    appendClientLog(platformLabel ? `失败 · 打开${platformLabel}${kindLabel}页面：${errorMessage(error)}` : `失败 · 容器浏览器远程画面：${errorMessage(error)}`);
   }
 }
 
@@ -74,7 +79,7 @@ async function runBrowserAction(action, extra = {}) {
   setViewerStatus(action === "navigate" ? "打开中" : "处理中");
   setNavButtonsBusy(true);
   try {
-    await dashboardApi.sendBrowserViewerAction({ action, ...extra });
+    await dashboardApi.sendBrowserViewerAction({ platform: currentPlatform, kind: currentKind, action, ...extra });
     if (action === "navigate") setAddressValue(extra.url || "");
     setViewerStatus("noVNC 已打开");
   } catch (error) {

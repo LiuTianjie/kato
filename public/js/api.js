@@ -14,11 +14,21 @@ export async function api(path, options = {}) {
   if (response.status === 401) {
     const error = new Error(data.error?.message || data.message || "需要登录 Kato Console");
     error.status = 401;
-    window.dispatchEvent(new CustomEvent("kato:unauthorized", { detail: { path, message: error.message } }));
+    if (shouldLogoutConsole(path, data, options)) {
+      window.dispatchEvent(new CustomEvent("kato:unauthorized", { detail: { path, message: error.message } }));
+    }
     throw error;
   }
   if (!response.ok) throw new Error(data.error?.message || data.error || `HTTP ${response.status}`);
   return data;
+}
+
+function shouldLogoutConsole(path, data, options = {}) {
+  if (options.logoutOnUnauthorized === false) return false;
+  const code = data?.error?.code || data?.code || "";
+  if (path === "/api/auth/login") return false;
+  if (path === "/api/auth/status") return true;
+  return code === "UNAUTHORIZED" && /Kato API token|invalid Kato|Missing or invalid/i.test(String(data?.error?.message || data?.message || ""));
 }
 
 export function getApiToken() {
@@ -32,7 +42,7 @@ export function setApiToken(token) {
 }
 
 export const dashboardApi = {
-  login: (token) => api("/api/auth/login", { method: "POST", body: { token }, headers: {} }),
+  login: (token) => api("/api/auth/login", { method: "POST", body: { token }, headers: {}, logoutOnUnauthorized: false }),
   getAuthStatus: () => api("/api/auth/status"),
   getPlatforms: () => api("/api/platforms"),
   getPlatformLoginStatuses: () => api("/api/platforms/login-status"),
