@@ -52,14 +52,16 @@ async function loginConsole(event) {
   try {
     setApiToken(token);
     await dashboardApi.login(token);
-    showLogin(false);
-    appendClientLog("成功 · Kato Console 已登录");
-    await refreshAll();
   } catch (error) {
     setApiToken("");
     message.textContent = error instanceof Error ? error.message : String(error);
     showLogin(true);
+    return;
   }
+
+  showLogin(false);
+  appendClientLog("成功 · Kato Console 已登录");
+  await refreshAll();
 }
 
 function logoutConsole() {
