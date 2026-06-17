@@ -83,6 +83,7 @@
 
         <nav class="tabs" aria-label="工作区">
           <button class="tab active" data-tab="queue">互动队列</button>
+          <button class="tab" data-tab="tasks">任务队列</button>
           <button class="tab" data-tab="search">帖子搜索</button>
           <button class="tab" data-tab="browser">浏览器接管</button>
           <button class="tab" data-tab="content">内容生产</button>
@@ -122,6 +123,29 @@
             </div>
 
             <div class="queue-list" id="queue"></div>
+          </section>
+        </section>
+
+        <section class="tab-panel" id="tab-tasks">
+          <section class="card worker-task-card">
+            <div class="card-head">
+              <div>
+                <h3>任务队列</h3>
+                <p>查看各平台 worker 的排队、运行、lease、浏览器状态和最近任务</p>
+              </div>
+              <div class="debug-actions">
+                <span id="workerQueueStatus">等待刷新</span>
+                <button class="secondary" id="refreshWorkerQueues" type="button">刷新队列</button>
+              </div>
+            </div>
+            <div class="worker-queue-grid" id="workerQueueList">
+              <div class="worker-platform-card is-checking">
+                <div class="worker-platform-head">
+                  <span>Worker</span>
+                  <strong>检查中</strong>
+                </div>
+              </div>
+            </div>
           </section>
         </section>
 
@@ -207,21 +231,6 @@
                   <span>B站</span>
                   <button class="secondary small" data-open-platform-challenge="bilibili" type="button">打开验证页</button>
                   <button class="secondary small" data-sync-platform-cookies="bilibili" type="button">同步状态</button>
-                </div>
-              </div>
-            </div>
-            <div class="browser-worker-panel" aria-label="Worker 队列状态">
-              <div class="worker-panel-head">
-                <div>
-                  <strong>Worker 队列</strong>
-                  <span id="workerQueueStatus">查看接口任务是否排队、卡住或占用浏览器。</span>
-                </div>
-                <button class="secondary small" id="refreshWorkerQueues" type="button">刷新队列</button>
-              </div>
-              <div class="worker-queue-grid" id="workerQueueList">
-                <div class="worker-queue-row is-checking">
-                  <span>Worker</span>
-                  <strong>检查中</strong>
                 </div>
               </div>
             </div>

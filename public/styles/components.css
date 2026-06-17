@@ -677,95 +677,135 @@
   font-weight: 900;
 }
 
-.browser-worker-panel {
-  display: grid;
-  gap: 8px;
-  padding: 9px 12px;
-  border-bottom: 1px solid var(--line);
-  background: rgba(246, 248, 251, 0.74);
-}
-
-.worker-panel-head {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: space-between;
-  align-items: center;
-  gap: 8px;
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.worker-panel-head > div {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-}
-
-.worker-panel-head strong {
-  color: var(--ink);
-  font-size: 13px;
-  font-weight: 900;
-}
-
 .worker-queue-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(190px, 1fr));
-  gap: 8px;
+  gap: 12px;
 }
 
-.worker-queue-row {
+.worker-platform-card {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 5px 8px;
-  align-items: center;
+  gap: 10px;
   min-width: 0;
-  padding: 8px;
+  padding: 12px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.78);
+  background: rgba(255, 255, 255, 0.82);
 }
 
-.worker-queue-row span {
+.worker-platform-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.worker-platform-title {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.worker-platform-title h4 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 900;
+}
+
+.worker-platform-title p,
+.worker-runtime-line,
+.worker-task-recent summary {
+  margin: 0;
   color: var(--muted);
   font-size: 11px;
-  font-weight: 850;
+  font-weight: 760;
 }
 
-.worker-queue-row strong {
-  justify-self: end;
+.worker-platform-card strong {
   color: var(--ink);
   font-size: 12px;
   font-weight: 900;
 }
 
-.worker-queue-row small {
-  grid-column: 1 / -1;
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1.45;
-}
-
-.worker-queue-row button {
-  grid-column: 1 / -1;
-  justify-self: end;
-}
-
-.worker-queue-row.ok strong {
+.worker-platform-card.ok strong {
   color: var(--green);
 }
 
-.worker-queue-row.warn strong {
+.worker-platform-card.warn strong {
   color: #a46a12;
 }
 
-.worker-queue-row.busy strong {
+.worker-platform-card.busy strong {
   color: #c94c55;
 }
 
-.worker-queue-row.is-checking strong::before {
+.worker-runtime-line {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.worker-task-table {
+  display: grid;
+  gap: 6px;
+}
+
+.worker-task-row {
+  display: grid;
+  grid-template-columns: 64px 76px minmax(160px, 1fr) 74px 74px 120px minmax(160px, 1.2fr);
+  gap: 8px;
+  align-items: center;
+  min-height: 34px;
+  padding: 7px 8px;
+  border: 1px solid rgba(25, 31, 40, 0.1);
+  border-radius: 7px;
+  background: rgba(246, 248, 251, 0.78);
+}
+
+.worker-task-row.is-head {
+  min-height: auto;
+  padding: 0 8px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.worker-task-row span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 760;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.worker-task-row .task-muted {
+  color: var(--muted);
+}
+
+.worker-task-row .task-bad {
+  color: #c94c55;
+}
+
+.worker-task-empty {
+  padding: 10px;
+  border: 1px dashed rgba(25, 31, 40, 0.16);
+  border-radius: 8px;
+  color: var(--muted);
+  background: rgba(246, 248, 251, 0.54);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.worker-task-recent {
+  display: grid;
+  gap: 6px;
+}
+
+.worker-platform-card.is-checking strong::before {
   content: "";
   display: inline-block;
   width: 10px;
@@ -1610,6 +1650,10 @@
   .row-actions {
     justify-content: flex-start;
   }
+
+  .worker-task-row {
+    grid-template-columns: 52px 64px minmax(120px, 1fr) 60px 60px 90px minmax(120px, 1fr);
+  }
 }
 
 @media (max-width: 760px) {
@@ -1668,6 +1712,19 @@
   .row-actions {
     display: grid;
     min-width: 0;
+  }
+
+  .worker-platform-head,
+  .worker-task-row {
+    grid-template-columns: 1fr;
+  }
+
+  .worker-task-row.is-head {
+    display: none;
+  }
+
+  .worker-task-row span {
+    white-space: normal;
   }
 
   .challenge-flow-row {

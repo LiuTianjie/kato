@@ -194,7 +194,7 @@ async function loadWorkerQueues(list) {
     const busyCount = platforms.filter((platform) => platform.queue?.active || Number(platform.queue?.pending || 0) > 0).length;
     setWorkerQueueStatus(busyCount ? `${busyCount} 个平台 worker 正在执行或排队` : "所有平台 worker 空闲");
   } catch (error) {
-    list.innerHTML = `<div class="worker-queue-row warn"><span>Worker</span><strong>不可用</strong><small>${escapeHtml(errorMessage(error))}</small></div>`;
+    list.innerHTML = `<article class="worker-platform-card warn"><div class="worker-platform-head"><div class="worker-platform-title"><h4>Worker</h4><p>${escapeHtml(errorMessage(error))}</p></div><strong>不可用</strong></div></article>`;
     setWorkerQueueStatus("Worker 队列状态读取失败");
   }
 }
@@ -218,21 +218,123 @@ function renderWorkerQueueStatus(platform) {
   const isHealthy = platform.service?.ok !== false && runtime.ok !== false && (chromeRunning || cdpReady);
   const state = !isHealthy ? "warn" : isBusy ? "busy" : "ok";
   const statusText = !isHealthy ? "异常" : isBusy ? "忙碌" : "空闲";
-  const details = [
+  const summary = [
     `pending ${pending}${queue.maxPending ? `/${queue.maxPending}` : ""}`,
     `active ${active?.label || "无"}`,
-    `lease ${lease.active ? `${lease.owner || "runtime"}:${lease.label || ""}` : "无"}`,
-    `chrome ${chromeRunning ? "on" : "off"} / cdp ${cdpReady ? "ready" : "down"}`
+    `generation ${queue.generation ?? "-"}`
   ];
+  const runtimeDetails = [
+    `lease ${lease.active ? `${lease.owner || "runtime"}:${lease.label || ""}` : "无"}`,
+    `chrome ${chromeRunning ? "on" : "off"}`,
+    `cdp ${cdpReady ? "ready" : "down"}`,
+    runtime.chrome?.pid ? `pid ${runtime.chrome.pid}` : ""
+  ].filter(Boolean);
+  const tasks = Array.isArray(queue.tasks) ? queue.tasks : [];
+  const recent = Array.isArray(queue.recent) ? queue.recent : [];
   const error = platform.service?.error || runtime.error;
   return `
-    <div class="worker-queue-row ${state}">
-      <span>${escapeHtml(label)}</span>
-      <strong>${escapeHtml(statusText)}</strong>
-      <small>${escapeHtml(details.join(" · "))}${error ? `<br>${escapeHtml(error)}` : ""}</small>
-      <button class="secondary small" data-recover-platform-worker="${escapeHtml(platform.platform)}" type="button">重置队列 / 重启 Worker</button>
+    <article class="worker-platform-card ${state}">
+      <div class="worker-platform-head">
+        <div class="worker-platform-title">
+          <h4>${escapeHtml(label)}</h4>
+          <p>${escapeHtml(summary.join(" · "))}</p>
+        </div>
+        <strong>${escapeHtml(statusText)}</strong>
+        <button class="secondary small" data-recover-platform-worker="${escapeHtml(platform.platform)}" type="button">重置队列 / 重启 Worker</button>
+      </div>
+      <div class="worker-runtime-line" title="${escapeHtml(runtimeDetails.join(" · "))}${error ? ` · ${escapeHtml(error)}` : ""}">
+        ${escapeHtml(runtimeDetails.join(" · "))}${error ? ` · ${escapeHtml(error)}` : ""}
+      </div>
+      ${renderCurrentWorkerTasks(tasks)}
+      ${renderRecentWorkerTasks(recent)}
+    </article>
+  `;
+}
+
+function renderCurrentWorkerTasks(tasks) {
+  if (!tasks.length) {
+    return `<div class="worker-task-empty">当前没有运行中或排队中的任务。</div>`;
+  }
+  return `
+    <div class="worker-task-table" aria-label="当前 worker 任务">
+      <div class="worker-task-row is-head">
+        <span>ID</span>
+        <span>状态</span>
+        <span>任务</span>
+        <span>等待</span>
+        <span>运行</span>
+        <span>Lease</span>
+        <span>信息</span>
+      </div>
+      ${tasks.map(renderWorkerTaskRow).join("")}
     </div>
   `;
+}
+
+function renderRecentWorkerTasks(tasks) {
+  if (!tasks.length) return "";
+  return `
+    <details class="worker-task-recent">
+      <summary>最近完成 / 失败任务（${tasks.length}）</summary>
+      <div class="worker-task-table">
+        ${tasks.slice(0, 8).map(renderWorkerTaskRow).join("")}
+      </div>
+    </details>
+  `;
+}
+
+function renderWorkerTaskRow(task) {
+  const status = workerTaskStatusLabel(task.status);
+  const info = task.cancelReason || task.error || task.finishedAt || task.queuedAt || "";
+  const badClass = task.status === "failed" || task.status === "cancelled" || task.cancelled ? " task-bad" : "";
+  return `
+    <div class="worker-task-row" title="${escapeHtml(workerTaskTitle(task))}">
+      <span>#${escapeHtml(String(task.id ?? "-"))}</span>
+      <span class="${badClass.trim()}">${escapeHtml(status)}</span>
+      <span>${escapeHtml(task.label || "-")}</span>
+      <span class="task-muted">${escapeHtml(formatMs(task.waitMs ?? task.ageMs))}</span>
+      <span class="task-muted">${escapeHtml(formatMs(task.activeMs ?? task.durationMs))}</span>
+      <span class="task-muted">${escapeHtml(task.leaseId ? String(task.leaseId).slice(0, 12) : "无")}</span>
+      <span class="${badClass.trim()}">${escapeHtml(String(info || "-"))}</span>
+    </div>
+  `;
+}
+
+function workerTaskStatusLabel(status) {
+  if (status === "queued") return "排队";
+  if (status === "running") return "运行";
+  if (status === "cancelling") return "取消中";
+  if (status === "completed") return "完成";
+  if (status === "failed") return "失败";
+  if (status === "cancelled") return "取消";
+  return status || "未知";
+}
+
+function workerTaskTitle(task) {
+  return [
+    `id=${task.id ?? "-"}`,
+    `label=${task.label || "-"}`,
+    `status=${task.status || "-"}`,
+    `queuedAt=${task.queuedAt || "-"}`,
+    task.startedAt ? `startedAt=${task.startedAt}` : "",
+    task.finishedAt ? `finishedAt=${task.finishedAt}` : "",
+    task.leaseId ? `lease=${task.leaseId}` : "",
+    task.cancelReason ? `cancel=${task.cancelReason}` : "",
+    task.error ? `error=${task.error}` : ""
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function formatMs(value) {
+  const ms = Number(value || 0);
+  if (!Number.isFinite(ms) || ms <= 0) return "-";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const seconds = Math.round(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return rest ? `${minutes}m${rest}s` : `${minutes}m`;
 }
 
 function platformLabel(platform) {

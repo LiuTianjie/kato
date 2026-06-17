@@ -49,6 +49,7 @@ const HUMAN_DELAY_ENABLED = process.env.XHS_HUMAN_DELAY_ENABLED !== "0";
 const BROWSER_TASK_DELAY_MIN_MS = normalizeNonNegativeEnv("XHS_BROWSER_TASK_DELAY_MIN_MS", 900);
 const BROWSER_TASK_DELAY_MAX_MS = normalizeDelayMax("XHS_BROWSER_TASK_DELAY_MAX_MS", 2_800, BROWSER_TASK_DELAY_MIN_MS);
 const BROWSER_QUEUE_MAX_PENDING = normalizePositiveEnv("XHS_BROWSER_QUEUE_MAX_PENDING", 12);
+const BROWSER_QUEUE_RECENT_LIMIT = normalizePositiveEnv("XHS_BROWSER_QUEUE_RECENT_LIMIT", 24);
 const BROWSER_ACTION_DELAY_MIN_MS = normalizeNonNegativeEnv("XHS_BROWSER_ACTION_DELAY_MIN_MS", 260);
 const BROWSER_ACTION_DELAY_MAX_MS = normalizeDelayMax("XHS_BROWSER_ACTION_DELAY_MAX_MS", 1_100, BROWSER_ACTION_DELAY_MIN_MS);
 const BROWSER_TYPE_DELAY_MIN_MS = normalizeNonNegativeEnv("XHS_BROWSER_TYPE_DELAY_MIN_MS", 45);
@@ -98,6 +99,8 @@ let browserTaskGeneration = 0;
 let browserTaskPending = 0;
 let browserTaskActive = null;
 let browserTaskActiveContext = null;
+let browserTaskRecords = new Map();
+let browserTaskRecent = [];
 let browserPriorityPromise;
 let cookiePersistTimer;
 let lastStorageSyncAt = null;
@@ -480,6 +483,7 @@ function enqueueBrowserTask(label, task, options = {}) {
   const timeoutMs = normalizePositiveInt(options.timeoutMs, BROWSER_TASK_TIMEOUT_MS);
   const queuedAt = Date.now();
   const taskContext = createBrowserTaskContext(id, label, options.signal);
+  trackBrowserTask({ id, label, status: "queued", queuedAt: new Date(queuedAt).toISOString(), timeoutMs, generation });
   browserTaskPending += 1;
 
   const run = async () => {
@@ -490,6 +494,8 @@ function enqueueBrowserTask(label, task, options = {}) {
       removedFromPending = true;
     };
     let markCancelled;
+    let finalStatus = "completed";
+    let finalError = "";
     try {
       if (generation !== browserTaskGeneration) {
         removeFromPending();
@@ -498,28 +504,41 @@ function enqueueBrowserTask(label, task, options = {}) {
       if (browserPriorityPromise) await waitForAbortable(browserPriorityPromise.catch(() => undefined), taskContext);
       removeFromPending();
       taskContext.throwIfCancelled();
-      browserTaskActive = { id, label, startedAt: new Date().toISOString(), cancelled: false };
+      const startedAt = new Date().toISOString();
+      browserTaskActive = { id, label, startedAt, cancelled: false };
       browserTaskActiveContext = taskContext;
       markCancelled = () => {
         if (browserTaskActive?.id !== id) return;
         browserTaskActive.cancelled = true;
         browserTaskActive.cancelReason = abortReasonMessage(taskContext.signal);
+        updateBrowserTaskRecord(id, { status: "cancelling", cancelled: true, cancelReason: browserTaskActive.cancelReason });
         serviceLog("warn", "queue", `Browser task #${id} cancelled: ${label}.`, {
           reason: browserTaskActive.cancelReason
         });
       };
       taskContext.signal.addEventListener("abort", markCancelled, { once: true });
       const waitedMs = Date.now() - queuedAt;
+      updateBrowserTaskRecord(id, { status: "running", startedAt, waitMs: waitedMs });
       serviceLog("info", "queue", `Browser task #${id} started: ${label}.`, { waitedMs, pending: browserTaskPending });
       const jitterMs = await humanDelay(`task:${label}`, BROWSER_TASK_DELAY_MIN_MS, BROWSER_TASK_DELAY_MAX_MS, {
         log: true,
         signal: taskContext.signal
       });
-      if (jitterMs > 0 && browserTaskActive?.id === id) browserTaskActive.delayMs = jitterMs;
+      if (jitterMs > 0 && browserTaskActive?.id === id) {
+        browserTaskActive.delayMs = jitterMs;
+        updateBrowserTaskRecord(id, { delayMs: jitterMs });
+      }
       const lease = await acquireRuntimeLease(label, timeoutMs, taskContext);
       taskContext.leaseId = lease.leaseId;
-      if (browserTaskActive?.id === id) browserTaskActive.leaseId = lease.leaseId;
+      if (browserTaskActive?.id === id) {
+        browserTaskActive.leaseId = lease.leaseId;
+        updateBrowserTaskRecord(id, { leaseId: lease.leaseId });
+      }
       return await runBrowserTaskWithTimeout(label, task, timeoutMs, taskContext);
+    } catch (error) {
+      finalStatus = error instanceof BrowserTaskCancelledError ? "cancelled" : "failed";
+      finalError = error instanceof Error ? error.message : String(error);
+      throw error;
     } finally {
       removeFromPending();
       const activeMs = browserTaskActive?.id === id ? Date.now() - Date.parse(browserTaskActive.startedAt) : 0;
@@ -529,6 +548,7 @@ function enqueueBrowserTask(label, task, options = {}) {
         browserTaskActive = null;
         browserTaskActiveContext = null;
       }
+      finishBrowserTaskRecord(id, finalStatus, { error: finalError, activeMs });
       await closeTaskServicePage(taskContext, "task finished").catch(() => undefined);
       await releaseRuntimeLease(taskContext.leaseId).catch(() => undefined);
     }
@@ -544,7 +564,11 @@ function resetBrowserTaskQueue(reason) {
   browserTaskGeneration += 1;
   browserTaskPending = 0;
   browserTaskTail = Promise.resolve();
+  for (const record of Array.from(browserTaskRecords.values())) {
+    if (record.status === "queued") finishBrowserTaskRecord(record.id, "cancelled", { cancelReason: `queue reset: ${reason}` });
+  }
   if (browserTaskActiveContext) {
+    updateBrowserTaskRecord(browserTaskActiveContext.id, { status: "cancelling", cancelled: true, cancelReason: `queue reset: ${reason}` });
     browserTaskActiveContext.abort(new BrowserTaskCancelledError(`Browser task queue reset: ${reason}`));
   }
   serviceLog("warn", "queue", "XHS browser task queue reset.", { reason, previous, generation: browserTaskGeneration });
@@ -654,11 +678,49 @@ async function waitForAbortable(promise, taskContext) {
 }
 
 function browserQueueSummary() {
+  const tasks = Array.from(browserTaskRecords.values())
+    .map(browserTaskSnapshot)
+    .sort((a, b) => Number(a.id) - Number(b.id));
   return {
     pending: browserTaskPending,
     maxPending: BROWSER_QUEUE_MAX_PENDING,
     active: browserTaskActive,
-    generation: browserTaskGeneration
+    generation: browserTaskGeneration,
+    tasks,
+    recent: browserTaskRecent.slice(0, BROWSER_QUEUE_RECENT_LIMIT)
+  };
+}
+
+function trackBrowserTask(record) {
+  browserTaskRecords.set(record.id, { ...record });
+}
+
+function updateBrowserTaskRecord(id, patch) {
+  const record = browserTaskRecords.get(id);
+  if (!record) return;
+  Object.assign(record, patch);
+}
+
+function finishBrowserTaskRecord(id, status, extra = {}) {
+  const record = browserTaskRecords.get(id);
+  if (!record) return;
+  const finishedAt = new Date().toISOString();
+  const snapshot = browserTaskSnapshot({ ...record, ...extra, status, finishedAt });
+  browserTaskRecords.delete(id);
+  browserTaskRecent.unshift(snapshot);
+  if (browserTaskRecent.length > BROWSER_QUEUE_RECENT_LIMIT) browserTaskRecent = browserTaskRecent.slice(0, BROWSER_QUEUE_RECENT_LIMIT);
+}
+
+function browserTaskSnapshot(record) {
+  const now = Date.now();
+  const queuedAtMs = Date.parse(record.queuedAt) || now;
+  const startedAtMs = record.startedAt ? Date.parse(record.startedAt) : 0;
+  const finishedAtMs = record.finishedAt ? Date.parse(record.finishedAt) : 0;
+  return {
+    ...record,
+    ageMs: Math.max(0, (finishedAtMs || now) - queuedAtMs),
+    waitMs: record.waitMs ?? Math.max(0, (startedAtMs || now) - queuedAtMs),
+    activeMs: record.activeMs ?? (startedAtMs ? Math.max(0, (finishedAtMs || now) - startedAtMs) : 0)
   };
 }
 
