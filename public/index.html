@@ -11,7 +11,7 @@
     <section class="login-gate" id="loginGate" aria-label="Kato Console 登录">
       <form class="login-card" id="loginForm">
         <div class="brand login-brand">
-          <span class="brand-mark">R</span>
+          <span class="brand-mark">K</span>
           <div>
             <h1>Kato Console</h1>
             <p>统一 API Token 登录</p>
@@ -25,25 +25,26 @@
         <div class="run-message" id="loginMessage"></div>
       </form>
     </section>
+
     <main class="shell">
       <aside class="rail">
         <div class="brand">
-          <span class="brand-mark">R</span>
+          <span class="brand-mark">K</span>
           <div>
             <h1>Kato Console</h1>
-            <p>小红书运营工作台</p>
+            <p>ServerX 采集接口平台</p>
           </div>
         </div>
 
         <section class="panel mcp-panel">
           <div class="panel-title">
-            <span>账号 / MCP</span>
-            <button class="icon-button" id="refreshMcp" title="刷新登录状态">↻</button>
+            <span>平台登录态</span>
+            <button class="icon-button" id="refreshMcp" title="刷新平台状态">↻</button>
           </div>
           <div class="mcp-state" id="mcpState">检查中</div>
           <div class="platform-login-list" id="platformLoginList" aria-live="polite">
             <div class="platform-login-row is-checking">
-              <span>平台登录态</span>
+              <span>平台</span>
               <strong>检查中</strong>
             </div>
           </div>
@@ -51,78 +52,53 @@
           <button class="secondary full" data-open-platform-login="douyin" type="button">打开抖音登录</button>
           <button class="secondary full" data-open-platform-login="bilibili" type="button">打开 B站登录</button>
           <button class="secondary ghost full" id="logoutConsole" type="button">退出控制台</button>
-          <button class="danger ghost full" id="restartMcpBrowser">重启浏览器</button>
         </section>
-
-        <section class="panel">
-          <div class="panel-title">
-            <span>发起搜索</span>
-          </div>
-          <label class="field">
-            <span>入队数量</span>
-            <input id="runLimit" type="number" min="1" max="100" value="30" />
-          </label>
-          <label class="field">
-            <span>关键词</span>
-            <textarea id="keywords" rows="5" placeholder="留空使用默认关键词；多关键词用逗号或换行分隔"></textarea>
-          </label>
-          <button class="primary full" id="startRun">搜索帖子入队</button>
-          <div class="run-message" id="runMessage"></div>
-        </section>
-
       </aside>
 
       <section class="workspace">
         <header class="topbar">
           <div>
-            <p class="eyebrow">Operations</p>
-            <h2>增长工作台</h2>
+            <p class="eyebrow">Platform API</p>
+            <h2>Kato 采集接口平台</h2>
           </div>
-          <button class="secondary" id="refreshAll">刷新数据</button>
+          <button class="secondary" id="refreshAll">刷新状态</button>
         </header>
 
         <nav class="tabs" aria-label="工作区">
-          <button class="tab active" data-tab="queue">互动队列</button>
+          <button class="tab active" data-tab="platforms">平台状态</button>
           <button class="tab" data-tab="tasks">任务队列</button>
-          <button class="tab" data-tab="search">帖子搜索</button>
           <button class="tab" data-tab="browser">浏览器接管</button>
-          <button class="tab" data-tab="content">内容生产</button>
-          <button class="tab" data-tab="notes">我的笔记库</button>
-          <button class="tab" data-tab="history">历史数据</button>
-          <button class="tab" data-tab="debug">调试截图</button>
+          <button class="tab" data-tab="api">接口说明</button>
         </nav>
 
-        <section class="tab-panel active" id="tab-queue">
-          <section class="card queue-card">
+        <section class="tab-panel active" id="tab-platforms">
+          <section class="card platform-service-card">
             <div class="card-head">
               <div>
-                <h3>互动队列</h3>
-                <p>搜索入队后直接筛选，选中后并发评论、发布和点赞</p>
-              </div>
-              <div class="queue-filter">
-                <label>
-                  <span>Run</span>
-                  <select id="runFilter" title="按 Run 筛选队列">
-                    <option value="">全部 Run</option>
-                  </select>
-                </label>
+                <h3>平台服务</h3>
+                <p>只保留 ServerX 需要的小红书、抖音、B站只读采集接口和登录态维护能力</p>
               </div>
             </div>
-
-            <div class="queue-command-bar">
-              <div class="selection-block">
-                <strong id="queueCount">0 条未互动</strong>
-                <span id="selectedCount">已选 0 条</span>
-              </div>
-              <div class="queue-actions">
-                <button class="secondary" id="selectAllVisible">全选</button>
-                <button class="secondary" id="invertSelection">反选</button>
-                <button class="primary" id="generatePublishSelected">评论并发布</button>
-                <button class="danger ghost" id="skipSelected">跳过</button>
-              </div>
+            <div class="service-grid">
+              <article class="service-card">
+                <strong>小红书</strong>
+                <span>搜索、图文/视频详情、一级评论、二级评论</span>
+                <button class="secondary small" data-open-platform-login="xhs" type="button">打开登录</button>
+                <button class="secondary small" data-sync-platform-cookies="xhs" type="button">同步状态</button>
+              </article>
+              <article class="service-card">
+                <strong>抖音</strong>
+                <span>视频搜索、作品详情、一级评论、二级评论</span>
+                <button class="secondary small" data-open-platform-login="douyin" type="button">打开登录</button>
+                <button class="secondary small" data-sync-platform-cookies="douyin" type="button">同步状态</button>
+              </article>
+              <article class="service-card">
+                <strong>B站</strong>
+                <span>视频搜索、视频详情、评论、回复</span>
+                <button class="secondary small" data-open-platform-login="bilibili" type="button">打开登录</button>
+                <button class="secondary small" data-sync-platform-cookies="bilibili" type="button">同步状态</button>
+              </article>
             </div>
-
-            <div class="queue-list" id="queue"></div>
           </section>
         </section>
 
@@ -138,6 +114,7 @@
                 <button class="secondary" id="refreshWorkerQueues" type="button">刷新队列</button>
               </div>
             </div>
+            <div class="worker-platform-tabs" id="workerPlatformTabs" aria-label="平台任务队列"></div>
             <div class="worker-queue-grid" id="workerQueueList">
               <div class="worker-platform-card is-checking">
                 <div class="worker-platform-head">
@@ -146,38 +123,6 @@
                 </div>
               </div>
             </div>
-          </section>
-        </section>
-
-        <section class="tab-panel" id="tab-search">
-          <section class="card post-search-card">
-            <div class="card-head">
-              <div>
-                <h3>帖子搜索</h3>
-                <p>只搜索和展示结果，不写入互动队列</p>
-              </div>
-            </div>
-
-            <div class="post-search-form">
-              <label class="field">
-                <span>关键词</span>
-                <textarea id="postSearchKeywords" rows="3" placeholder="多个关键词用逗号或换行分隔"></textarea>
-              </label>
-              <label class="field compact-field">
-                <span>数量</span>
-                <input id="postSearchLimit" type="number" min="1" max="100" value="20" />
-              </label>
-              <button class="primary" id="postSearchButton">搜索帖子</button>
-            </div>
-
-            <div class="queue-command-bar search-command-bar">
-              <div class="selection-block">
-                <strong id="postSearchCount">未搜索</strong>
-                <span>结果不会入队</span>
-              </div>
-            </div>
-
-            <div class="search-post-list" id="postSearchResults"></div>
           </section>
         </section>
 
@@ -191,7 +136,7 @@
               </div>
               <form class="browser-address-form" id="cdpAddressForm">
                 <span class="browser-lock" aria-hidden="true">https</span>
-                <input id="cdpAddressInput" type="text" inputmode="url" autocomplete="off" spellcheck="false" placeholder="输入网址或粘贴小红书链接" />
+                <input id="cdpAddressInput" type="text" inputmode="url" autocomplete="off" spellcheck="false" placeholder="输入平台链接或登录页地址" />
                 <button class="secondary browser-go-button" type="submit">访问</button>
               </form>
               <div class="browser-status-actions">
@@ -237,253 +182,44 @@
             <div class="cdp-screen-wrap" id="cdpScreenWrap" tabindex="0">
               <div class="browser-viewer-placeholder">
                 <strong>noVNC 未连接</strong>
-                <span>点击“小红书登录”或“抖音登录”后会在这里显示容器 Chrome。</span>
+                <span>点击平台登录后会在这里显示容器 Chrome。</span>
               </div>
             </div>
           </section>
         </section>
 
-        <section class="tab-panel" id="tab-content">
-          <section class="content-layout">
-            <article class="card content-control-card">
-              <div class="card-head">
-                <div>
-                  <h3>内容生产</h3>
-                  <p>从高热话题和可信来源生成可审核图文笔记</p>
-                </div>
-              </div>
-              <div class="content-form-grid">
-                <label class="field">
-                  <span>关键词</span>
-                  <input id="contentKeyword" type="search" placeholder="例如：AI办公自动化" />
-                </label>
-                <label class="field">
-                  <span>类型</span>
-                  <select id="contentType">
-                    <option value="auto">自动判断</option>
-                    <option value="news">新闻</option>
-                    <option value="opinion">观点</option>
-                    <option value="guide">指南</option>
-                    <option value="tips">技巧</option>
-                    <option value="list">清单</option>
-                    <option value="case">案例</option>
-                  </select>
-                </label>
-                <label class="field">
-                  <span>参考篇数</span>
-                  <input id="contentSourceLimit" type="number" min="5" max="10" value="8" />
-                </label>
-                <button class="primary" id="startContentProject">生成可审核笔记</button>
-              </div>
-              <div class="run-message" id="contentMessage"></div>
-              <div class="content-project-list" id="contentProjectList"></div>
-            </article>
-
-            <article class="card persona-card">
-              <div class="card-head">
-                <div>
-                  <h3>账号人设</h3>
-                  <p>让草稿更像这个账号本人，而不是通用 AI 文案</p>
-                </div>
-              </div>
-              <div class="persona-grid">
-                <label class="field">
-                  <span>账号名</span>
-                  <input id="personaName" placeholder="例如：效率研究员" />
-                </label>
-                <label class="field">
-                  <span>账号定位</span>
-                  <textarea id="personaPositioning" rows="3" placeholder="这个账号长期写什么、站在什么角度写"></textarea>
-                </label>
-                <label class="field">
-                  <span>目标读者</span>
-                  <textarea id="personaReaders" rows="3" placeholder="读者是谁，他们在意什么"></textarea>
-                </label>
-                <label class="field">
-                  <span>口吻</span>
-                  <textarea id="personaTone" rows="3" placeholder="冷静、实操、轻微吐槽、少营销感..."></textarea>
-                </label>
-                <label class="field">
-                  <span>常用表达</span>
-                  <textarea id="personaCommonPhrases" rows="3" placeholder="一行一个"></textarea>
-                </label>
-                <label class="field">
-                  <span>禁用表达</span>
-                  <textarea id="personaBannedPhrases" rows="3" placeholder="一行一个"></textarea>
-                </label>
-                <label class="field wide">
-                  <span>可信经验素材</span>
-                  <textarea id="personaExperience" rows="4" placeholder="账号真实经历、常见案例、可反复使用的判断"></textarea>
-                </label>
-              </div>
-              <div class="persona-actions">
-                <button class="primary" id="savePersona">保存人设</button>
-                <span id="personaMessage"></span>
-              </div>
-            </article>
-
-            <article class="card content-detail-card">
-              <div class="card-head">
-                <div>
-                  <h3 id="contentDetailTitle">选择或创建一个内容项目</h3>
-                  <p>研究来源、证据约束、审核和发布</p>
-                </div>
-                <span class="status-pill" id="draftStatus">draft</span>
-              </div>
-              <section class="content-research">
-                <h4>研究摘要</h4>
-                <p id="contentResearchSummary">内容项目完成后，这里会显示选题研究摘要。</p>
-              </section>
-              <div class="source-columns">
-                <section>
-                  <h4>小红书来源</h4>
-                  <div id="contentSources"></div>
-                </section>
-                <section>
-                  <h4>网页辅助</h4>
-                  <div id="webSources"></div>
-                </section>
-              </div>
-              <div id="contentDraftEmpty" class="empty">暂无草稿。</div>
-              <section id="contentDraftEditor" class="content-draft-editor hidden">
-                <label class="field">
-                  <span>标题候选</span>
-                  <textarea id="draftTitles" rows="4"></textarea>
-                </label>
-                <label class="field">
-                  <span>封面文案</span>
-                  <textarea id="draftCoverText" rows="2"></textarea>
-                </label>
-                <label class="field">
-                  <span>正文</span>
-                  <textarea id="draftBody" rows="12"></textarea>
-                </label>
-                <div class="content-form-grid">
-                  <label class="field">
-                    <span>标签</span>
-                    <input id="draftTags" />
-                  </label>
-                  <label class="field">
-                    <span>视觉风格</span>
-                    <input id="draftVisualStyle" />
-                  </label>
-                </div>
-                <label class="field">
-                  <span>配图方案</span>
-                  <textarea id="draftImagePlan" rows="4"></textarea>
-                </label>
-                <div class="draft-review">
-                  <strong>人设贴合</strong>
-                  <p id="draftPersonaFit"></p>
-                  <div id="draftReview"></div>
-                </div>
-                <div class="draft-evidence">
-                  <section>
-                    <strong>证据事实</strong>
-                    <div id="draftClaims"></div>
-                  </section>
-                  <section>
-                    <strong>来源引用</strong>
-                    <div id="draftSourceRefs"></div>
-                  </section>
-                  <section>
-                    <strong>风险与未支持事实</strong>
-                    <div id="draftRisks"></div>
-                  </section>
-                </div>
-                <label class="field">
-                  <span>本地图片路径</span>
-                  <textarea id="draftImagePaths" rows="3" placeholder="一行一个本地图片路径，审核通过后用于图文发布"></textarea>
-                </label>
-                <div class="publish-status" id="draftPublishStatus"></div>
-                <div class="draft-actions">
-                  <button class="secondary" id="saveContentDraft">保存编辑</button>
-                  <button class="primary" id="approveContentDraft">通过</button>
-                  <button class="secondary" id="reviseContentDraft">需修改</button>
-                  <button class="danger ghost" id="rejectContentDraft">拒绝</button>
-                  <button class="primary" id="publishContentDraft">发布</button>
-                </div>
-              </section>
-              <section class="content-events">
-                <h4>项目时间线</h4>
-                <div id="contentEvents"></div>
-              </section>
-            </article>
-          </section>
-        </section>
-
-        <section class="tab-panel" id="tab-notes">
-          <section class="card notes-card">
+        <section class="tab-panel" id="tab-api">
+          <section class="card api-reference-card">
             <div class="card-head">
               <div>
-                <h3>我的笔记库</h3>
-                <p>同步、启用和停用用于匹配评论的个人笔记</p>
-              </div>
-              <span id="noteCount"></span>
-            </div>
-            <div class="sync-strip">
-              <div>
-                <strong>同步我的小红书笔记</strong>
-                <span>读取当前登录账号主页，导入可作为互动素材的笔记。</span>
-              </div>
-              <label class="sync-limit">
-                <span>数量</span>
-                <input id="syncLimit" type="number" min="1" max="100" value="30" />
-              </label>
-              <button class="primary" id="syncNotes">同步笔记</button>
-            </div>
-            <div class="run-message" id="syncMessage"></div>
-            <div class="note-list" id="noteList"></div>
-          </section>
-        </section>
-
-        <section class="tab-panel" id="tab-history">
-          <section class="history-layout">
-            <div class="metrics" id="metrics"></div>
-            <article class="card history-card">
-              <div class="card-head">
-                <div>
-                  <h3>历史列表</h3>
-                  <p>已互动和已跳过记录只在这里查看</p>
-                </div>
-                <span id="historyCount"></span>
-              </div>
-              <div class="history-filters">
-                <label>
-                  <span>Run</span>
-                  <select id="historyRunFilter">
-                    <option value="">全部 Run</option>
-                  </select>
-                </label>
-                <label>
-                  <span>日期</span>
-                  <input id="historyDateFilter" type="date" />
-                </label>
-                <label>
-                  <span>关键词</span>
-                  <input id="historyKeywordFilter" type="search" placeholder="标题、评论、笔记" />
-                </label>
-                <button class="secondary" id="clearHistoryFilters">清空</button>
-              </div>
-              <div class="history-list" id="historyList"></div>
-            </article>
-          </section>
-        </section>
-
-        <section class="tab-panel" id="tab-debug">
-          <section class="card debug-card">
-            <div class="card-head">
-              <div>
-                <h3>调试截图</h3>
-                <p>自动读取 MCP 浏览器失败时保存的页面截图</p>
-              </div>
-              <div class="debug-actions">
-                <span id="debugScreenshotCount"></span>
-                <button class="secondary" id="refreshDebugScreenshots">刷新截图</button>
+                <h3>ServerX 对接入口</h3>
+                <p>控制台只用于登录态、验证码和 worker 观察；采集由 ServerX 调用公开接口完成</p>
               </div>
             </div>
-            <div class="debug-path">mcp/xiaohongshu/data/debug</div>
-            <div class="debug-grid" id="debugScreenshots"></div>
+            <div class="api-reference-grid">
+              <article>
+                <strong>小红书</strong>
+                <code>/api/v1/xiaohongshu/app_v2/search_notes</code>
+                <code>/api/v1/xiaohongshu/app_v2/get_image_note_detail</code>
+                <code>/api/v1/xiaohongshu/app_v2/get_video_note_detail</code>
+                <code>/api/v1/xiaohongshu/app_v2/get_note_comments</code>
+                <code>/api/v1/xiaohongshu/app_v2/get_note_sub_comments</code>
+              </article>
+              <article>
+                <strong>抖音</strong>
+                <code>/api/douyin/web/search_videos</code>
+                <code>/api/douyin/web/fetch_one_video</code>
+                <code>/api/douyin/web/fetch_video_comments</code>
+                <code>/api/douyin/web/fetch_video_comment_replies</code>
+              </article>
+              <article>
+                <strong>B站</strong>
+                <code>/api/bilibili/web/search_videos</code>
+                <code>/api/bilibili/web/fetch_video_detail</code>
+                <code>/api/bilibili/web/fetch_video_comments</code>
+                <code>/api/bilibili/web/fetch_video_comment_replies</code>
+              </article>
+            </div>
           </section>
         </section>
       </section>
@@ -498,7 +234,7 @@
         <div class="log-panel-head">
           <div>
             <strong>任务日志</strong>
-            <span>运行、MCP、批量操作输出</span>
+            <span>登录、同步、Worker 恢复输出</span>
           </div>
           <button class="secondary small" id="closeLogPanel" type="button">收起</button>
         </div>

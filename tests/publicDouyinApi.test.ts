@@ -300,9 +300,79 @@ test("serverx-compatible Douyin API maps platform challenge to 40102", async () 
       pathname: "/api/douyin/web/search_videos?keyword=test",
       token: "secret-token"
     });
-    assert.equal(response.status, 428);
+    assert.equal(response.status, 200);
     assert.equal(response.payload.code, 40102);
     assert.match(response.payload.message, /Douyin challenge required/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("XHS_API_TOKEN", originalToken);
+    restoreEnv("DOUYIN_SERVICE_URL", originalBaseUrl);
+  }
+});
+
+test("serverx-compatible Douyin API returns business error envelope for cancelled upstream tasks", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalToken = process.env.XHS_API_TOKEN;
+  const originalBaseUrl = process.env.DOUYIN_SERVICE_URL;
+  process.env.XHS_API_TOKEN = "secret-token";
+  process.env.DOUYIN_SERVICE_URL = "http://fake-douyin.local";
+
+  globalThis.fetch = async () =>
+    jsonResponse(
+      {
+        success: false,
+        error: {
+          code: "CLIENT_CLOSED_REQUEST",
+          message: "Browser task queue reset: dashboard worker recovery: douyin"
+        }
+      },
+      499
+    );
+
+  try {
+    const response = await callApi({
+      method: "GET",
+      pathname: "/api/douyin/web/fetch_one_video?aweme_id=738xxx",
+      token: "secret-token"
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.payload.code, 50001);
+    assert.match(response.payload.message, /queue reset/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("XHS_API_TOKEN", originalToken);
+    restoreEnv("DOUYIN_SERVICE_URL", originalBaseUrl);
+  }
+});
+
+test("serverx-compatible Douyin API returns business error envelope for upstream timeouts", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalToken = process.env.XHS_API_TOKEN;
+  const originalBaseUrl = process.env.DOUYIN_SERVICE_URL;
+  process.env.XHS_API_TOKEN = "secret-token";
+  process.env.DOUYIN_SERVICE_URL = "http://fake-douyin.local";
+
+  globalThis.fetch = async () =>
+    jsonResponse(
+      {
+        success: false,
+        error: {
+          code: "UPSTREAM_TIMEOUT",
+          message: "Douyin reply page fallback timed out after 32000ms."
+        }
+      },
+      504
+    );
+
+  try {
+    const response = await callApi({
+      method: "GET",
+      pathname: "/api/douyin/web/fetch_video_comment_replies?aweme_id=738xxx&comment_id=comment_1",
+      token: "secret-token"
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.payload.code, 50001);
+    assert.match(response.payload.message, /fallback timed out/);
   } finally {
     globalThis.fetch = originalFetch;
     restoreEnv("XHS_API_TOKEN", originalToken);

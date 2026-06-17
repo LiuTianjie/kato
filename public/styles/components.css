@@ -119,6 +119,61 @@
   line-height: 1.55;
 }
 
+.platform-service-card,
+.api-reference-card {
+  overflow: hidden;
+}
+
+.service-grid,
+.api-reference-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.service-card,
+.api-reference-grid article {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(246, 248, 251, 0.78);
+}
+
+.service-card strong,
+.api-reference-grid strong {
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 950;
+}
+
+.service-card span {
+  min-height: 36px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
+  line-height: 1.5;
+}
+
+.service-card button {
+  justify-self: start;
+}
+
+.api-reference-grid code {
+  display: block;
+  overflow: hidden;
+  padding: 7px 8px;
+  border-radius: 7px;
+  background: rgba(25, 31, 40, 0.05);
+  color: #374151;
+  font-size: 12px;
+  font-weight: 780;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .content-layout {
   display: grid;
   grid-template-columns: minmax(260px, 0.75fr) minmax(360px, 1.25fr);
@@ -680,6 +735,57 @@
 .worker-queue-grid {
   display: grid;
   gap: 12px;
+}
+
+.worker-platform-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.worker-platform-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 7px 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(246, 248, 251, 0.82);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 900;
+  cursor: pointer;
+  box-shadow: none;
+}
+
+.worker-platform-tab strong {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.worker-platform-tab.ok strong {
+  color: var(--green);
+}
+
+.worker-platform-tab.busy strong {
+  color: #c94c55;
+}
+
+.worker-platform-tab.warn strong {
+  color: #a46a12;
+}
+
+.worker-platform-tab.active {
+  border-color: rgba(25, 31, 40, 0.42);
+  background: var(--ink);
+  color: #f7f9fc;
+  box-shadow: 0 10px 24px rgba(25, 31, 40, 0.14);
+}
+
+.worker-platform-tab.active strong {
+  color: rgba(247, 249, 252, 0.72);
 }
 
 .worker-platform-card {
@@ -1654,6 +1760,11 @@
   .worker-task-row {
     grid-template-columns: 52px 64px minmax(120px, 1fr) 60px 60px 90px minmax(120px, 1fr);
   }
+
+  .service-grid,
+  .api-reference-grid {
+    grid-template-columns: repeat(2, minmax(220px, 1fr));
+  }
 }
 
 @media (max-width: 760px) {
@@ -1674,6 +1785,8 @@
 
   .metrics,
   .sync-strip,
+  .service-grid,
+  .api-reference-grid,
   .challenge-flow-grid,
   .worker-queue-grid,
   .history-filters,

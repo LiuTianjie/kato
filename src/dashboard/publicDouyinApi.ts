@@ -268,7 +268,7 @@ function sendServerxError(res: ServerResponse, error: PublicApiError): void {
         : error.status === 400
           ? 40001
           : 50001;
-  sendJson(res, error.status >= 400 && error.status < 600 ? error.status : 500, {
+  sendJson(res, 200, {
     code,
     message: error.message,
     data: null

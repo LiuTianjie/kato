@@ -36,6 +36,10 @@ const BROWSER_STATUS_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_BROWSER_STATUS_TI
 const BROWSER_RUNTIME_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_BROWSER_RUNTIME_TIMEOUT_MS", 30_000);
 const HEALTH_ENSURE_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_HEALTH_ENSURE_TIMEOUT_MS", 20_000);
 const BROWSER_TASK_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_BROWSER_TASK_TIMEOUT_MS", 180_000);
+const DOUYIN_COMMENTS_DIRECT_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_COMMENTS_DIRECT_TIMEOUT_MS", 20_000);
+const DOUYIN_REPLIES_DIRECT_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_REPLIES_DIRECT_TIMEOUT_MS", 12_000);
+const DOUYIN_REPLIES_PAGE_FALLBACK_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_REPLIES_PAGE_FALLBACK_TIMEOUT_MS", 32_000);
+const DOUYIN_REPLIES_PAGE_MAX_ROUNDS = normalizePositiveEnv("DOUYIN_REPLIES_PAGE_MAX_ROUNDS", 6);
 const DOUYIN_SIGNER_URL = stringValue(process.env.DOUYIN_SIGNER_URL || "");
 const DOUYIN_SIGNER_REQUIRED = process.env.DOUYIN_SIGNER_REQUIRED === "1";
 const DOUYIN_SIGNER_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_SIGNER_TIMEOUT_MS", 8_000);
@@ -132,6 +136,16 @@ class DouyinChallengeRequiredError extends Error {
     this.name = "DouyinChallengeRequiredError";
     this.statusCode = 428;
     this.code = "CHALLENGE_REQUIRED";
+    this.details = details;
+  }
+}
+
+class DouyinUpstreamTimeoutError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = "DouyinUpstreamTimeoutError";
+    this.statusCode = 504;
+    this.code = "UPSTREAM_TIMEOUT";
     this.details = details;
   }
 }
@@ -291,6 +305,11 @@ const server = createServer(async (req, res) => {
     }
     if (error instanceof DouyinChallengeRequiredError) {
       serviceLog("warn", "request", `${req.method || "GET"} ${req.url || "/"} requires Douyin challenge: ${message}`, error.details);
+      sendJson(res, error.statusCode, { success: false, error: { code: error.code, message, details: error.details } });
+      return;
+    }
+    if (error instanceof DouyinUpstreamTimeoutError) {
+      serviceLog("warn", "request", `${req.method || "GET"} ${req.url || "/"} upstream timeout: ${message}`, error.details);
       sendJson(res, error.statusCode, { success: false, error: { code: error.code, message, details: error.details } });
       return;
     }
@@ -845,7 +864,7 @@ async function getPostComments(body, limit, taskContext) {
         await prepareDouyinApiPage(page, "comments:api");
         const directPayload = await withTimeout(
           fetchCommentsInPage(page, "list", { aweme_id: resolved.awemeId, cursor, count: limit }),
-          25_000,
+          DOUYIN_COMMENTS_DIRECT_TIMEOUT_MS,
           "Douyin comments API timed out."
         );
         extracted = extractCommentsPayload([directPayload], "");
@@ -890,25 +909,49 @@ async function getCommentReplies(body, limit, taskContext) {
       const page = await newTaskPage(taskContext);
       let extracted = { comments: [], cursor: "", hasMore: false };
       let directError = null;
+      let source = "direct";
       try {
         await prepareDouyinApiPage(page, "replies:api");
-        const fallback = await withTimeout(
+        const directPayload = await withTimeout(
           fetchCommentsInPage(page, "reply", { item_id: itemId, comment_id: commentId, cursor, count: limit }),
-          25_000,
+          DOUYIN_REPLIES_DIRECT_TIMEOUT_MS,
           "Douyin replies API timed out."
         );
-        extracted = extractCommentsPayload([fallback], commentId);
+        extracted = extractCommentsPayload([directPayload], commentId);
       } catch (error) {
         directError = error;
         serviceLog("warn", "comments", `Direct replies fetch failed: ${errorMessage(error)}`);
       }
       if (directError && !isInitialCursor(cursor)) throw directError;
       if (!extracted.comments.length && isInitialCursor(cursor)) {
-        extracted = await expandRepliesFromPage(page, { itemId, commentId, cursor, limit, signal: taskContext?.signal });
+        source = "page";
+        extracted = await runStepWithTimeout(
+          "comments:reply-page-fallback",
+          (signal) => expandRepliesFromPage(page, { itemId, commentId, cursor, limit, signal }),
+          DOUYIN_REPLIES_PAGE_FALLBACK_TIMEOUT_MS,
+          `Douyin reply page fallback timed out after ${DOUYIN_REPLIES_PAGE_FALLBACK_TIMEOUT_MS}ms.`,
+          taskContext?.signal,
+          {
+            itemId,
+            commentId,
+            cursor,
+            limit,
+            directError: directError ? errorMessage(directError).slice(0, 240) : ""
+          }
+        );
       }
       const comments = uniqueComments(extracted.comments.map((comment) => ({ ...comment, parentId: comment.parentId || commentId }))).slice(0, limit);
       const hasMore = extracted.hasMore || comments.length >= limit;
       const nextCursor = normalizeNextCursor(extracted.cursor, cursor, limit, comments.length, hasMore);
+      serviceLog("info", "comments", "Douyin replies completed.", {
+        itemId,
+        commentId,
+        cursor,
+        nextCursor,
+        returned: comments.length,
+        source,
+        directFailed: Boolean(directError)
+      });
       return {
         comments,
         items: comments,
@@ -1001,7 +1044,7 @@ async function expandRepliesFromPage(page, { itemId, commentId, cursor, limit, s
     await humanDelay("replies:page-settle", 1_500, 3_000, { signal });
     await assertPageNotChallenged(page, "expandRepliesFromPage");
 
-    for (let scrollIndex = 0; scrollIndex < 10; scrollIndex += 1) {
+    for (let scrollIndex = 0; scrollIndex < DOUYIN_REPLIES_PAGE_MAX_ROUNDS; scrollIndex += 1) {
       signal?.throwIfAborted?.();
       const clicked = await clickVisibleReplyExpander(page);
       await humanDelay("replies:expand", 700, 1_600, { signal });
@@ -1022,7 +1065,8 @@ async function expandRepliesFromPage(page, { itemId, commentId, cursor, limit, s
     matchedPayloads: matchedPayloads.length,
     returned: extracted.comments.length,
     cursor,
-    limit
+    limit,
+    maxRounds: DOUYIN_REPLIES_PAGE_MAX_ROUNDS
   });
   return extracted;
 }
@@ -2188,6 +2232,52 @@ function withTimeout(promise, timeoutMs, message) {
     timer = setTimeout(() => reject(new Error(message)), timeoutMs);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function runStepWithTimeout(label, factory, timeoutMs, message, parentSignal, details = {}) {
+  const controller = new AbortController();
+  const signal = combineAbortSignals(parentSignal, controller.signal);
+  const startedAt = Date.now();
+  const timeoutError = new DouyinUpstreamTimeoutError(message, { label, timeoutMs, ...details });
+  let timer;
+  const stepPromise = Promise.resolve().then(() => factory(signal));
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort(timeoutError);
+      reject(timeoutError);
+    }, timeoutMs);
+  });
+
+  try {
+    serviceLog("info", "comments", `Douyin step started: ${label}.`, { timeoutMs, ...details });
+    const result = await Promise.race([stepPromise, timeoutPromise]);
+    serviceLog("info", "comments", `Douyin step completed: ${label}.`, { elapsedMs: Date.now() - startedAt });
+    return result;
+  } catch (error) {
+    if (error === timeoutError || controller.signal.aborted) {
+      stepPromise.catch(() => undefined);
+      serviceLog("warn", "comments", `Douyin step timed out: ${label}.`, { elapsedMs: Date.now() - startedAt, timeoutMs, ...details });
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function combineAbortSignals(parentSignal, stepSignal) {
+  const signals = [parentSignal, stepSignal].filter(Boolean);
+  if (signals.length === 1) return signals[0];
+  if (typeof AbortSignal.any === "function") return AbortSignal.any(signals);
+  const controller = new AbortController();
+  for (const signal of signals) {
+    const abort = () => {
+      if (!controller.signal.aborted) controller.abort(signal.reason);
+    };
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+  }
+  return controller.signal;
 }
 
 function walkObjects(value, seen = new Set()) {

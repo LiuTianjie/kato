@@ -73,8 +73,9 @@ RUN groupadd --system kato \
 
 COPY browser-runtime ./browser-runtime
 COPY scripts/kato-chromium.sh /usr/local/bin/kato-chromium
+COPY scripts/kato-xdg-open-stub.sh /usr/local/bin/xdg-open
 
-RUN chmod +x /app/browser-runtime/bin/start-browser-runtime.sh /usr/local/bin/kato-chromium \
+RUN chmod +x /app/browser-runtime/bin/start-browser-runtime.sh /usr/local/bin/kato-chromium /usr/local/bin/xdg-open \
   && mkdir -p /app/data \
   && chown -R kato:kato /home/kato /app/data
 
