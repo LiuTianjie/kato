@@ -7,8 +7,12 @@ export function getConfiguredApiToken(): string {
 }
 
 export function getAcceptedApiTokens(): string[] {
-  const values = [process.env.KATO_API_TOKEN?.trim(), process.env.XHS_API_TOKEN?.trim()].filter(Boolean) as string[];
-  return values.length ? [...new Set(values)] : [DEFAULT_KATO_API_TOKEN];
+  const values = [
+    DEFAULT_KATO_API_TOKEN,
+    process.env.KATO_API_TOKEN?.trim(),
+    process.env.XHS_API_TOKEN?.trim()
+  ].filter(Boolean) as string[];
+  return [...new Set(values)];
 }
 
 export function getRequestApiToken(req: IncomingMessage): string {

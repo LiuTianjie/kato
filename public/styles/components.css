@@ -677,6 +677,107 @@
   font-weight: 900;
 }
 
+.browser-worker-panel {
+  display: grid;
+  gap: 8px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(246, 248, 251, 0.74);
+}
+
+.worker-panel-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.worker-panel-head > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.worker-panel-head strong {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.worker-queue-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(190px, 1fr));
+  gap: 8px;
+}
+
+.worker-queue-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 5px 8px;
+  align-items: center;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.78);
+}
+
+.worker-queue-row span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 850;
+}
+
+.worker-queue-row strong {
+  justify-self: end;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.worker-queue-row small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.45;
+}
+
+.worker-queue-row button {
+  grid-column: 1 / -1;
+  justify-self: end;
+}
+
+.worker-queue-row.ok strong {
+  color: var(--green);
+}
+
+.worker-queue-row.warn strong {
+  color: #a46a12;
+}
+
+.worker-queue-row.busy strong {
+  color: #c94c55;
+}
+
+.worker-queue-row.is-checking strong::before {
+  content: "";
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 6px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  vertical-align: -1px;
+  animation: spin 0.75s linear infinite;
+}
+
 .cdp-screen-wrap {
   display: grid;
   place-items: stretch;
@@ -1530,6 +1631,7 @@
   .metrics,
   .sync-strip,
   .challenge-flow-grid,
+  .worker-queue-grid,
   .history-filters,
   .history-row,
   .content-layout,

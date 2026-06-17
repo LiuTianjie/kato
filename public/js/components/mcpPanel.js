@@ -19,12 +19,14 @@ export async function refreshMcp(button) {
       el.classList.remove("is-checking");
       el.classList.add(data.is_logged_in ? "ok" : "warn");
       await refreshPlatformLoginList();
+      await refreshWorkerQueues();
       appendClientLog(`成功 · MCP 登录状态：${el.textContent}`);
     } catch (error) {
       setText("mcpState", "MCP 不可用");
       el.classList.remove("is-checking");
       el.classList.add("warn");
       await refreshPlatformLoginList();
+      await refreshWorkerQueues();
       appendClientLog(`失败 · MCP 登录状态：${errorMessage(error)}`);
     }
   });
@@ -103,9 +105,41 @@ export async function syncPlatformCookies(platform, button) {
         `成功 · ${label}已导出 ${result.exportedCookies ?? 0} 个 cookies${result.exportedStorageOrigins !== undefined ? ` / ${result.exportedStorageOrigins} 个 storage origin` : ""} 到 ${result.cookiesPath || "持久化目录"}`
       );
       await refreshPlatformLoginList();
+      await refreshWorkerQueues();
     } catch (error) {
       setChallengeFlowStatus(`${label}状态同步失败`);
       appendClientLog(`失败 · 同步${label}登录态：${errorMessage(error)}`);
+    }
+  });
+}
+
+export async function refreshWorkerQueues(button) {
+  const list = $("workerQueueList");
+  if (!list) return;
+  setWorkerQueueStatus("刷新 Worker 队列状态中");
+  if (button) {
+    return withButtonLoading(button, "刷新中", async () => {
+      await loadWorkerQueues(list);
+    });
+  }
+  await loadWorkerQueues(list);
+}
+
+export async function recoverPlatformWorker(platform, button) {
+  const label = platformLabel(platform);
+  appendClientLog(`开始 · 恢复${label} Worker 队列`);
+  return withButtonLoading(button, "恢复中", async () => {
+    try {
+      setWorkerQueueStatus(`${label}恢复中：重置队列并重启 worker 浏览器`);
+      const result = await dashboardApi.recoverPlatformWorker(platform);
+      appendClientLog(`成功 · ${label} Worker 已恢复`);
+      const queue = result.status?.queue;
+      if (queue) appendClientLog(`状态 · ${label} 队列 pending=${queue.pending ?? 0} active=${queue.active?.label || "无"}`);
+      await refreshWorkerQueues();
+    } catch (error) {
+      setWorkerQueueStatus(`${label}恢复失败`);
+      appendClientLog(`失败 · 恢复${label} Worker：${errorMessage(error)}`);
+      await refreshWorkerQueues().catch(() => undefined);
     }
   });
 }
@@ -119,6 +153,9 @@ export function bindPlatformLoginActions() {
   });
   $$("[data-sync-platform-cookies]").forEach((button) => {
     button.addEventListener("click", () => syncPlatformCookies(button.dataset.syncPlatformCookies, button));
+  });
+  $$("[data-recover-platform-worker]").forEach((button) => {
+    button.addEventListener("click", () => recoverPlatformWorker(button.dataset.recoverPlatformWorker, button));
   });
 }
 
@@ -148,6 +185,56 @@ function renderPlatformStatus(platform) {
   `;
 }
 
+async function loadWorkerQueues(list) {
+  try {
+    const result = await dashboardApi.getPlatformWorkerStatuses();
+    const platforms = (result.platforms || []).filter((platform) => platform.implemented !== false);
+    list.innerHTML = platforms.map(renderWorkerQueueStatus).join("");
+    bindWorkerRecoveryButtons(list);
+    const busyCount = platforms.filter((platform) => platform.queue?.active || Number(platform.queue?.pending || 0) > 0).length;
+    setWorkerQueueStatus(busyCount ? `${busyCount} 个平台 worker 正在执行或排队` : "所有平台 worker 空闲");
+  } catch (error) {
+    list.innerHTML = `<div class="worker-queue-row warn"><span>Worker</span><strong>不可用</strong><small>${escapeHtml(errorMessage(error))}</small></div>`;
+    setWorkerQueueStatus("Worker 队列状态读取失败");
+  }
+}
+
+function bindWorkerRecoveryButtons(root) {
+  root.querySelectorAll("[data-recover-platform-worker]").forEach((button) => {
+    button.addEventListener("click", () => recoverPlatformWorker(button.dataset.recoverPlatformWorker, button));
+  });
+}
+
+function renderWorkerQueueStatus(platform) {
+  const label = platform.label || platformLabel(platform.platform);
+  const queue = platform.queue || {};
+  const runtime = platform.workerRuntime || {};
+  const chromeRunning = runtime.chrome?.running === true;
+  const cdpReady = runtime.cdp?.ready === true;
+  const lease = runtime.lease || {};
+  const pending = Number(queue.pending || 0);
+  const active = queue.active;
+  const isBusy = pending > 0 || Boolean(active) || lease.active === true;
+  const isHealthy = platform.service?.ok !== false && runtime.ok !== false && (chromeRunning || cdpReady);
+  const state = !isHealthy ? "warn" : isBusy ? "busy" : "ok";
+  const statusText = !isHealthy ? "异常" : isBusy ? "忙碌" : "空闲";
+  const details = [
+    `pending ${pending}${queue.maxPending ? `/${queue.maxPending}` : ""}`,
+    `active ${active?.label || "无"}`,
+    `lease ${lease.active ? `${lease.owner || "runtime"}:${lease.label || ""}` : "无"}`,
+    `chrome ${chromeRunning ? "on" : "off"} / cdp ${cdpReady ? "ready" : "down"}`
+  ];
+  const error = platform.service?.error || runtime.error;
+  return `
+    <div class="worker-queue-row ${state}">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(statusText)}</strong>
+      <small>${escapeHtml(details.join(" · "))}${error ? `<br>${escapeHtml(error)}` : ""}</small>
+      <button class="secondary small" data-recover-platform-worker="${escapeHtml(platform.platform)}" type="button">重置队列 / 重启 Worker</button>
+    </div>
+  `;
+}
+
 function platformLabel(platform) {
   if (platform === "douyin") return "抖音";
   if (platform === "bilibili") return "B站";
@@ -162,5 +249,10 @@ function platformChallengeUrl(platform) {
 
 function setChallengeFlowStatus(text) {
   const el = $("challengeFlowStatus");
+  if (el) el.textContent = text;
+}
+
+function setWorkerQueueStatus(text) {
+  const el = $("workerQueueStatus");
   if (el) el.textContent = text;
 }

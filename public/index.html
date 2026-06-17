@@ -210,6 +210,21 @@
                 </div>
               </div>
             </div>
+            <div class="browser-worker-panel" aria-label="Worker 队列状态">
+              <div class="worker-panel-head">
+                <div>
+                  <strong>Worker 队列</strong>
+                  <span id="workerQueueStatus">查看接口任务是否排队、卡住或占用浏览器。</span>
+                </div>
+                <button class="secondary small" id="refreshWorkerQueues" type="button">刷新队列</button>
+              </div>
+              <div class="worker-queue-grid" id="workerQueueList">
+                <div class="worker-queue-row is-checking">
+                  <span>Worker</span>
+                  <strong>检查中</strong>
+                </div>
+              </div>
+            </div>
             <div class="cdp-screen-wrap" id="cdpScreenWrap" tabindex="0">
               <div class="browser-viewer-placeholder">
                 <strong>noVNC 未连接</strong>

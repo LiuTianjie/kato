@@ -48,6 +48,7 @@ const BROWSER_TASK_TIMEOUT_MS = normalizePositiveEnv("XHS_BROWSER_TASK_TIMEOUT_M
 const HUMAN_DELAY_ENABLED = process.env.XHS_HUMAN_DELAY_ENABLED !== "0";
 const BROWSER_TASK_DELAY_MIN_MS = normalizeNonNegativeEnv("XHS_BROWSER_TASK_DELAY_MIN_MS", 900);
 const BROWSER_TASK_DELAY_MAX_MS = normalizeDelayMax("XHS_BROWSER_TASK_DELAY_MAX_MS", 2_800, BROWSER_TASK_DELAY_MIN_MS);
+const BROWSER_QUEUE_MAX_PENDING = normalizePositiveEnv("XHS_BROWSER_QUEUE_MAX_PENDING", 12);
 const BROWSER_ACTION_DELAY_MIN_MS = normalizeNonNegativeEnv("XHS_BROWSER_ACTION_DELAY_MIN_MS", 260);
 const BROWSER_ACTION_DELAY_MAX_MS = normalizeDelayMax("XHS_BROWSER_ACTION_DELAY_MAX_MS", 1_100, BROWSER_ACTION_DELAY_MIN_MS);
 const BROWSER_TYPE_DELAY_MIN_MS = normalizeNonNegativeEnv("XHS_BROWSER_TYPE_DELAY_MIN_MS", 45);
@@ -93,8 +94,10 @@ let viewerPagePromise;
 let restartPromise;
 let browserTaskTail = Promise.resolve();
 let browserTaskSeq = 0;
+let browserTaskGeneration = 0;
 let browserTaskPending = 0;
 let browserTaskActive = null;
+let browserTaskActiveContext = null;
 let browserPriorityPromise;
 let cookiePersistTimer;
 let lastStorageSyncAt = null;
@@ -112,6 +115,15 @@ class BrowserTaskCancelledError extends Error {
   constructor(message) {
     super(message);
     this.name = "BrowserTaskCancelledError";
+  }
+}
+
+class BrowserQueueBusyError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "BrowserQueueBusyError";
+    this.statusCode = 429;
+    this.code = "QUEUE_BUSY";
   }
 }
 
@@ -194,6 +206,13 @@ const server = createServer(async (req, res) => {
           cursor: serviceLogSeq
         }
       });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/v1/browser/queue/reset") {
+      const body = await readJson(req).catch(() => ({}));
+      const result = resetBrowserTaskQueue(String(body.reason || "manual reset"));
+      sendJson(res, 200, { success: true, data: result });
       return;
     }
 
@@ -350,6 +369,11 @@ const server = createServer(async (req, res) => {
       sendJson(res, 499, { success: false, error: { code: "CLIENT_CLOSED_REQUEST", message } });
       return;
     }
+    if (error instanceof BrowserQueueBusyError) {
+      serviceLog("warn", "request", `${req.method || "GET"} ${req.url || "/"} queue busy: ${message}`);
+      sendJson(res, error.statusCode, { success: false, error: { code: error.code, message, queue: browserQueueSummary() } });
+      return;
+    }
     serviceLog("error", "request", `${req.method || "GET"} ${req.url || "/"} failed: ${message}`);
     sendJson(res, 500, { success: false, error: { code: "INTERNAL_ERROR", message } });
   }
@@ -446,7 +470,13 @@ async function ensureContext() {
 }
 
 function enqueueBrowserTask(label, task, options = {}) {
+  if (browserTaskPending >= BROWSER_QUEUE_MAX_PENDING) {
+    throw new BrowserQueueBusyError(
+      `XHS browser queue is busy: pending=${browserTaskPending}, max=${BROWSER_QUEUE_MAX_PENDING}. Retry after current tasks finish or use dashboard worker recovery.`
+    );
+  }
   const id = ++browserTaskSeq;
+  const generation = browserTaskGeneration;
   const timeoutMs = normalizePositiveInt(options.timeoutMs, BROWSER_TASK_TIMEOUT_MS);
   const queuedAt = Date.now();
   const taskContext = createBrowserTaskContext(id, label, options.signal);
@@ -461,10 +491,15 @@ function enqueueBrowserTask(label, task, options = {}) {
     };
     let markCancelled;
     try {
+      if (generation !== browserTaskGeneration) {
+        removeFromPending();
+        throw new BrowserTaskCancelledError(`Browser task #${id}:${label} was dropped by queue reset.`);
+      }
       if (browserPriorityPromise) await waitForAbortable(browserPriorityPromise.catch(() => undefined), taskContext);
       removeFromPending();
       taskContext.throwIfCancelled();
       browserTaskActive = { id, label, startedAt: new Date().toISOString(), cancelled: false };
+      browserTaskActiveContext = taskContext;
       markCancelled = () => {
         if (browserTaskActive?.id !== id) return;
         browserTaskActive.cancelled = true;
@@ -492,6 +527,7 @@ function enqueueBrowserTask(label, task, options = {}) {
         serviceLog("info", "queue", `Browser task #${id} finished: ${label}.`, { activeMs, pending: browserTaskPending });
         if (markCancelled) taskContext.signal.removeEventListener("abort", markCancelled);
         browserTaskActive = null;
+        browserTaskActiveContext = null;
       }
       await closeTaskServicePage(taskContext, "task finished").catch(() => undefined);
       await releaseRuntimeLease(taskContext.leaseId).catch(() => undefined);
@@ -501,6 +537,18 @@ function enqueueBrowserTask(label, task, options = {}) {
   const result = browserTaskTail.then(run, run);
   browserTaskTail = result.catch(() => undefined);
   return result;
+}
+
+function resetBrowserTaskQueue(reason) {
+  const previous = browserQueueSummary();
+  browserTaskGeneration += 1;
+  browserTaskPending = 0;
+  browserTaskTail = Promise.resolve();
+  if (browserTaskActiveContext) {
+    browserTaskActiveContext.abort(new BrowserTaskCancelledError(`Browser task queue reset: ${reason}`));
+  }
+  serviceLog("warn", "queue", "XHS browser task queue reset.", { reason, previous, generation: browserTaskGeneration });
+  return { reset: true, reason, previous, queue: browserQueueSummary() };
 }
 
 function priorityRestartBrowser(reason) {
@@ -608,7 +656,9 @@ async function waitForAbortable(promise, taskContext) {
 function browserQueueSummary() {
   return {
     pending: browserTaskPending,
-    active: browserTaskActive
+    maxPending: BROWSER_QUEUE_MAX_PENDING,
+    active: browserTaskActive,
+    generation: browserTaskGeneration
   };
 }
 

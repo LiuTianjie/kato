@@ -21,6 +21,42 @@ test("public Douyin API requires the shared Kato token", async () => {
   }
 });
 
+test("public Douyin API accepts the built-in Kato token even when env token differs", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKatoToken = process.env.KATO_API_TOKEN;
+  const originalXhsToken = process.env.XHS_API_TOKEN;
+  const originalBaseUrl = process.env.DOUYIN_SERVICE_URL;
+  process.env.KATO_API_TOKEN = "secret-token";
+  process.env.XHS_API_TOKEN = "another-secret";
+  process.env.DOUYIN_SERVICE_URL = "http://fake-douyin.local";
+
+  globalThis.fetch = async (input) => {
+    assert.equal(String(input), "http://fake-douyin.local/api/v1/posts/search");
+    return jsonResponse({
+      success: true,
+      data: {
+        posts: [{ id: "7372484719365098803", title: "课程体验反馈", url: "https://www.douyin.com/video/7372484719365098803" }]
+      }
+    });
+  };
+
+  try {
+    const response = await callApi({
+      method: "POST",
+      pathname: "/api/v1/douyin/posts/search",
+      token: "LiuTao0.1",
+      body: { keyword: "课程", limit: 1 }
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.payload.success, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("KATO_API_TOKEN", originalKatoToken);
+    restoreEnv("XHS_API_TOKEN", originalXhsToken);
+    restoreEnv("DOUYIN_SERVICE_URL", originalBaseUrl);
+  }
+});
+
 test("public Douyin API exposes search through the service adapter", async () => {
   const originalFetch = globalThis.fetch;
   const originalToken = process.env.XHS_API_TOKEN;

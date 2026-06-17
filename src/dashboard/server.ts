@@ -195,6 +195,18 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     return;
   }
 
+  if (req.method === "GET" && url.pathname === "/api/platforms/worker-status") {
+    sendJson(res, 200, { platforms: await Promise.all(listPlatformSpecs().map((platform) => getPlatformWorkerStatus(platform.id))) });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/platforms/worker/recover") {
+    const body = await readJson(req);
+    const platform = requirePlatformSpec(body.platform);
+    sendJson(res, 200, await recoverPlatformWorker(platform.id));
+    return;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/hybrid/update_cookie") {
     if (!hasSharedApiToken(req)) {
       sendJson(res, 401, { code: 40101, message: "Missing or invalid API token.", data: null });
@@ -930,6 +942,129 @@ async function syncPlatformCookies(platform: PlatformId): Promise<Record<string,
         : await postMcpJson("/api/v1/browser/sync-cookies", {}, 35_000);
   const data = unwrapMcpData(payload) as Record<string, unknown>;
   return { platform: spec.id, label: spec.label, synced: true, ...data };
+}
+
+async function getPlatformWorkerStatus(platform: PlatformId): Promise<Record<string, unknown>> {
+  const spec = getPlatformSpec(platform);
+  if (!spec.implemented) {
+    return { platform: spec.id, label: spec.label, implemented: false, error: "未接入平台服务" };
+  }
+  const [service, workerRuntime] = await Promise.all([safePlatformServiceHealth(platform), safeWorkerRuntimeHealth(platform)]);
+  const servicePayload = service.payload as { ok?: unknown; service?: unknown; browser?: unknown; auth?: unknown } | undefined;
+  const browser = servicePayload?.browser && typeof servicePayload.browser === "object" ? (servicePayload.browser as Record<string, unknown>) : undefined;
+  const queue = browser?.queue && typeof browser.queue === "object" ? (browser.queue as Record<string, unknown>) : undefined;
+  const runtimePayload = workerRuntime.payload as { ok?: unknown; runtime?: unknown } | undefined;
+  const runtime =
+    runtimePayload?.runtime && typeof runtimePayload.runtime === "object" ? (runtimePayload.runtime as Record<string, unknown>) : undefined;
+  return {
+    platform: spec.id,
+    label: spec.label,
+    implemented: spec.implemented,
+    service: {
+      ok: service.ok,
+      name: servicePayload?.service || spec.serviceName,
+      error: service.error
+    },
+    queue: queue || null,
+    auth: servicePayload?.auth || null,
+    workerRuntime: {
+      ok: workerRuntime.ok,
+      error: workerRuntime.error,
+      chrome: runtime && typeof runtime.chrome === "object" ? runtime.chrome : null,
+      cdp: runtime && typeof runtime.cdp === "object" ? runtime.cdp : null,
+      lease: runtime && typeof runtime.lease === "object" ? runtime.lease : null,
+      logs: runtime && typeof runtime.logs === "object" ? runtime.logs : null
+    }
+  };
+}
+
+async function recoverPlatformWorker(platform: PlatformId): Promise<Record<string, unknown>> {
+  const spec = getPlatformSpec(platform);
+  if (!spec.implemented) {
+    return { platform: spec.id, label: spec.label, recovered: false, error: "未接入平台服务" };
+  }
+  const steps: Record<string, unknown> = {};
+  const reason = `dashboard worker recovery: ${spec.id}`;
+
+  if (platform === "xhs" || platform === "douyin") {
+    steps.queueReset = await resetPlatformWorkerQueue(platform, reason);
+    await delay(800);
+  }
+
+  steps.workerRestart = await restartPlatformWorkerWithRetry(platform, reason);
+  await delay(600);
+  const status = await getPlatformWorkerStatus(platform);
+  return {
+    platform: spec.id,
+    label: spec.label,
+    recovered: true,
+    steps,
+    status
+  };
+}
+
+async function safePlatformServiceHealth(platform: PlatformId): Promise<{ ok: boolean; payload?: unknown; error?: string }> {
+  try {
+    const payload =
+      platform === "douyin"
+        ? await fetchDouyinJson("/health?ensure=0", 8_000)
+        : platform === "bilibili"
+          ? await fetchBilibiliJson("/health", 8_000)
+          : await fetchMcpJson("/health?ensure=0", 8_000);
+    const ok = payload && typeof payload === "object" && "ok" in payload ? (payload as { ok?: unknown }).ok !== false : true;
+    return { ok, payload };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function safeWorkerRuntimeHealth(platform: PlatformId): Promise<{ ok: boolean; payload?: unknown; error?: string }> {
+  const spec = getPlatformSpec(platform);
+  if (!spec.workerRuntimeUrl) return { ok: false, error: "未配置 worker runtime" };
+  try {
+    const payload = await fetchRuntimeJson(spec.workerRuntimeUrl, "/health", 5_000);
+    const ok = payload && typeof payload === "object" && "ok" in payload ? (payload as { ok?: unknown }).ok !== false : true;
+    return { ok, payload };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function resetPlatformWorkerQueue(platform: PlatformId, reason: string): Promise<unknown> {
+  const payload =
+    platform === "douyin"
+      ? await postDouyinJson("/api/v1/browser/queue/reset", { reason }, 20_000)
+      : await postMcpJson("/api/v1/browser/queue/reset", { reason }, 20_000);
+  return unwrapMcpData(payload);
+}
+
+async function restartPlatformWorkerWithRetry(platform: PlatformId, reason: string): Promise<unknown> {
+  try {
+    return await restartPlatformWorker(platform, reason);
+  } catch (error) {
+    if (!isLeaseBusyError(error)) throw error;
+    await delay(1_500);
+    return restartPlatformWorker(platform, `${reason} retry after lease release`);
+  }
+}
+
+async function restartPlatformWorker(platform: PlatformId, reason: string): Promise<unknown> {
+  if (platform === "douyin") {
+    const payload = await postDouyinJson("/api/v1/browser/restart", { reason }, 130_000);
+    return unwrapMcpData(payload);
+  }
+  if (platform === "xhs") {
+    const payload = await postMcpJson("/api/v1/browser/restart", { reason }, 130_000);
+    return unwrapMcpData(payload);
+  }
+  const spec = getPlatformSpec(platform);
+  if (!spec.workerRuntimeUrl) throw new Error(`${spec.label} 未配置 worker runtime`);
+  return postRuntimeJson(spec.workerRuntimeUrl, "/browser/restart", { reason }, 130_000);
+}
+
+function isLeaseBusyError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /423|lease|busy|blocked by active lease/i.test(message);
 }
 
 async function runBrowserViewerAction(body: Record<string, unknown>): Promise<{ ok: true }> {

@@ -43,6 +43,7 @@ const DOUYIN_GENERATE_MISSING_TOKENS = process.env.DOUYIN_GENERATE_MISSING_TOKEN
 const HUMAN_DELAY_ENABLED = process.env.DOUYIN_HUMAN_DELAY_ENABLED !== "0";
 const TASK_DELAY_MIN_MS = normalizeNonNegativeEnv("DOUYIN_BROWSER_TASK_DELAY_MIN_MS", 900);
 const TASK_DELAY_MAX_MS = normalizeDelayMax("DOUYIN_BROWSER_TASK_DELAY_MAX_MS", 2_600, TASK_DELAY_MIN_MS);
+const BROWSER_QUEUE_MAX_PENDING = normalizePositiveEnv("DOUYIN_BROWSER_QUEUE_MAX_PENDING", 12);
 const BROWSER_VERSION = detectChromeVersion();
 const BROWSER_MAJOR_VERSION = process.env.DOUYIN_BROWSER_MAJOR_VERSION || BROWSER_VERSION.major;
 const WINDOWS_USER_AGENT =
@@ -72,12 +73,31 @@ const WINDOWS_UA_METADATA = {
   wow64: false
 };
 const DOUYIN_COOKIE_DOMAINS = [".douyin.com", "douyin.com", ".iesdouyin.com", "iesdouyin.com", ".amemv.com", "amemv.com", "bytedance"];
+const DOUYIN_LOGIN_COOKIE_NAMES = new Set([
+  "sessionid",
+  "sessionid_ss",
+  "sid_guard",
+  "sid_tt",
+  "uid_tt",
+  "uid_tt_ss",
+  "sid_ucp_v1",
+  "ssid_ucp_v1",
+  "sso_uid_tt",
+  "sso_uid_tt_ss",
+  "passport_auth_status",
+  "passport_auth_status_ss",
+  "passport_fe_beating_status",
+  "login_status",
+  "n_mh"
+]);
 let contextPromise;
 let restartPromise;
 let browserTaskTail = Promise.resolve();
 let browserTaskSeq = 0;
+let browserTaskGeneration = 0;
 let browserTaskPending = 0;
 let browserTaskActive = null;
+let browserTaskActiveContext = null;
 let cookiePersistTimer;
 
 class BrowserTaskTimeoutError extends Error {
@@ -91,6 +111,15 @@ class BrowserTaskCancelledError extends Error {
   constructor(message) {
     super(message);
     this.name = "BrowserTaskCancelledError";
+  }
+}
+
+class BrowserQueueBusyError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "BrowserQueueBusyError";
+    this.statusCode = 429;
+    this.code = "QUEUE_BUSY";
   }
 }
 
@@ -116,16 +145,32 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/api/v1/browser/queue/reset") {
+      const body = await readJson(req).catch(() => ({}));
+      const result = resetBrowserTaskQueue(String(body.reason || "manual reset"));
+      sendJson(res, 200, { success: true, data: result });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/v1/browser/restart") {
+      const body = await readJson(req).catch(() => ({}));
+      serviceLog("warn", "browser", "Browser restart requested.", { reason: body.reason || "manual" });
+      const data = await restartBrowser(`priority:${String(body.reason || "manual")}`);
+      sendJson(res, 200, { success: true, data });
+      return;
+    }
+
     if (req.method === "GET" && url.pathname === "/health") {
       const ensure = url.searchParams.get("ensure") === "1";
       const browser = await healthBrowserSummary({ ensure });
+      const auth = await persistedLoginStatus().catch((error) => ({ is_logged_in: false, cookie_count: 0, error: errorMessage(error) }));
       const ok = ensure ? browser.running === true : true;
-      sendJson(res, ok ? 200 : 503, { ok, service: "kato-douyin-browser", browser });
+      sendJson(res, ok ? 200 : 503, { ok, service: "kato-douyin-browser", browser, auth });
       return;
     }
 
     if (req.method === "GET" && url.pathname === "/api/v1/login/status") {
-      const data = await enqueueBrowserTask("login:status", (taskContext) => loginStatus(taskContext), { signal: requestSignal });
+      const data = await loginStatus();
       sendJson(res, 200, { success: true, data });
       return;
     }
@@ -139,13 +184,17 @@ const server = createServer(async (req, res) => {
       await persistCookies(cookies, "manual-sync");
       if (storage.length) await persistStorage(storage, "manual-sync");
       const context = contextPromise ? await contextPromise.catch(() => undefined) : undefined;
-      if (context && cookies.length) await context.addCookies(cookies).catch(() => undefined);
+      if (context && cookies.length) await addCookiesToContext(context, cookies, "manual-sync");
       if (context && storage.length) await restoreStorage(context, storage).catch((error) => {
         serviceLog("warn", "storage", `Douyin worker storage restore after sync failed: ${errorMessage(error)}`);
       });
       const exportedCookies = cookies.length;
+      const auth = summarizeLoginStatus(cookies, "viewer-sync", { storageOrigins: storage.length });
       serviceLog("info", "cookies", "Douyin browser cookies synced manually.", { exportedCookies, exportedStorageOrigins: storage.length });
-      sendJson(res, 200, { success: true, data: { cookiesPath: COOKIES_PATH, storagePath: STORAGE_PATH, exportedCookies, exportedStorageOrigins: storage.length } });
+      sendJson(res, 200, {
+        success: true,
+        data: { cookiesPath: COOKIES_PATH, storagePath: STORAGE_PATH, exportedCookies, exportedStorageOrigins: storage.length, auth }
+      });
       return;
     }
 
@@ -157,9 +206,12 @@ const server = createServer(async (req, res) => {
       if (!cookies.length) throw new Error("No valid cookie pairs found.");
       await persistCookies(cookies, "serverx-update");
       const context = contextPromise ? await contextPromise.catch(() => undefined) : undefined;
-      if (context) await context.addCookies(cookies).catch(() => undefined);
+      if (context) await addCookiesToContext(context, cookies, "serverx-update");
       serviceLog("info", "cookies", "Douyin cookies updated from API.", { count: cookies.length });
-      sendJson(res, 200, { success: true, data: { cookiesPath: COOKIES_PATH, updatedCookies: cookies.length } });
+      sendJson(res, 200, {
+        success: true,
+        data: { cookiesPath: COOKIES_PATH, updatedCookies: cookies.length, auth: summarizeLoginStatus(cookies, "api-update") }
+      });
       return;
     }
 
@@ -227,6 +279,11 @@ const server = createServer(async (req, res) => {
     if (error instanceof BrowserTaskCancelledError) {
       serviceLog("warn", "request", `${req.method || "GET"} ${req.url || "/"} cancelled: ${message}`);
       sendJson(res, 499, { success: false, error: { code: "CLIENT_CLOSED_REQUEST", message } });
+      return;
+    }
+    if (error instanceof BrowserQueueBusyError) {
+      serviceLog("warn", "request", `${req.method || "GET"} ${req.url || "/"} queue busy: ${message}`);
+      sendJson(res, error.statusCode, { success: false, error: { code: error.code, message, queue: browserQueueSummary() } });
       return;
     }
     if (error instanceof DouyinChallengeRequiredError) {
@@ -429,7 +486,13 @@ async function newTaskPage(taskContext) {
 }
 
 function enqueueBrowserTask(label, task, options = {}) {
+  if (browserTaskPending >= BROWSER_QUEUE_MAX_PENDING) {
+    throw new BrowserQueueBusyError(
+      `Douyin browser queue is busy: pending=${browserTaskPending}, max=${BROWSER_QUEUE_MAX_PENDING}. Retry after current tasks finish or restart Kato.`
+    );
+  }
   const id = ++browserTaskSeq;
+  const generation = browserTaskGeneration;
   const timeoutMs = normalizePositiveInt(options.timeoutMs, BROWSER_TASK_TIMEOUT_MS);
   const queuedAt = Date.now();
   const taskContext = createBrowserTaskContext(id, label, options.signal);
@@ -444,9 +507,14 @@ function enqueueBrowserTask(label, task, options = {}) {
     };
     let markCancelled;
     try {
+      if (generation !== browserTaskGeneration) {
+        removeFromPending();
+        throw new BrowserTaskCancelledError(`Browser task #${id}:${label} was dropped by queue reset.`);
+      }
       removeFromPending();
       taskContext.throwIfCancelled();
       browserTaskActive = { id, label, startedAt: new Date().toISOString(), cancelled: false };
+      browserTaskActiveContext = taskContext;
       markCancelled = () => {
         if (browserTaskActive?.id !== id) return;
         browserTaskActive.cancelled = true;
@@ -470,6 +538,7 @@ function enqueueBrowserTask(label, task, options = {}) {
         serviceLog("info", "queue", `Browser task #${id} finished: ${label}.`, { activeMs, pending: browserTaskPending });
         if (markCancelled) taskContext.signal.removeEventListener("abort", markCancelled);
         browserTaskActive = null;
+        browserTaskActiveContext = null;
       }
       await closeTaskPage(taskContext, "task finished").catch(() => undefined);
       await releaseRuntimeLease(taskContext.leaseId).catch(() => undefined);
@@ -479,6 +548,18 @@ function enqueueBrowserTask(label, task, options = {}) {
   const result = browserTaskTail.then(run, run);
   browserTaskTail = result.catch(() => undefined);
   return result;
+}
+
+function resetBrowserTaskQueue(reason) {
+  const previous = browserQueueSummary();
+  browserTaskGeneration += 1;
+  browserTaskPending = 0;
+  browserTaskTail = Promise.resolve();
+  if (browserTaskActiveContext) {
+    browserTaskActiveContext.abort(new BrowserTaskCancelledError(`Browser task queue reset: ${reason}`));
+  }
+  serviceLog("warn", "queue", "Douyin browser task queue reset.", { reason, previous, generation: browserTaskGeneration });
+  return { reset: true, reason, previous, queue: browserQueueSummary() };
 }
 
 async function runBrowserTaskWithTimeout(label, task, timeoutMs, taskContext) {
@@ -618,22 +699,15 @@ async function restartBrowser(reason = "manual", taskContext) {
   return restartPromise;
 }
 
-async function loginStatus(taskContext) {
-  return withBrowserRecovery(
-    "loginStatus",
-    async () => {
-      const context = await ensureContext();
-      const cookies = (await context.cookies()).filter(isDouyinCookie);
-      if (cookies.length) await persistCookies(cookies, "loginStatus");
-      return {
-        is_logged_in: cookies.some((cookie) => ["sessionid", "sid_guard", "passport_auth_status", "sid_tt"].includes(cookie.name) && cookie.value),
-        cookie_count: cookies.length,
-        domains: [...new Set(cookies.map((cookie) => cookie.domain))],
-        username: ""
-      };
-    },
-    taskContext
-  );
+async function loginStatus() {
+  const persisted = await persistedLoginStatus();
+  if (persisted.cookie_count > 0 || persisted.storage_origin_count > 0) return persisted;
+  return {
+    ...persisted,
+    is_logged_in: false,
+    source: "file",
+    username: ""
+  };
 }
 
 async function searchPosts(keyword, limit, options = {}) {
@@ -1700,12 +1774,105 @@ async function loadCookies(context) {
     const raw = await readFile(COOKIES_PATH, "utf8");
     const cookies = JSON.parse(raw);
     if (Array.isArray(cookies) && cookies.length) {
-      await context.addCookies(cookies).catch(() => undefined);
-      serviceLog("info", "cookies", `Loaded ${cookies.length} Douyin cookies.`, { cookiesPath: COOKIES_PATH });
+      const added = await addCookiesToContext(context, cookies, "load");
+      serviceLog("info", "cookies", `Loaded ${added}/${cookies.length} Douyin cookies.`, { cookiesPath: COOKIES_PATH });
     }
   } catch {
     // Missing cookie files are normal on first boot.
   }
+}
+
+async function persistedLoginStatus() {
+  const cookies = await readPersistedCookies();
+  const storage = await readPersistedStorage();
+  return summarizeLoginStatus(cookies, "file", { storageOrigins: storage.length });
+}
+
+async function readPersistedCookies() {
+  try {
+    const raw = await readFile(COOKIES_PATH, "utf8");
+    const cookies = JSON.parse(raw);
+    return Array.isArray(cookies) ? cookies.filter(isDouyinCookie) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function readPersistedStorage() {
+  try {
+    const raw = await readFile(STORAGE_PATH, "utf8");
+    const storage = JSON.parse(raw);
+    return Array.isArray(storage) ? storage : [];
+  } catch {
+    return [];
+  }
+}
+
+function summarizeLoginStatus(cookies, source, extra = {}) {
+  const douyinCookies = Array.isArray(cookies) ? cookies.filter(isDouyinCookie) : [];
+  const names = new Set(douyinCookies.map((cookie) => stringValue(cookie.name).toLowerCase()).filter(Boolean));
+  const loginCookieNames = [...names].filter((name) => DOUYIN_LOGIN_COOKIE_NAMES.has(name));
+  const storageOriginCount = Number(extra.storageOrigins || 0);
+  const hasSyncedBrowserState = douyinCookies.length > 0 && storageOriginCount > 0;
+  return {
+    is_logged_in: loginCookieNames.length > 0 || hasSyncedBrowserState,
+    cookie_count: douyinCookies.length,
+    login_cookie_names: loginCookieNames,
+    login_evidence: loginCookieNames.length > 0 ? "cookie" : hasSyncedBrowserState ? "cookie+storage" : "none",
+    storage_origin_count: storageOriginCount,
+    domains: [...new Set(douyinCookies.map((cookie) => stringValue(cookie.domain)).filter(Boolean))],
+    source,
+    username: ""
+  };
+}
+
+async function addCookiesToContext(context, cookies, source) {
+  const normalized = normalizeCookiesForPlaywright(cookies);
+  if (!normalized.length) return 0;
+  try {
+    await context.addCookies(normalized);
+    return normalized.length;
+  } catch (error) {
+    serviceLog("warn", "cookies", `Failed to add Douyin cookies to worker context during ${source}: ${errorMessage(error)}`, {
+      count: normalized.length
+    });
+    return 0;
+  }
+}
+
+function normalizeCookiesForPlaywright(cookies) {
+  if (!Array.isArray(cookies)) return [];
+  const result = [];
+  for (const cookie of cookies) {
+    if (!cookie || typeof cookie !== "object") continue;
+    const name = stringValue(cookie.name);
+    const value = cookie.value == null ? "" : String(cookie.value);
+    const domain = stringValue(cookie.domain);
+    if (!name || !domain || !isDouyinCookie(cookie)) continue;
+    const normalized = {
+      name,
+      value,
+      domain,
+      path: stringValue(cookie.path) || "/",
+      httpOnly: Boolean(cookie.httpOnly),
+      secure: cookie.secure !== false
+    };
+    const expires = Number(cookie.expires ?? cookie.expirationDate);
+    if (Number.isFinite(expires) && expires > 0) normalized.expires = Math.floor(expires);
+    const sameSite = normalizeSameSite(cookie.sameSite);
+    if (sameSite) normalized.sameSite = sameSite;
+    result.push(normalized);
+  }
+  return result;
+}
+
+function normalizeSameSite(value) {
+  const normalized = stringValue(value).toLowerCase().replace(/[_\s-]+/g, "");
+  if (!normalized || normalized === "unspecified") return undefined;
+  if (normalized === "lax") return "Lax";
+  if (normalized === "strict") return "Strict";
+  if (normalized === "none" || normalized === "norestriction") return "None";
+  return undefined;
 }
 
 async function loadStorage(context) {
@@ -1811,7 +1978,7 @@ function isDouyinCookie(cookie) {
 }
 
 function browserQueueSummary() {
-  return { pending: browserTaskPending, active: browserTaskActive };
+  return { pending: browserTaskPending, maxPending: BROWSER_QUEUE_MAX_PENDING, active: browserTaskActive, generation: browserTaskGeneration };
 }
 
 function createRequestAbortSignal(req, res) {
