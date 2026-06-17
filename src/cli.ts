@@ -117,6 +117,10 @@ async function main(): Promise<void> {
             ? await syncCdpCookiesToMcp(config, Number(args.port ?? getDefaultCdpPort()))
             : await syncBrowserViewerCookiesToMcp(config);
         console.log(`Cookies: exported ${result.exportedCookies} to ${result.cookiesPath}`);
+        const storageResult = result as { storagePath?: string; exportedStorageOrigins?: number };
+        if (storageResult.storagePath) {
+          console.log(`Storage: exported ${storageResult.exportedStorageOrigins ?? 0} origins to ${storageResult.storagePath}`);
+        }
         break;
       }
       default:

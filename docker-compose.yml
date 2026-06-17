@@ -14,6 +14,9 @@ services:
       - ./mcp/xiaohongshu/data:/app/mcp/xiaohongshu/data
       - ./mcp/xiaohongshu/images:/app/mcp/xiaohongshu/images
     environment:
+      - TZ=Asia/Shanghai
+      - BROWSER_TIMEZONE_ID=Asia/Shanghai
+      - XHS_TIMEZONE_ID=Asia/Shanghai
       - PORT=4173
       - KATO_API_TOKEN=${KATO_API_TOKEN:-LiuTao0.1}
       - XHS_SERVICE_PORT=18060
@@ -37,6 +40,7 @@ services:
       - DOUYIN_INTERNAL_CDP_PORT=9235
       - BILIBILI_INTERNAL_CDP_PORT=9245
       - XHS_PROFILE_DIR=/app/data/platforms/xhs/worker-profile
+      - XHS_STORAGE_PATH=/app/data/platforms/xhs/storage.json
       - DOUYIN_PROFILE_DIR=/app/data/platforms/douyin/worker-profile
       - BILIBILI_PROFILE_DIR=/app/data/platforms/bilibili/worker-profile
       - COOKIES_PATH=/app/mcp/xiaohongshu/data/cookies.json

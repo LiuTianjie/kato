@@ -32,6 +32,7 @@ const VIEWER_RUNTIME_URL =
 const INTERNAL_CDP_PORT = Number(process.env.XHS_INTERNAL_CDP_PORT || process.env.BROWSER_CDP_PORT || process.env.XHS_CDP_PORT || 9224);
 const PROFILE_DIR = process.env.XHS_PROFILE_DIR || "/app/data/profile";
 const COOKIES_PATH = process.env.COOKIES_PATH || "/app/data/cookies.json";
+const STORAGE_PATH = process.env.XHS_STORAGE_PATH || "/app/data/platforms/xhs/storage.json";
 const COOKIE_FALLBACK_PATHS = uniquePaths([
   COOKIES_PATH,
   "/app/mcp/xiaohongshu/data/cookies.json",
@@ -60,6 +61,7 @@ const WINDOWS_USER_AGENT =
 const WINDOWS_ACCEPT_LANGUAGE = process.env.XHS_BROWSER_ACCEPT_LANGUAGE || "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7";
 const WINDOWS_NAVIGATOR_PLATFORM = process.env.XHS_NAVIGATOR_PLATFORM || "Win32";
 const WINDOWS_PLATFORM_VERSION = process.env.XHS_BROWSER_PLATFORM_VERSION || "10.0.0";
+const TIMEZONE_ID = process.env.XHS_TIMEZONE_ID || process.env.BROWSER_TIMEZONE_ID || "Asia/Shanghai";
 const WINDOWS_UA_METADATA = {
   brands: [
     { brand: "Google Chrome", version: BROWSER_MAJOR_VERSION },
@@ -83,6 +85,7 @@ const WINDOWS_UA_METADATA = {
 const XHS_HOME_URL = "https://www.xiaohongshu.com/explore";
 const XHS_CREATOR_URL = "https://creator.xiaohongshu.com";
 const XHS_COOKIE_DOMAINS = [".xiaohongshu.com", "xiaohongshu.com", ".xhslink.com", "xhslink.com", ".xhscdn.com"];
+const XHS_STORAGE_DOMAINS = ["xiaohongshu.com", "xhslink.com", "xhscdn.com"];
 
 let contextPromise;
 let servicePagePromise;
@@ -94,6 +97,8 @@ let browserTaskPending = 0;
 let browserTaskActive = null;
 let browserPriorityPromise;
 let cookiePersistTimer;
+let lastStorageSyncAt = null;
+let loadedStorageOrigins = 0;
 const postTokenCache = new Map();
 
 class BrowserTaskTimeoutError extends Error {
@@ -228,12 +233,38 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/v1/browser/sync-cookies") {
       const cookies = await exportViewerCookies(XHS_COOKIE_DOMAINS);
+      let storageExportFailed = false;
+      const storage = await exportViewerStorage(XHS_COOKIE_DOMAINS).catch((error) => {
+        storageExportFailed = true;
+        const message = error instanceof Error ? error.message : String(error);
+        serviceLog("warn", "storage", `XHS browser storage sync failed: ${message}`);
+        return [];
+      });
       await persistCookies(cookies, "manual-sync");
+      if (!storageExportFailed) {
+        if (storage.length) await persistStorage(storage, "manual-sync");
+        else await ensureStorageFile("manual-sync");
+      }
       const context = contextPromise ? await contextPromise.catch(() => undefined) : undefined;
       if (context && cookies.length) await context.addCookies(cookies).catch(() => undefined);
+      if (context && storage.length) await restoreStorage(context, storage).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        serviceLog("warn", "storage", `XHS worker storage restore after sync failed: ${message}`);
+      });
       const exportedCookies = cookies.length;
-      serviceLog("info", "cookies", "Browser cookies synced manually.", { exportedCookies });
-      sendJson(res, 200, { success: true, data: { cookiesPath: COOKIES_PATH, exportedCookies } });
+      serviceLog("info", "cookies", "Browser state synced manually.", {
+        exportedCookies,
+        exportedStorageOrigins: storage.length
+      });
+      sendJson(res, 200, {
+        success: true,
+        data: {
+          cookiesPath: COOKIES_PATH,
+          storagePath: STORAGE_PATH,
+          exportedCookies,
+          exportedStorageOrigins: storage.length
+        }
+      });
       return;
     }
 
@@ -335,6 +366,7 @@ async function shutdown() {
   try {
     const context = contextPromise ? await contextPromise : undefined;
     if (context) await persistContextCookies(context, "shutdown").catch(() => undefined);
+    if (context) await persistContextStorage(context, "shutdown").catch(() => undefined);
     await context?.browser()?.close().catch(() => undefined);
   } finally {
     stopCookieAutoPersist();
@@ -347,14 +379,15 @@ async function browserSummary() {
     ok: false,
     error: error instanceof Error ? error.message : String(error)
   }));
-  if (!contextPromise) return { running: false, queue: browserQueueSummary(), stealth: stealthSummary(), runtime };
+  if (!contextPromise) return { running: false, queue: browserQueueSummary(), state: stateSummary(), stealth: stealthSummary(), runtime };
   try {
     const context = await withTimeout(contextPromise, BROWSER_STATUS_TIMEOUT_MS, "Browser status timed out.");
-    return { running: true, pages: context.pages().length, queue: browserQueueSummary(), stealth: stealthSummary(), runtime };
+    return { running: true, pages: context.pages().length, queue: browserQueueSummary(), state: stateSummary(), stealth: stealthSummary(), runtime };
   } catch (error) {
     return {
       running: false,
       queue: browserQueueSummary(),
+      state: stateSummary(),
       stealth: stealthSummary(),
       runtime,
       error: error instanceof Error ? error.message : String(error)
@@ -370,6 +403,7 @@ async function healthBrowserSummary({ ensure = false } = {}) {
     return {
       running: false,
       queue: browserQueueSummary(),
+      state: stateSummary(),
       stealth: stealthSummary(),
       error: error instanceof Error ? error.message : String(error)
     };
@@ -382,7 +416,20 @@ function stealthSummary() {
     plugin: STEALTH_PLUGIN_READY,
     customFingerprint: true,
     platform: "Windows",
+    timezoneId: TIMEZONE_ID,
+    locale: "zh-CN",
+    acceptLanguage: WINDOWS_ACCEPT_LANGUAGE,
     cdp: "internal-loopback"
+  };
+}
+
+function stateSummary() {
+  return {
+    cookiesPath: COOKIES_PATH,
+    storagePath: STORAGE_PATH,
+    storageLoaded: loadedStorageOrigins > 0,
+    loadedStorageOrigins,
+    lastStorageSyncAt
   };
 }
 
@@ -575,6 +622,7 @@ async function launchContext() {
     const context = browser.contexts()[0] || (await browser.newContext({ viewport: { width: 1440, height: 980 }, locale: "zh-CN" }));
     await configureContextFingerprint(context);
     await loadCookies(context);
+    await loadStorage(context);
     startCookieAutoPersist(context);
     context.on("page", (page) => {
       page.setDefaultTimeout(30_000);
@@ -654,6 +702,11 @@ async function configureContextFingerprint(context) {
 async function applyPageFingerprint(page) {
   const session = await page.context().newCDPSession(page);
   try {
+    await session.send("Emulation.setTimezoneOverride", { timezoneId: TIMEZONE_ID }).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      serviceLog("warn", "stealth", `Timezone override failed: ${message}`);
+    });
+    await session.send("Emulation.setLocaleOverride", { locale: "zh-CN" }).catch(() => undefined);
     await session.send("Emulation.setUserAgentOverride", {
       userAgent: WINDOWS_USER_AGENT,
       acceptLanguage: WINDOWS_ACCEPT_LANGUAGE,
@@ -841,6 +894,7 @@ async function restartBrowser(reason = "manual", taskContext) {
     if (oldContextPromise) {
       const context = await withTimeout(oldContextPromise, 1_500, "Old browser context close timed out.").catch(() => undefined);
       if (context) await persistContextCookies(context, "restart").catch(() => undefined);
+      if (context) await persistContextStorage(context, "restart").catch(() => undefined);
       await withTimeout(context?.browser()?.close(), 1_500, "Old browser close timed out.").catch(() => undefined);
     }
 
@@ -1559,6 +1613,53 @@ async function loadCookies(context) {
   serviceLog("warn", "cookies", "No exported XHS cookies found.", { paths: COOKIE_FALLBACK_PATHS });
 }
 
+async function loadStorage(context) {
+  try {
+    const text = await readFile(STORAGE_PATH, "utf8");
+    const storage = filterXhsStorageEntries(JSON.parse(text));
+    if (storage.length) {
+      loadedStorageOrigins = await restoreStorage(context, storage);
+      serviceLog("info", "storage", `Loaded ${loadedStorageOrigins} XHS storage origins.`, { storagePath: STORAGE_PATH });
+    }
+  } catch {
+    // Missing storage files are normal on first boot.
+  }
+}
+
+async function restoreStorage(context, storage) {
+  let restored = 0;
+  for (const entry of filterXhsStorageEntries(storage)) {
+    const origin = String(entry?.origin || "");
+    const page = await context.newPage();
+    try {
+      await applyPageFingerprint(page).catch(() => undefined);
+      await page.goto(origin, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
+      await page.evaluate(({ localStorageData, sessionStorageData }) => {
+        const apply = (target, data) => {
+          if (!data || typeof data !== "object") return;
+          for (const [key, value] of Object.entries(data)) {
+            try {
+              target.setItem(key, String(value ?? ""));
+            } catch {
+              // Ignore storage quota and platform-owned key failures.
+            }
+          }
+        };
+        apply(localStorage, localStorageData);
+        apply(sessionStorage, sessionStorageData);
+      }, { localStorageData: entry.localStorage || {}, sessionStorageData: entry.sessionStorage || {} });
+      restored += 1;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      serviceLog("warn", "storage", `XHS storage restore failed for ${origin}: ${message}`);
+    } finally {
+      await page.close({ runBeforeUnload: false }).catch(() => undefined);
+    }
+  }
+  loadedStorageOrigins = restored;
+  return restored;
+}
+
 async function persistContextCookies(context, reason = "auto") {
   const cookies = await context.cookies();
   const xhsCookies = cookies.filter((cookie) => /xiaohongshu|xhs|rednote/i.test(cookie.domain));
@@ -1581,6 +1682,82 @@ async function persistCookies(cookies, reason = "manual") {
     })
   );
   serviceLog("info", "cookies", `Persisted ${cookies.length} XHS cookies.`, { reason, cookiesPath: COOKIES_PATH });
+}
+
+async function persistContextStorage(context, reason = "auto") {
+  const storage = await exportContextStorage(context);
+  if (!storage.length) return 0;
+  await persistStorage(storage, reason);
+  return storage.length;
+}
+
+async function exportContextStorage(context) {
+  const byOrigin = new Map();
+  for (const page of context.pages()) {
+    if (page.isClosed()) continue;
+    const pageUrl = String(page.url() || "");
+    let origin = "";
+    try {
+      const url = new URL(pageUrl);
+      origin = url.origin;
+      if (!isAllowedXhsStorageOrigin(origin)) continue;
+    } catch {
+      continue;
+    }
+    if (byOrigin.has(origin)) continue;
+    try {
+      const value = await page.evaluate(() => {
+        const copy = (storage) => {
+          const out = {};
+          for (let index = 0; index < storage.length; index += 1) {
+            const key = storage.key(index);
+            if (key) out[key] = storage.getItem(key);
+          }
+          return out;
+        };
+        return { origin: location.origin, url: location.href, localStorage: copy(localStorage), sessionStorage: copy(sessionStorage) };
+      });
+      if (value?.origin && isAllowedXhsStorageOrigin(value.origin)) byOrigin.set(value.origin, value);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      serviceLog("warn", "storage", `XHS context storage export failed for ${pageUrl}: ${message}`);
+    }
+  }
+  return [...byOrigin.values()];
+}
+
+async function persistStorage(storage, reason = "manual") {
+  const filtered = filterXhsStorageEntries(storage);
+  await mkdir(path.dirname(STORAGE_PATH), { recursive: true });
+  await writeFile(STORAGE_PATH, JSON.stringify(filtered, null, 2), "utf8");
+  loadedStorageOrigins = filtered.length;
+  lastStorageSyncAt = new Date().toISOString();
+  serviceLog("info", "storage", `Persisted ${filtered.length} XHS storage origins.`, { reason, storagePath: STORAGE_PATH });
+}
+
+async function ensureStorageFile(reason = "manual") {
+  try {
+    await readFile(STORAGE_PATH, "utf8");
+    lastStorageSyncAt = new Date().toISOString();
+  } catch {
+    await persistStorage([], reason);
+  }
+}
+
+function filterXhsStorageEntries(storage) {
+  if (!Array.isArray(storage)) return [];
+  return storage.filter((entry) => isAllowedXhsStorageOrigin(String(entry?.origin || "")));
+}
+
+function isAllowedXhsStorageOrigin(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+    const hostname = url.hostname.toLowerCase();
+    return XHS_STORAGE_DOMAINS.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`));
+  } catch {
+    return false;
+  }
 }
 
 function startCookieAutoPersist(context) {
@@ -1841,8 +2018,22 @@ async function exportViewerCookies(domains) {
   return Array.isArray(data?.cookies) ? data.cookies : [];
 }
 
+async function exportViewerStorage(domains) {
+  const payload = await fetchRuntimeJson(
+    "/browser/storage/export",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ domains })
+    },
+    BROWSER_RUNTIME_TIMEOUT_MS
+  );
+  const data = payload?.data || payload;
+  return filterXhsStorageEntries(Array.isArray(data?.storage) ? data.storage : []);
+}
+
 async function fetchRuntimeJson(endpoint, init = {}, timeoutMs = BROWSER_RUNTIME_TIMEOUT_MS) {
-  const baseUrl = endpoint === "/browser/cookies/export" ? VIEWER_RUNTIME_URL : BROWSER_RUNTIME_URL;
+  const baseUrl = endpoint === "/browser/cookies/export" || endpoint === "/browser/storage/export" ? VIEWER_RUNTIME_URL : BROWSER_RUNTIME_URL;
   const url = `${baseUrl.replace(/\/$/, "")}${endpoint}`;
   const response = await fetchWithAbort(url, init, timeoutMs);
   const text = await response.text();

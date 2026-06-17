@@ -117,15 +117,16 @@ docker compose up -d --build
 1. 打开 dashboard 的“浏览器接管”页。
 2. 选择“小红书登录”“抖音登录”或“B站登录”，Kato 会打开该平台的 viewer runtime。
 3. 在 noVNC 画面里扫码或完成验证。
-4. 登录成功后，点击对应平台的“同步 Cookie”。
+4. 登录成功后，点击对应平台的“同步状态”。
 
-viewer runtime 只给人登录和观察页面用；worker runtime 只给接口任务使用。两者不共享 Chrome profile，登录态会通过“同步 Cookie”从 viewer 导出并注入/持久化到 worker，避免人工操作把正在跑的接口任务导航走。
+viewer runtime 只给人登录和观察页面用；worker runtime 只给接口任务使用。两者不共享 Chrome profile，登录态会通过“同步状态”从 viewer 导出并注入/持久化到 worker，避免人工操作把正在跑的接口任务导航走。小红书和抖音会同步 Cookie 以及 localStorage/sessionStorage；B站当前同步 Cookie。
 
 小红书登录态会保存到：
 
 ```text
 mcp/xiaohongshu/data/cookies.json
 /app/data/platforms/xhs/cookies.json
+/app/data/platforms/xhs/storage.json
 ```
 
 抖音登录态会保存到：
@@ -154,7 +155,7 @@ npm run auth:cdp -- --restart
 npm run auth:sync-cookies
 ```
 
-如果已经在 noVNC 里完成登录，需要手动再同步一次小红书 Cookie，可以运行：
+如果已经在 noVNC 里完成登录，需要手动再同步一次小红书状态，可以运行：
 
 ```bash
 npm run auth:sync-cookies

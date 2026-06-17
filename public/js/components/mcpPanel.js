@@ -100,7 +100,7 @@ export async function syncPlatformCookies(platform, button) {
       $("mcpState").className = "mcp-state ok";
       setChallengeFlowStatus(`${label}状态已同步，可以重试刚才的任务`);
       appendClientLog(
-        `成功 · ${label}已导出 ${result.exportedCookies ?? 0} 个 cookies${result.exportedStorageOrigins !== undefined ? ` / ${result.exportedStorageOrigins} 个 storage` : ""} 到 ${result.cookiesPath || "持久化目录"}`
+        `成功 · ${label}已导出 ${result.exportedCookies ?? 0} 个 cookies${result.exportedStorageOrigins !== undefined ? ` / ${result.exportedStorageOrigins} 个 storage origin` : ""} 到 ${result.cookiesPath || "持久化目录"}`
       );
       await refreshPlatformLoginList();
     } catch (error) {

@@ -39,6 +39,7 @@ const EXTERNAL_PROTOCOL_SCHEMES = stringEnv(
 const ACCEPT_LANGUAGE = stringEnv(["BROWSER_ACCEPT_LANGUAGE", "XHS_BROWSER_ACCEPT_LANGUAGE"], "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7");
 const NAVIGATOR_PLATFORM = stringEnv(["BROWSER_NAVIGATOR_PLATFORM", "XHS_NAVIGATOR_PLATFORM"], "Win32");
 const WINDOWS_PLATFORM_VERSION = stringEnv(["BROWSER_PLATFORM_VERSION", "XHS_BROWSER_PLATFORM_VERSION"], "10.0.0");
+const TIMEZONE_ID = stringEnv(["BROWSER_TIMEZONE_ID", "XHS_TIMEZONE_ID"], "Asia/Shanghai");
 const BROWSER_VERSION = detectChromeVersion();
 const BROWSER_MAJOR_VERSION = stringEnv(["BROWSER_MAJOR_VERSION", "XHS_BROWSER_MAJOR_VERSION"], BROWSER_VERSION.major);
 const USER_AGENT =
@@ -313,8 +314,21 @@ async function runtimeStatus() {
       port: NOVNC_PORT,
       ready: VNC_ENABLED ? (await isHttpReady(`http://127.0.0.1:${NOVNC_PORT}/vnc.html`, 600)).ok : false
     },
+    fingerprint: fingerprintSummary(),
     logs: { cursor: logSeq },
     lease: leaseSummary()
+  };
+}
+
+function fingerprintSummary() {
+  return {
+    timezoneId: TIMEZONE_ID,
+    locale: "zh-CN",
+    acceptLanguage: ACCEPT_LANGUAGE,
+    navigatorPlatform: NAVIGATOR_PLATFORM,
+    userAgent: redactUserAgent(USER_AGENT),
+    webglBackend: ENABLE_WEBGL ? WEBGL_BACKEND : "disabled",
+    profileDir: PROFILE_DIR
   };
 }
 
@@ -569,6 +583,9 @@ async function applyFingerprintToPageTarget(page, reason) {
   const alreadyInitialized = fingerprintedTargets.has(targetKey);
   await sendCdpCommand(page.webSocketDebuggerUrl, "Network.enable", {}).catch(() => undefined);
   await setUserAgentOverride(page.webSocketDebuggerUrl);
+  await sendCdpCommand(page.webSocketDebuggerUrl, "Emulation.setTimezoneOverride", { timezoneId: TIMEZONE_ID }).catch((error) => {
+    serviceLog("warn", "fingerprint", `Timezone override failed: ${error instanceof Error ? error.message : String(error)}`);
+  });
   await sendCdpCommand(page.webSocketDebuggerUrl, "Emulation.setLocaleOverride", { locale: "zh-CN" }).catch(() => undefined);
   await sendCdpCommand(page.webSocketDebuggerUrl, "Page.enable", {}).catch(() => undefined);
   const source = browserFingerprintSource();

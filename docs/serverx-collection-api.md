@@ -36,14 +36,14 @@ https://kato.itool.tech
 2. 进入“浏览器接管”。
 3. 点击对应平台登录按钮：小红书、抖音、B站。
 4. 在 noVNC 画面中扫码登录。
-5. 点击“同步 Cookie”或“同步状态”。
+5. 点击“同步状态”。
 
 如果接口返回 `40102` / `CHALLENGE_REQUIRED`，说明平台当前要求人工安全验证，不是 Kato parser 假失败。处理流程：
 
 1. 打开 Kato dashboard 的“浏览器接管”。
 2. 在“验证处理”区域选择对应平台，点击“打开验证页”。
 3. 在 noVNC 画面里完成验证码或安全验证。
-4. 点击同一行的“同步状态”。抖音会同步 Cookie 以及 localStorage/sessionStorage。
+4. 点击同一行的“同步状态”。小红书和抖音会同步 Cookie 以及 localStorage/sessionStorage。
 5. 重试刚才的 ServerX 任务。
 
 这套流程适用于换环境、重启容器、平台挑战失效等情况。Kato 会把挑战状态写入任务日志，并返回明确错误码，不会把验证码页伪装成空结果。

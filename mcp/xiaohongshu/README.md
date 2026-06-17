@@ -29,13 +29,14 @@ xhs-viewer: 人工登录/noVNC/扫码
 xhs-worker: 搜索、详情、评论等接口任务
 ```
 
-两个 runtime 不共享 Chrome profile。完成 noVNC 登录后，需要在 dashboard 里点击“小红书同步 Cookie”，或运行根目录的 `npm run auth:sync-cookies`，把 viewer Cookie 导出并注入 worker。
+两个 runtime 不共享 Chrome profile。完成 noVNC 登录后，需要在 dashboard 里点击“小红书同步状态”，或运行根目录的 `npm run auth:sync-cookies`，把 viewer Cookie 和 localStorage/sessionStorage 导出并注入 worker。
 
 登录态会保存在：
 
 ```text
 mcp/xiaohongshu/data/cookies.json
 /app/data/platforms/xhs/cookies.json
+/app/data/platforms/xhs/storage.json
 ```
 
 本目录不需要 `source/`。历史上如果本机存在 `mcp/xiaohongshu/source/`，它会被 `.gitignore` 和 `.dockerignore` 排除，不参与开源发布和镜像构建。

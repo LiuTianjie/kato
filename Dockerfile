@@ -9,7 +9,9 @@ RUN npm ci && npm run build && npm prune --omit=dev
 FROM node:22-bookworm-slim AS browser-runtime
 
 ENV NODE_ENV=production \
+    TZ=Asia/Shanghai \
     PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    BROWSER_TIMEZONE_ID=Asia/Shanghai \
     BROWSER_RUNTIME_PORT=18100 \
     BROWSER_BIN=/usr/local/bin/kato-chromium \
     BROWSER_CDP_HOST=127.0.0.1 \
@@ -32,6 +34,7 @@ ENV NODE_ENV=production \
     XHS_VNC_PORT=5900 \
     XHS_NOVNC_PORT=6080 \
     XHS_CHROME_USER=kato \
+    XHS_TIMEZONE_ID=Asia/Shanghai \
     XHS_CHROME_NO_SANDBOX=1
 
 RUN apt-get update \
@@ -41,6 +44,7 @@ RUN apt-get update \
     gnupg \
     locales \
     tini \
+    tzdata \
     wget \
     xauth \
     x11vnc \
@@ -82,6 +86,9 @@ CMD ["/app/browser-runtime/bin/start-browser-runtime.sh"]
 FROM browser-runtime AS kato
 
 ENV PORT=4173 \
+    TZ=Asia/Shanghai \
+    BROWSER_TIMEZONE_ID=Asia/Shanghai \
+    XHS_TIMEZONE_ID=Asia/Shanghai \
     XHS_SERVICE_PORT=18060 \
     DOUYIN_SERVICE_PORT=18070 \
     BILIBILI_SERVICE_PORT=18080 \
@@ -100,6 +107,7 @@ ENV PORT=4173 \
     DOUYIN_INTERNAL_CDP_PORT=9235 \
     BILIBILI_INTERNAL_CDP_PORT=9245 \
     XHS_PROFILE_DIR=/app/data/platforms/xhs/worker-profile \
+    XHS_STORAGE_PATH=/app/data/platforms/xhs/storage.json \
     DOUYIN_PROFILE_DIR=/app/data/platforms/douyin/worker-profile \
     BILIBILI_PROFILE_DIR=/app/data/platforms/bilibili/worker-profile \
     COOKIES_PATH=/app/mcp/xiaohongshu/data/cookies.json \

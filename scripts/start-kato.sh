@@ -15,6 +15,10 @@ trap cleanup INT TERM EXIT
 CHROME_USER="${BROWSER_CHROME_USER:-${XHS_CHROME_USER:-kato}}"
 BROWSER_BIN_DEFAULT="${BROWSER_BIN:-/usr/local/bin/kato-chromium}"
 
+export TZ="${TZ:-Asia/Shanghai}"
+export BROWSER_TIMEZONE_ID="${BROWSER_TIMEZONE_ID:-Asia/Shanghai}"
+export XHS_TIMEZONE_ID="${XHS_TIMEZONE_ID:-${BROWSER_TIMEZONE_ID}}"
+
 XHS_VIEWER_RUNTIME_PORT="${XHS_VIEWER_RUNTIME_PORT:-18100}"
 XHS_WORKER_RUNTIME_PORT="${XHS_WORKER_RUNTIME_PORT:-${BROWSER_RUNTIME_PORT:-18101}}"
 DOUYIN_VIEWER_RUNTIME_PORT="${DOUYIN_VIEWER_RUNTIME_PORT:-18110}"
@@ -40,6 +44,7 @@ export BROWSER_RUNTIME_PORT="${BROWSER_RUNTIME_PORT:-${XHS_WORKER_RUNTIME_PORT}}
 export BROWSER_CDP_PORT="${BROWSER_CDP_PORT:-${XHS_INTERNAL_CDP_PORT}}"
 
 export XHS_PROFILE_DIR="${XHS_PROFILE_DIR:-/app/data/platforms/xhs/worker-profile}"
+export XHS_STORAGE_PATH="${XHS_STORAGE_PATH:-/app/data/platforms/xhs/storage.json}"
 export DOUYIN_PROFILE_DIR="${DOUYIN_PROFILE_DIR:-/app/data/platforms/douyin/worker-profile}"
 export BILIBILI_PROFILE_DIR="${BILIBILI_PROFILE_DIR:-/app/data/platforms/bilibili/worker-profile}"
 export COOKIES_PATH="${COOKIES_PATH:-/app/mcp/xiaohongshu/data/cookies.json}"
@@ -99,6 +104,9 @@ start_runtime() {
     BROWSER_COOKIE_MIRROR_PATHS="$mirror_paths" \
     BROWSER_BIN="$BROWSER_BIN_DEFAULT" \
     BROWSER_CHROME_USER="$CHROME_USER" \
+    TZ="${TZ:-Asia/Shanghai}" \
+    BROWSER_TIMEZONE_ID="${BROWSER_TIMEZONE_ID:-Asia/Shanghai}" \
+    XHS_TIMEZONE_ID="${XHS_TIMEZONE_ID:-${BROWSER_TIMEZONE_ID:-Asia/Shanghai}}" \
     LANG="${LANG:-zh_CN.UTF-8}" \
     LC_ALL="${LC_ALL:-zh_CN.UTF-8}" \
     LANGUAGE="${LANGUAGE:-zh_CN:zh}" \

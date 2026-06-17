@@ -103,7 +103,9 @@ export async function openBrowserViewerLogin(config: AppConfig, account?: string
   };
 }
 
-export async function syncBrowserViewerCookiesToMcp(config: AppConfig): Promise<{ cookiesPath: string; exportedCookies: number }> {
+export async function syncBrowserViewerCookiesToMcp(
+  config: AppConfig
+): Promise<{ cookiesPath: string; exportedCookies: number; storagePath?: string; exportedStorageOrigins?: number }> {
   const mcpBaseUrl = getMcpRestBaseUrl(config);
   const response = await fetch(`${mcpBaseUrl}/api/v1/browser/sync-cookies`, {
     method: "POST",
@@ -121,7 +123,14 @@ export async function syncBrowserViewerCookiesToMcp(config: AppConfig): Promise<
   }
   const cookiesPath = String((data as { cookiesPath?: unknown }).cookiesPath ?? "mcp/xiaohongshu/data/cookies.json");
   const exportedCookies = Number((data as { exportedCookies?: unknown }).exportedCookies ?? 0);
-  return { cookiesPath, exportedCookies: Number.isFinite(exportedCookies) ? exportedCookies : 0 };
+  const storagePathValue = (data as { storagePath?: unknown }).storagePath;
+  const exportedStorageOrigins = Number((data as { exportedStorageOrigins?: unknown }).exportedStorageOrigins);
+  return {
+    cookiesPath,
+    exportedCookies: Number.isFinite(exportedCookies) ? exportedCookies : 0,
+    storagePath: typeof storagePathValue === "string" && storagePathValue ? storagePathValue : undefined,
+    exportedStorageOrigins: Number.isFinite(exportedStorageOrigins) ? exportedStorageOrigins : undefined
+  };
 }
 
 export async function restartContainerBrowser(config: AppConfig, reason = "manual", port = getDefaultCdpPort()): Promise<unknown> {
