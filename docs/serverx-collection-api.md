@@ -70,6 +70,8 @@ curl -X POST "$KATO_BASE/api/bilibili/web/update_cookie" \
 
 抖音 service 使用容器内真实 Chrome 打开抖音 Web 页面，并监听 Web 网络响应解析搜索、详情和评论。生产建议先登录并同步 Cookie。
 
+实现上会优先在 worker 浏览器上下文里发起抖音 Web API 请求，携带从浏览器读取到的 Cookie、`msToken`、`webid`、`verifyFp/fp` 和完整 Web 参数；评论分页会优先使用抖音返回的 cursor。Kato 不直接依赖 `douyin-download-api`，但参数模型参考了它的 Web crawler。后续如果需要强制使用 `X-Bogus` / `a_bogus` 签名，可以给 Kato 配置独立 signer 服务：`DOUYIN_SIGNER_URL`。默认 signer 不可用时会回退到浏览器同源 fetch；设置 `DOUYIN_SIGNER_REQUIRED=1` 后 signer 失败会返回错误。
+
 ### 搜索视频
 
 ```text

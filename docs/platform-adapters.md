@@ -157,7 +157,8 @@ B 站当前按只读采集接入：
 - 评论分页要保留平台返回的 cursor，不要只用 offset 猜测
 - cookie 按 `.douyin.com`、`.iesdouyin.com`、`.amemv.com` 等域从 Douyin viewer runtime 导出，再注入 Douyin worker runtime
 - 同步状态时同时导出 Douyin viewer 的 localStorage/sessionStorage；否则 viewer 已通过验证但 worker 仍可能落到“验证码中间页”
-- 当前实现复用 Douyin worker runtime 打开真实页面并监听抖音 Web 网络响应，不把 `douyin-download-api` 作为运行依赖
+- 当前实现复用 Douyin worker runtime 打开真实页面并监听抖音 Web 网络响应；同时借鉴 `douyin-download-api` 的 Web 参数模型，补齐 `msToken`、`webid`、`verifyFp/fp`、`item_type`、`cut_version`、`rcFT`、`pc_libra_divert` 等接口参数
+- 不把 `douyin-download-api` 作为运行依赖，也不直接复制其签名算法源码；如需更稳定的 `X-Bogus` / `a_bogus`，可单独部署 signer 服务并通过 `DOUYIN_SIGNER_URL` 接入。`DOUYIN_SIGNER_REQUIRED=1` 可让 signer 失败时直接报错，默认 signer 失败会回退到浏览器同源 fetch
 
 抖音页面变化更频繁，service 内要保留 `raw` payload 和结构化日志，方便线上出问题时从 dashboard 看见是哪一步解析失败。遇到验证码或安全验证时，service 应返回 `CHALLENGE_REQUIRED`，ServerX 兼容接口映射为 `40102`；Dashboard 里必须能通过“浏览器接管”里的“验证处理”完成：
 

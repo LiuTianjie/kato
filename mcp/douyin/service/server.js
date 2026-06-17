@@ -36,6 +36,10 @@ const BROWSER_STATUS_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_BROWSER_STATUS_TI
 const BROWSER_RUNTIME_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_BROWSER_RUNTIME_TIMEOUT_MS", 30_000);
 const HEALTH_ENSURE_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_HEALTH_ENSURE_TIMEOUT_MS", 20_000);
 const BROWSER_TASK_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_BROWSER_TASK_TIMEOUT_MS", 180_000);
+const DOUYIN_SIGNER_URL = stringValue(process.env.DOUYIN_SIGNER_URL || "");
+const DOUYIN_SIGNER_REQUIRED = process.env.DOUYIN_SIGNER_REQUIRED === "1";
+const DOUYIN_SIGNER_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_SIGNER_TIMEOUT_MS", 8_000);
+const DOUYIN_GENERATE_MISSING_TOKENS = process.env.DOUYIN_GENERATE_MISSING_TOKENS !== "0";
 const HUMAN_DELAY_ENABLED = process.env.DOUYIN_HUMAN_DELAY_ENABLED !== "0";
 const TASK_DELAY_MIN_MS = normalizeNonNegativeEnv("DOUYIN_BROWSER_TASK_DELAY_MIN_MS", 900);
 const TASK_DELAY_MAX_MS = normalizeDelayMax("DOUYIN_BROWSER_TASK_DELAY_MAX_MS", 2_600, TASK_DELAY_MIN_MS);
@@ -641,22 +645,40 @@ async function searchPosts(keyword, limit, options = {}) {
       const pageNumber = normalizePositiveInt(options.page, 1);
       serviceLog("info", "posts", "Douyin search requested.", { keyword, limit, page: pageNumber });
       const page = await newTaskPage(taskContext);
-      const capture = startDouyinResponseCapture(page, ["search", "detail"]);
-      const targetUrl = `https://www.douyin.com/search/${encodeURIComponent(keyword)}?type=video`;
+      const offset = (pageNumber - 1) * limit;
+      let directSearch = false;
       let payloads = [];
       try {
-        await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch((error) => {
-          serviceLog("warn", "posts", `Search navigation warning: ${errorMessage(error)}`);
-        });
-        await humanDelay("search:settle", 2_500, 5_500, { signal: taskContext?.signal });
-        await autoScroll(page, Math.max(2, pageNumber + 1), taskContext);
-      } finally {
-        payloads = await capture.stop();
+        await prepareDouyinApiPage(page, "search:api");
+        const directPayload = await withTimeout(
+          fetchSearchInPage(page, { keyword, offset, count: limit }),
+          25_000,
+          "Douyin search API timed out."
+        );
+        payloads = [{ kind: "search", url: "direct:general-search", payload: directPayload }];
+        directSearch = true;
+      } catch (error) {
+        serviceLog("warn", "posts", `Direct search API failed, falling back to page search: ${errorMessage(error)}`);
+        const capture = startDouyinResponseCapture(page, ["search"]);
+        const targetUrl = `https://www.douyin.com/search/${encodeURIComponent(keyword)}?type=video`;
+        try {
+          await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch((navigationError) => {
+            serviceLog("warn", "posts", `Search navigation warning: ${errorMessage(navigationError)}`);
+          });
+          await humanDelay("search:settle", 2_500, 5_500, { signal: taskContext?.signal });
+          await autoScroll(page, Math.max(2, pageNumber + 1), taskContext);
+        } finally {
+          payloads = await capture.stop();
+        }
       }
       taskContext?.throwIfCancelled?.();
-      const posts = uniquePosts([...extractPostsFromPayloads(payloads), ...(await scrapePosts(page))]);
-      const start = (pageNumber - 1) * limit;
-      const result = posts.slice(start, start + limit);
+      const parsedPosts = uniquePosts(extractPostsFromPayloads(payloads));
+      const fallbackPosts = parsedPosts.length ? [] : await scrapePosts(page);
+      const posts = uniquePosts([...parsedPosts, ...fallbackPosts]);
+      const relevantPosts = filterPostsByKeyword(posts, keyword);
+      const sourcePosts = relevantPosts.length || shouldRequireKeywordRelevance(keyword) ? relevantPosts : posts;
+      const start = directSearch ? 0 : (pageNumber - 1) * limit;
+      const result = sourcePosts.slice(start, start + limit);
       const pageTitle = await page.title().catch(() => "");
       const bodyPreview = result.length ? "" : await page.locator("body").innerText({ timeout: 2_000 }).catch(() => "");
       assertNoDouyinChallenge({ pageTitle, bodyPreview, url: page.url(), task: "searchPosts" });
@@ -664,7 +686,9 @@ async function searchPosts(keyword, limit, options = {}) {
         keyword,
         capturedPayloads: payloads.length,
         parsed: posts.length,
+        relevant: relevantPosts.length,
         returned: result.length,
+        directSearch,
         currentUrl: safeLogUrl(page.url()),
         title: pageTitle,
         bodyPreview: sanitizeLogText(bodyPreview).slice(0, 160)
@@ -717,35 +741,41 @@ async function getPostComments(body, limit, taskContext) {
       if (!resolved.awemeId && !resolved.url) throw new Error("aweme_id, id or url is required.");
       const cursor = normalizeCursor(body.cursor, 0);
       const page = await newTaskPage(taskContext);
-      const capture = startDouyinResponseCapture(page, ["comment"]);
-      let payloads = [];
+      let extracted = { comments: [], cursor: "", hasMore: false };
+      let source = "direct";
+      let directError = null;
       try {
-        await page.goto(resolved.url || canonicalPostUrl(resolved.awemeId), { waitUntil: "domcontentloaded", timeout: 60_000 });
-        await humanDelay("comments:settle", 2_000, 4_800, { signal: taskContext?.signal });
-        await autoScroll(page, 2, taskContext);
-      } finally {
-        payloads = await capture.stop();
+        await prepareDouyinApiPage(page, "comments:api");
+        const directPayload = await withTimeout(
+          fetchCommentsInPage(page, "list", { aweme_id: resolved.awemeId, cursor, count: limit }),
+          25_000,
+          "Douyin comments API timed out."
+        );
+        extracted = extractCommentsPayload([directPayload], "");
+      } catch (error) {
+        directError = error;
+        serviceLog("warn", "comments", `Direct comments fetch failed: ${errorMessage(error)}`);
       }
-      await assertPageNotChallenged(page, "getPostComments");
-      let extracted = extractCommentsPayload(payloads, "");
-      if (!extracted.comments.length && resolved.awemeId) {
-        const fallback = await fetchCommentsInPage(page, "list", { aweme_id: resolved.awemeId, cursor, count: limit }).catch((error) => {
-          serviceLog("warn", "comments", `In-page comments fetch failed: ${errorMessage(error)}`);
-          return null;
-        });
-        if (fallback) extracted = extractCommentsPayload([fallback], "");
+      if (directError && !canFallbackCommentsByPage(cursor)) throw directError;
+      if (!extracted.comments.length && (isInitialCursor(cursor) || directError)) {
+        source = "page";
+        extracted = await collectCommentsFromPage(page, resolved, cursor, limit, taskContext);
       }
       const comments = uniqueComments(extracted.comments).slice(0, limit);
+      const hasMore = extracted.hasMore || comments.length >= limit;
+      const nextCursor = normalizeNextCursor(extracted.cursor, cursor, limit, comments.length, hasMore);
       serviceLog("info", "comments", "Douyin comments completed.", {
         awemeId: resolved.awemeId,
         returned: comments.length,
-        cursor
+        cursor,
+        nextCursor,
+        source
       });
       return {
         comments,
         items: comments,
-        cursor: extracted.cursor,
-        has_more: extracted.hasMore || comments.length >= limit
+        cursor: nextCursor,
+        has_more: hasMore
       };
     },
     taskContext
@@ -762,6 +792,7 @@ async function getCommentReplies(body, limit, taskContext) {
       const cursor = normalizeCursor(body.cursor, 0);
       const page = await newTaskPage(taskContext);
       let extracted = { comments: [], cursor: "", hasMore: false };
+      let directError = null;
       try {
         await prepareDouyinApiPage(page, "replies:api");
         const fallback = await withTimeout(
@@ -771,21 +802,65 @@ async function getCommentReplies(body, limit, taskContext) {
         );
         extracted = extractCommentsPayload([fallback], commentId);
       } catch (error) {
+        directError = error;
         serviceLog("warn", "comments", `Direct replies fetch failed: ${errorMessage(error)}`);
       }
-      if (!extracted.comments.length) {
+      if (directError && !isInitialCursor(cursor)) throw directError;
+      if (!extracted.comments.length && isInitialCursor(cursor)) {
         extracted = await expandRepliesFromPage(page, { itemId, commentId, cursor, limit, signal: taskContext?.signal });
       }
       const comments = uniqueComments(extracted.comments.map((comment) => ({ ...comment, parentId: comment.parentId || commentId }))).slice(0, limit);
+      const hasMore = extracted.hasMore || comments.length >= limit;
+      const nextCursor = normalizeNextCursor(extracted.cursor, cursor, limit, comments.length, hasMore);
       return {
         comments,
         items: comments,
-        cursor: extracted.cursor,
-        has_more: extracted.hasMore || comments.length >= limit
+        cursor: nextCursor,
+        has_more: hasMore
       };
     },
     taskContext
   );
+}
+
+async function collectCommentsFromPage(page, resolved, cursor, limit, taskContext) {
+  const offset = cursorToOffset(cursor);
+  const targetCount = offset + limit;
+  const maxRounds = Math.min(36, Math.max(4, Math.ceil(targetCount / 8) + 3));
+  const capture = startDouyinResponseCapture(page, ["comment"]);
+  const payloads = [];
+  try {
+    await page.goto(resolved.url || canonicalPostUrl(resolved.awemeId), { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await humanDelay("comments:settle", 2_000, 4_800, { signal: taskContext?.signal });
+    for (let round = 0; round < maxRounds; round += 1) {
+      taskContext?.throwIfCancelled?.();
+      payloads.push(...(await capture.drain()));
+      const collected = uniqueComments(extractCommentsPayload(payloads, "").comments);
+      if (collected.length >= targetCount) break;
+      await page.mouse.wheel(0, 620 + Math.round(Math.random() * 520)).catch(() => undefined);
+      await humanDelay("comments:page-scroll", 700, 1_700, { signal: taskContext?.signal });
+    }
+  } finally {
+    payloads.push(...(await capture.stop()));
+  }
+  await assertPageNotChallenged(page, "collectCommentsFromPage");
+  const extracted = extractCommentsPayload(payloads, "");
+  const allComments = uniqueComments(extracted.comments);
+  const comments = allComments.slice(offset, offset + limit);
+  const hasMore = comments.length > 0 && (extracted.hasMore || allComments.length > offset + comments.length || comments.length >= limit);
+  serviceLog("info", "comments", "Douyin comments page fallback completed.", {
+    awemeId: resolved.awemeId,
+    cursor,
+    offset,
+    collected: allComments.length,
+    returned: comments.length,
+    maxRounds
+  });
+  return {
+    comments,
+    cursor: hasMore ? String(offset + comments.length) : "",
+    hasMore
+  };
 }
 
 async function resolveDouyinLink(input, taskContext) {
@@ -921,91 +996,275 @@ function classifyDouyinResponse(url) {
   return "";
 }
 
+async function fetchSearchInPage(page, params) {
+  const url = new URL("https://www.douyin.com/aweme/v1/web/general/search/single/");
+  const runtimeParams = await readDouyinRuntimeParams(page);
+  const defaults = {
+    ...douyinWebApiDefaults(runtimeParams),
+    search_channel: "aweme_general",
+    keyword: params.keyword,
+    search_source: "normal_search",
+    query_correct_type: "1",
+    is_filter_search: "0",
+    offset: params.offset,
+    count: params.count,
+    sort_type: params.sort_type ?? "0",
+    publish_time: params.publish_time ?? "0",
+    filter_duration: params.filter_duration ?? "0",
+    need_filter_settings: "1",
+    list_type: "single",
+    update_version_code: "170400"
+  };
+  for (const [key, value] of Object.entries(defaults)) {
+    if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
+  }
+  const requestUrl = await signDouyinApiUrl(page, url.toString(), runtimeParams, "search");
+  return fetchJsonInPage(page, requestUrl, 20_000, "Douyin search fetch timed out.");
+}
+
 async function fetchCommentsInPage(page, type, params) {
   const endpoint =
     type === "reply" ? "https://www.douyin.com/aweme/v1/web/comment/list/reply/" : "https://www.douyin.com/aweme/v1/web/comment/list/";
   const url = new URL(endpoint);
+  const runtimeParams = await readDouyinRuntimeParams(page);
   const defaults = {
-    device_platform: "webapp",
-    aid: "6383",
-    channel: "channel_pc_web",
+    ...douyinWebApiDefaults(runtimeParams),
     item_type: "0",
-    pc_client_type: "1",
-    version_code: "290100",
-    version_name: "29.1.0",
-    cookie_enabled: "true",
-    screen_width: "1440",
-    screen_height: "980",
-    browser_language: "zh-CN",
-    browser_platform: "Win32",
-    browser_name: "Chrome",
-    browser_version: BROWSER_VERSION.full,
-    browser_online: "true",
-    engine_name: "Blink",
-    engine_version: BROWSER_VERSION.full,
-    os_name: "Windows",
-    os_version: "10",
-    cpu_core_num: "12",
-    device_memory: "8",
-    platform: "PC",
-    downlink: "10",
-    effective_type: "4g",
-    round_trip_time: "50"
+    insert_ids: "",
+    whale_cut_token: "",
+    cut_version: "1",
+    rcFT: ""
   };
   for (const [key, value] of Object.entries({ ...defaults, ...params })) {
     if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
   }
-  return page.evaluate(async (requestUrl) => {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(new Error("Douyin comment fetch timed out.")), 20_000);
-    const response = await fetch(requestUrl, {
-      credentials: "include",
-      signal: controller.signal,
-      headers: {
-        accept: "application/json, text/plain, */*",
-        "accept-language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+  const requestUrl = await signDouyinApiUrl(page, url.toString(), runtimeParams, type === "reply" ? "commentReply" : "comment");
+  return fetchJsonInPage(page, requestUrl, 20_000, "Douyin comment fetch timed out.");
+}
+
+function douyinWebApiDefaults(runtimeParams = {}) {
+  return {
+    device_platform: "webapp",
+    aid: "6383",
+    channel: "channel_pc_web",
+    pc_client_type: "1",
+    version_code: "290100",
+    version_name: "29.1.0",
+    cookie_enabled: "true",
+    screen_width: runtimeParams.screenWidth || "1920",
+    screen_height: runtimeParams.screenHeight || "1080",
+    browser_language: runtimeParams.browserLanguage || "zh-CN",
+    browser_platform: "Win32",
+    browser_name: "Chrome",
+    browser_version: BROWSER_VERSION.full,
+    browser_online: runtimeParams.browserOnline || "true",
+    engine_name: "Blink",
+    engine_version: BROWSER_VERSION.full,
+    os_name: "Windows",
+    os_version: "10",
+    cpu_core_num: runtimeParams.hardwareConcurrency || "12",
+    device_memory: runtimeParams.deviceMemory || "8",
+    platform: "PC",
+    downlink: runtimeParams.downlink || "10",
+    effective_type: runtimeParams.effectiveType || "4g",
+    from_user_page: "1",
+    locate_query: "false",
+    need_time_list: "1",
+    pc_libra_divert: "Windows",
+    publish_video_strategy_type: "2",
+    round_trip_time: runtimeParams.roundTripTime || "50",
+    show_live_replay_strategy: "1",
+    time_list_query: "0",
+    whale_cut_token: "",
+    update_version_code: "170400",
+    ...(runtimeParams.webid ? { webid: runtimeParams.webid } : {}),
+    ...(runtimeParams.verifyFp ? { verifyFp: runtimeParams.verifyFp, fp: runtimeParams.verifyFp } : {}),
+    ...(runtimeParams.msToken ? { msToken: runtimeParams.msToken } : {})
+  };
+}
+
+async function readDouyinRuntimeParams(page) {
+  const params = await page
+    .evaluate(() => {
+      const cookies = Object.fromEntries(
+        document.cookie
+          .split(";")
+          .map((item) => item.trim())
+          .filter(Boolean)
+          .map((item) => {
+            const index = item.indexOf("=");
+            if (index < 0) return [item, ""];
+            return [item.slice(0, index), decodeURIComponent(item.slice(index + 1))];
+          })
+      );
+      const safeStorageGet = (key) => {
+        try {
+          return localStorage.getItem(key) || sessionStorage.getItem(key) || "";
+        } catch {
+          return "";
+        }
+      };
+      const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection || {};
+      return {
+        webid: cookies.webid || cookies.s_v_web_id || safeStorageGet("webid") || "",
+        verifyFp: cookies.s_v_web_id || safeStorageGet("s_v_web_id") || safeStorageGet("verifyFp") || "",
+        msToken: cookies.msToken || "",
+        ttwid: cookies.ttwid || "",
+        browserLanguage: navigator.language || "zh-CN",
+        browserOnline: navigator.onLine ? "true" : "false",
+        screenWidth: String(screen.width || window.innerWidth || 1920),
+        screenHeight: String(screen.height || window.innerHeight || 1080),
+        hardwareConcurrency: String(navigator.hardwareConcurrency || 12),
+        deviceMemory: String(navigator.deviceMemory || 8),
+        downlink: String(connection.downlink || 10),
+        effectiveType: String(connection.effectiveType || "4g"),
+        roundTripTime: String(connection.rtt || 50)
+      };
+    })
+    .catch(() => ({}));
+  if (!params.verifyFp && DOUYIN_GENERATE_MISSING_TOKENS) params.verifyFp = generateDouyinVerifyFp();
+  if (!params.webid && params.verifyFp) params.webid = params.verifyFp;
+  if (!params.msToken && DOUYIN_GENERATE_MISSING_TOKENS) params.msToken = generateDouyinMsToken();
+  return params;
+}
+
+async function fetchJsonInPage(page, requestUrl, timeoutMs, timeoutMessage) {
+  return page.evaluate(
+    async ({ requestUrl: innerUrl, timeoutMs: innerTimeoutMs, timeoutMessage: innerTimeoutMessage }) => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(new Error(innerTimeoutMessage)), innerTimeoutMs);
+      const response = await fetch(innerUrl, {
+        credentials: "include",
+        signal: controller.signal,
+        headers: {
+          accept: "application/json, text/plain, */*",
+          "accept-language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+        },
+        mode: "cors",
+        referrer: "https://www.douyin.com/"
+      }).finally(() => clearTimeout(timeout));
+      if (!response.ok) throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 500)}`);
+      return response.json();
+    },
+    { requestUrl, timeoutMs, timeoutMessage }
+  );
+}
+
+async function signDouyinApiUrl(page, requestUrl, runtimeParams, task) {
+  const browserSignedUrl = await signDouyinApiUrlInBrowser(page, requestUrl).catch((error) => {
+    serviceLog("warn", "signer", `Douyin browser signer failed for ${task}: ${errorMessage(error)}`);
+    return "";
+  });
+  if (browserSignedUrl && browserSignedUrl !== requestUrl) {
+    serviceLog("info", "signer", `Douyin browser signer applied for ${task}.`, { task });
+    return browserSignedUrl;
+  }
+
+  if (!DOUYIN_SIGNER_URL) return requestUrl;
+  try {
+    const response = await fetchWithTimeout(
+      new URL(DOUYIN_SIGNER_URL),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          platform: "douyin",
+          task,
+          url: requestUrl,
+          userAgent: WINDOWS_USER_AGENT,
+          runtime: runtimeParams
+        })
+      },
+      DOUYIN_SIGNER_TIMEOUT_MS
+    );
+    const text = await response.text();
+    const payload = text ? JSON.parse(text) : {};
+    if (!response.ok || payload?.success === false) {
+      throw new Error(payload?.error?.message || payload?.message || `HTTP ${response.status}`);
+    }
+    const data = payload?.data || payload;
+    const signedUrl = stringValue(data.signedUrl || data.url || data.requestUrl);
+    if (!signedUrl) throw new Error("Signer response did not include signedUrl/url.");
+    serviceLog("info", "signer", `Douyin external signer applied for ${task}.`, { task });
+    return signedUrl;
+  } catch (error) {
+    const message = `Douyin external signer failed for ${task}: ${errorMessage(error)}`;
+    if (DOUYIN_SIGNER_REQUIRED) throw new Error(message);
+    serviceLog("warn", "signer", message);
+    return requestUrl;
+  }
+}
+
+async function signDouyinApiUrlInBrowser(page, requestUrl) {
+  const signature = await page.evaluate((rawUrl) => {
+    const acrawler = window.byted_acrawler || window.bytedAcrawler || window.bytedCrawler;
+    if (!acrawler || typeof acrawler !== "object") return null;
+    const url = new URL(rawUrl);
+    const query = url.searchParams.toString();
+    const attempts = [
+      () => (typeof acrawler.sign === "function" ? acrawler.sign({ url: url.pathname, params: query }) : null),
+      () => (typeof acrawler.sign === "function" ? acrawler.sign(query) : null),
+      () => (typeof acrawler.frontierSign === "function" ? acrawler.frontierSign({ url: rawUrl }) : null),
+      () => (typeof acrawler.frontierSign === "function" ? acrawler.frontierSign(rawUrl) : null)
+    ];
+    for (const attempt of attempts) {
+      try {
+        const result = attempt();
+        if (result) return result;
+      } catch {
+        // Try the next known browser-side signing shape.
       }
-    }).finally(() => clearTimeout(timeout));
-    if (!response.ok) throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 500)}`);
-    return response.json();
-  }, url.toString());
+    }
+    return null;
+  }, requestUrl);
+  return applyDouyinSignatureResult(requestUrl, signature);
+}
+
+function applyDouyinSignatureResult(requestUrl, signature) {
+  if (!signature) return "";
+  if (typeof signature === "string") {
+    const value = signature.trim();
+    if (!value) return "";
+    if (/^https?:\/\//i.test(value)) return value;
+    const url = new URL(requestUrl);
+    const text = value.replace(/^\?/, "").replace(/^&/, "");
+    if (/=/.test(text)) {
+      for (const pair of text.split("&")) {
+        const index = pair.indexOf("=");
+        if (index <= 0) continue;
+        url.searchParams.set(pair.slice(0, index), pair.slice(index + 1));
+      }
+      return url.toString();
+    }
+    url.searchParams.set("X-Bogus", value);
+    return url.toString();
+  }
+  if (typeof signature === "object") {
+    const signedUrl = stringValue(signature.url || signature.signedUrl || signature.requestUrl);
+    if (signedUrl) return signedUrl;
+    const url = new URL(requestUrl);
+    const xBogus = stringValue(signature["X-Bogus"] || signature.XBogus || signature.x_bogus);
+    const aBogus = stringValue(signature.a_bogus || signature.aBogus || signature["a-bogus"]);
+    if (xBogus) url.searchParams.set("X-Bogus", xBogus);
+    if (aBogus) url.searchParams.set("a_bogus", aBogus);
+    return xBogus || aBogus ? url.toString() : "";
+  }
+  return "";
 }
 
 async function fetchDetailInPage(page, awemeId) {
   await prepareDouyinApiPage(page, "detail:api");
   const url = new URL("https://www.douyin.com/aweme/v1/web/aweme/detail/");
+  const runtimeParams = await readDouyinRuntimeParams(page);
   const defaults = {
-    device_platform: "webapp",
-    aid: "6383",
-    channel: "channel_pc_web",
+    ...douyinWebApiDefaults(runtimeParams),
     aweme_id: awemeId,
-    update_version_code: "170400",
-    pc_client_type: "1",
-    pc_libra_divert: "Windows",
     support_h265: "0",
-    support_dash: "1",
-    cpu_core_num: "12",
-    device_memory: "8",
-    platform: "PC",
-    downlink: "10",
-    effective_type: "4g",
-    round_trip_time: "50"
+    support_dash: "1"
   };
   for (const [key, value] of Object.entries(defaults)) url.searchParams.set(key, String(value));
-  return page.evaluate(async (requestUrl) => {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(new Error("Douyin detail fetch timed out.")), 20_000);
-    const response = await fetch(requestUrl, {
-      credentials: "include",
-      signal: controller.signal,
-      headers: {
-        accept: "application/json, text/plain, */*",
-        "accept-language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
-      }
-    }).finally(() => clearTimeout(timeout));
-    if (!response.ok) throw new Error(`HTTP ${response.status}: ${(await response.text()).slice(0, 500)}`);
-    return response.json();
-  }, url.toString());
+  const requestUrl = await signDouyinApiUrl(page, url.toString(), runtimeParams, "detail");
+  return fetchJsonInPage(page, requestUrl, 20_000, "Douyin detail fetch timed out.");
 }
 
 async function prepareDouyinApiPage(page, task) {
@@ -1200,6 +1459,95 @@ function uniqueComments(comments) {
     result.push(comment);
   }
   return result;
+}
+
+function filterPostsByKeyword(posts, keyword) {
+  const normalizedKeyword = compactSearchText(keyword);
+  if (!normalizedKeyword) return posts;
+  const terms = [
+    normalizedKeyword,
+    ...String(keyword || "")
+      .split(/[\s,，、/|]+/)
+      .map(compactSearchText)
+      .filter((term) => term.length >= 2)
+  ];
+  const uniqueTerms = [...new Set(terms)];
+  return posts.filter((post) => {
+    const rawText = safeJsonStringify(post.raw).slice(0, 20_000);
+    const haystack = compactSearchText([post.title, post.snippet, post.author, post.url, rawText].filter(Boolean).join(" "));
+    return uniqueTerms.some((term) => haystack.includes(term));
+  });
+}
+
+function shouldRequireKeywordRelevance(keyword) {
+  return compactSearchText(keyword).length >= 2;
+}
+
+function compactSearchText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[\s"'“”‘’`~!！?？,，.。:：;；/\\|()[\]{}<>《》【】_-]+/g, "");
+}
+
+function safeJsonStringify(value) {
+  try {
+    return JSON.stringify(value || "");
+  } catch {
+    return "";
+  }
+}
+
+function generateDouyinVerifyFp() {
+  const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+  const timestamp = Date.now().toString(36);
+  const chars = Array.from({ length: 36 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]);
+  chars[8] = "_";
+  chars[13] = "_";
+  chars[14] = "4";
+  chars[18] = "_";
+  chars[19] = alphabet[(alphabet.indexOf(chars[19]) & 3) | 8] || "8";
+  chars[23] = "_";
+  return `verify_${timestamp}_${chars.join("")}`;
+}
+
+function generateDouyinMsToken() {
+  return `${randomTokenString(126)}==`;
+}
+
+function randomTokenString(length) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  let value = "";
+  for (let index = 0; index < length; index += 1) {
+    value += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return value;
+}
+
+function isInitialCursor(cursor) {
+  if (cursor === "" || cursor === undefined || cursor === null) return true;
+  const numeric = Number(cursor);
+  return Number.isFinite(numeric) && numeric <= 0;
+}
+
+function canFallbackCommentsByPage(cursor) {
+  return Number.isFinite(Number(cursor)) && Number(cursor) >= 0;
+}
+
+function cursorToOffset(cursor) {
+  const numeric = Number(cursor);
+  if (!Number.isFinite(numeric) || numeric < 0) return 0;
+  return Math.floor(numeric);
+}
+
+function normalizeNextCursor(rawCursor, requestCursor, limit, returnedCount, hasMore) {
+  const raw = stringValue(rawCursor);
+  if (!hasMore) return raw;
+  const requestNumber = Number(requestCursor);
+  const rawNumber = Number(raw);
+  if (!Number.isFinite(requestNumber)) return raw;
+  if (raw && (!Number.isFinite(rawNumber) || rawNumber > requestNumber)) return raw;
+  const step = Math.max(1, returnedCount || limit || 1);
+  return String(Math.floor(requestNumber) + step);
 }
 
 async function autoScroll(page, rounds, taskContext) {
