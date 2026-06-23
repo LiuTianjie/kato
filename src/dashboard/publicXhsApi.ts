@@ -287,7 +287,7 @@ async function noteCommentsForServerx(
 ): Promise<Record<string, unknown>[]> {
   const post = normalizePostInput(normalizeServerxPostInput(body));
   const comments = await getCommentsStrict(config, post, normalizeLimit(body.max_comments ?? body.limit, 50), options);
-  return comments.map(toServerxComment);
+  return dedupeXhsComments(comments).map(toServerxComment);
 }
 
 async function noteCommentsForTikHub(
@@ -459,6 +459,60 @@ function normalizePositiveInt(value: unknown, fallback: number): number {
   return Math.max(1, Math.floor(numberValue));
 }
 
+function secondsValue(value: unknown): number {
+  if (value == null || value === "") return 0;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value <= 0) return 0;
+    return Math.floor(value);
+  }
+  const text = String(value).trim();
+  if (/^\d+$/.test(text)) {
+    const numeric = Number(text);
+    if (numeric <= 0) return 0;
+    return numeric > 10_000_000_000 ? Math.floor(numeric / 1000) : numeric;
+  }
+  const relative = relativeSecondsValue(text);
+  if (relative) return relative;
+  const monthDay = text.match(/^(\\d{1,2})[-./月](\\d{1,2})(?:日)?$/);
+  if (monthDay) {
+    const date = new Date();
+    date.setMonth(Number(monthDay[1]) - 1, Number(monthDay[2]));
+    date.setHours(0, 0, 0, 0);
+    return Math.floor(date.getTime() / 1000);
+  }
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? Math.floor(parsed / 1000) : 0;
+}
+
+function relativeSecondsValue(text: string): number {
+  const now = Date.now();
+  if (/刚刚/.test(text)) return Math.floor(now / 1000);
+  const match = text.match(/(\d+)\s*(秒|分钟|小时|天|周|月|年)前/);
+  if (match) {
+    const value = Number(match[1]);
+    const multipliers: Record<string, number> = {
+      秒: 1000,
+      分钟: 60 * 1000,
+      小时: 60 * 60 * 1000,
+      天: 24 * 60 * 60 * 1000,
+      周: 7 * 24 * 60 * 60 * 1000,
+      月: 30 * 24 * 60 * 60 * 1000,
+      年: 365 * 24 * 60 * 60 * 1000
+    };
+    const date = new Date(now - value * multipliers[match[2]]);
+    if (["天", "周", "月", "年"].includes(match[2])) {
+      date.setHours(0, 0, 0, 0);
+    }
+    return Math.floor(date.getTime() / 1000);
+  }
+  const dayMatch = text.match(/^(昨天|前天)\s*(\d{1,2}):(\d{2})$/);
+  if (!dayMatch) return 0;
+  const date = new Date(now);
+  date.setDate(date.getDate() - (dayMatch[1] === "昨天" ? 1 : 2));
+  date.setHours(Number(dayMatch[2]), Number(dayMatch[3]), 0, 0);
+  return Math.floor(date.getTime() / 1000);
+}
+
 function normalizeCursorPage(indexValue: unknown, cursorValue: unknown, fallback: number): number {
   const cursorText = String(cursorValue ?? "");
   const offset = /^offset:(\d+)$/.exec(cursorText);
@@ -488,12 +542,14 @@ function normalizePostInput(body: Record<string, unknown>): XhsPost {
 }
 
 function normalizeServerxPostInput(body: Record<string, unknown>): Record<string, unknown> {
-  const noteId = String(body.note_id ?? body.id ?? body.feed_id ?? "").trim();
+  const rawNoteId = String(body.note_id ?? body.id ?? body.feed_id ?? "").trim();
   const url = String(body.url ?? body.share_text ?? "").trim();
-  const xsecToken = optionalString(body.xsec_token ?? body.xsecToken) || extractXsecToken(url);
+  const noteId = looksLikeHttpUrl(rawNoteId) ? "" : rawNoteId;
+  const noteUrl = url || (looksLikeHttpUrl(rawNoteId) ? rawNoteId : "");
+  const xsecToken = optionalString(body.xsec_token ?? body.xsecToken) || extractXsecToken(noteUrl);
   return {
     id: noteId,
-    url: normalizeXhsUrl(url, noteId, xsecToken),
+    url: normalizeXhsUrl(noteUrl, noteId, xsecToken),
     xsecToken,
     title: body.title,
     snippet: body.content ?? body.desc ?? body.note_content,
@@ -542,24 +598,81 @@ function toServerxPost(post: XhsPost, comments: XhsComment[] = []): Record<strin
     },
     like_count: post.likeCount,
     comment_count: post.commentCount ?? payloadComments.length,
+    publish_time: secondsValue(post.publishedAt),
+    create_time: secondsValue(post.publishedAt),
+    published_at: post.publishedAt ?? "",
     comments: payloadComments,
     comment_list: payloadComments
   };
 }
 
 function toServerxComment(comment: XhsComment): Record<string, unknown> {
+  const createTime = secondsValue(comment.publishedAt);
+  const id = normalizeXhsCommentId(comment.id);
   return {
-    id: comment.id,
-    comment_id: comment.id,
-    commentId: comment.id,
+    id,
+    comment_id: id,
+    commentId: id,
     content: comment.content,
     text: comment.content,
     comment_content: comment.content,
     author_name: comment.author ?? "",
     user: { nickname: comment.author ?? "" },
     parent_comment_id: comment.parentId ?? "",
-    parent_id: comment.parentId ?? ""
+    parent_id: comment.parentId ?? "",
+    create_time: createTime,
+    published_at: comment.publishedAt ?? ""
   };
+}
+
+function dedupeXhsComments(comments: XhsComment[]): XhsComment[] {
+  const result: XhsComment[] = [];
+  const stableIds = new Set<string>();
+  const unstableIndexByContent = new Map<string, number>();
+  const stableContentKeys = new Set<string>();
+  for (const comment of comments) {
+    const normalizedId = normalizeXhsCommentId(comment.id);
+    const normalizedComment = { ...comment, id: normalizedId };
+    const contentKey = xhsCommentContentKey(normalizedComment);
+    if (!normalizedId || stableIds.has(normalizedId)) continue;
+    if (isUnstableXhsCommentId(comment.id)) {
+      if (stableContentKeys.has(contentKey)) continue;
+      if (!unstableIndexByContent.has(contentKey)) {
+        unstableIndexByContent.set(contentKey, result.length);
+        result.push(normalizedComment);
+      }
+      continue;
+    }
+    stableIds.add(normalizedId);
+    stableContentKeys.add(contentKey);
+    const unstableIndex = unstableIndexByContent.get(contentKey);
+    if (unstableIndex !== undefined) {
+      result[unstableIndex] = normalizedComment;
+      unstableIndexByContent.delete(contentKey);
+    } else {
+      result.push(normalizedComment);
+    }
+  }
+  return result;
+}
+
+function normalizeXhsCommentId(id: string): string {
+  const value = String(id || "").trim();
+  const prefixed = /^comment-([0-9a-f]{24})$/i.exec(value);
+  return prefixed ? prefixed[1] : value;
+}
+
+function isUnstableXhsCommentId(id: string): boolean {
+  return /^comment-\d+-[0-9a-f]{6,16}$/i.test(String(id || "").trim());
+}
+
+function xhsCommentContentKey(comment: XhsComment): string {
+  return [
+    comment.parentId ?? "",
+    comment.author ?? "",
+    comment.publishedAt ?? "",
+    comment.content
+  ].join("\u0001");
 }
 
 function buildXhsUrl(id: string, rawToken: unknown): string {
@@ -613,6 +726,10 @@ function normalizeUrlCandidate(value: string): string {
   return value;
 }
 
+function looksLikeHttpUrl(value: string): boolean {
+  return /^https?:\/\//i.test(value) || /^(www\.)?(xiaohongshu|xhslink)\.com(\/|$)/i.test(value);
+}
+
 function isXhsExploreUrl(url: URL): boolean {
   return /(^|\.)xiaohongshu\.com$/i.test(url.hostname) && url.pathname.split("/").includes("explore");
 }
@@ -635,7 +752,9 @@ function requireIdempotencyKey(body: Record<string, unknown>): string {
 async function runIdempotent(key: string, task: () => Promise<unknown>): Promise<unknown> {
   const existing = idempotencyResults.get(key);
   if (existing) return existing;
-  const promise = task();
+  const promise = task().finally(() => {
+    idempotencyResults.delete(key);
+  });
   idempotencyResults.set(key, promise);
   return promise;
 }

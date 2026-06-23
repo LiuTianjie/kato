@@ -1097,35 +1097,71 @@ async function searchFeeds(keyword, limit, options = {}) {
     const pageNumber = normalizePositiveInt(options.page, 1);
     serviceLog("info", "feeds", "Search feeds requested.", { keyword, limit, page: pageNumber });
     const page = await servicePage(taskContext);
-    const capture = startPostResponseCapture(page);
-    const url = new URL("https://www.xiaohongshu.com/search_result");
-    url.searchParams.set("keyword", keyword);
-    url.searchParams.set("source", "web_search_result_notes");
-    let capturedPosts = [];
-    try {
+    let lastDiagnostics = null;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const capture = startPostResponseCapture(page);
+      const url = new URL("https://www.xiaohongshu.com/search_result");
+      url.searchParams.set("keyword", keyword);
+      url.searchParams.set("source", "web_search_result_notes");
+      url.searchParams.set("type", "51");
+      let capturedPosts = [];
+      try {
+        taskContext?.throwIfCancelled?.();
+        await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: 60_000 });
+        await page.waitForLoadState("networkidle", { timeout: 12_000 }).catch(() => undefined);
+        await humanDelay("search:settle", 2_400, 5_200, { signal: taskContext?.signal });
+        await autoScroll(page, Math.max(2, pageNumber + 1), taskContext);
+      } finally {
+        capturedPosts = await capture.stop();
+      }
       taskContext?.throwIfCancelled?.();
-      await page.goto(url.toString(), { waitUntil: "domcontentloaded", timeout: 60_000 });
-      await humanDelay("search:settle", 2_400, 5_200, { signal: taskContext?.signal });
-      await autoScroll(page, Math.max(2, pageNumber + 1), taskContext);
-    } finally {
-      capturedPosts = await capture.stop();
+      const posts = [...capturedPosts, ...(await scrapePosts(page))];
+      const start = (pageNumber - 1) * limit;
+      const unique = sortByPublishedAtDesc(uniquePosts(posts));
+      rememberPosts(unique);
+      const result = unique.slice(start, start + limit);
+      lastDiagnostics = result.length ? null : await searchPageDiagnostics(page);
+      serviceLog(result.length ? "info" : "warn", "feeds", "Search feeds attempt completed.", {
+        keyword,
+        page: pageNumber,
+        attempt,
+        captured: capturedPosts.length,
+        scraped: unique.length,
+        returned: result.length,
+        currentUrl: safeLogUrl(page.url()),
+        diagnostics: lastDiagnostics || undefined
+      });
+      if (result.length || attempt >= 2) {
+        serviceLog("info", "feeds", "Search feeds completed.", {
+          keyword,
+          page: pageNumber,
+          captured: capturedPosts.length,
+          scraped: unique.length,
+          returned: result.length,
+          currentUrl: safeLogUrl(page.url())
+        });
+        return result;
+      }
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 45_000 }).catch(() => undefined);
+      await humanDelay("search:retry", 1_200, 2_400, { signal: taskContext?.signal });
     }
-    taskContext?.throwIfCancelled?.();
-    const posts = [...capturedPosts, ...(await scrapePosts(page))];
-    const start = (pageNumber - 1) * limit;
-    const unique = uniquePosts(posts);
-    rememberPosts(unique);
-    const result = unique.slice(start, start + limit);
-    serviceLog("info", "feeds", "Search feeds completed.", {
-      keyword,
-      page: pageNumber,
-      captured: capturedPosts.length,
-      scraped: unique.length,
-      returned: result.length,
-      currentUrl: safeLogUrl(page.url())
-    });
-    return result;
+    serviceLog("warn", "feeds", "Search feeds returned empty result.", { keyword, page: pageNumber, diagnostics: lastDiagnostics || undefined });
+    return [];
   }, taskContext);
+}
+
+async function searchPageDiagnostics(page) {
+  return page.evaluate(() => {
+    const text = (document.body?.innerText || "").replace(/\s+/g, " ").trim();
+    const anchors = [...document.querySelectorAll('a[href*="/explore/"]')];
+    return {
+      title: document.title,
+      readyState: document.readyState,
+      bodyLength: text.length,
+      bodyPreview: text.slice(0, 180),
+      exploreAnchors: anchors.length
+    };
+  }).catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
 }
 
 async function getFeedDetail(body, taskContext) {
@@ -1498,7 +1534,22 @@ function postFromPayloadItem(item) {
     author: firstText(user.nickname, user.nickName, user.name, item.author),
     xsecToken: xsecToken || undefined,
     likeCount: toOptionalCount(interactInfo.liked_count ?? interactInfo.likedCount ?? interactInfo.like_count ?? interactInfo.likeCount),
-    commentCount: toOptionalCount(interactInfo.comment_count ?? interactInfo.commentCount)
+    commentCount: toOptionalCount(interactInfo.comment_count ?? interactInfo.commentCount),
+    publishedAt: normalizePublishTime(
+      item.publishedAt ??
+        item.published_at ??
+        item.publish_time ??
+        item.publishTime ??
+        item.create_time ??
+        item.createTime ??
+        item.time ??
+        note.time ??
+        note.publish_time ??
+        note.create_time ??
+        noteCard?.publish_time ??
+        noteCard?.create_time,
+      id
+    )
   };
 }
 
@@ -1548,6 +1599,7 @@ async function scrapeComments(page) {
         node.id ||
         `comment-${index}-${hashText(`${author}:${text}`)}`;
       const parent = node.closest("[data-comment-id]")?.getAttribute("data-comment-id") || "";
+      const publishedAt = pickTimeText(node);
       return {
         id,
         comment_id: id,
@@ -1555,7 +1607,9 @@ async function scrapeComments(page) {
         text,
         author,
         author_name: author,
-        parent_id: parent && parent !== id ? parent : ""
+        parent_id: parent && parent !== id ? parent : "",
+        published_at: publishedAt,
+        create_time: publishedAt
       };
     });
 
@@ -1604,6 +1658,12 @@ async function scrapeComments(page) {
         .slice(0, 1000);
     }
 
+    function pickTimeText(node) {
+      const text = (node.textContent || "").replace(/\s+/g, " ").trim();
+      const match = text.match(/(刚刚|\d+\s*(?:秒|分钟|小时|天|周|月|年)前|昨天\s*\d{1,2}:\d{2}|前天\s*\d{1,2}:\d{2}|\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}(?:日)?(?:\s+\d{1,2}:\d{2})?|\d{1,2}[-/.]\d{1,2}(?:\s+\d{1,2}:\d{2})?)/);
+      return match?.[1] || "";
+    }
+
     function hashText(value) {
       let hash = 0;
       for (let i = 0; i < value.length; i += 1) {
@@ -1614,33 +1674,146 @@ async function scrapeComments(page) {
   });
 }
 
+function normalizePublishTime(value, fallbackId = "") {
+  const parsed = parsePublishTime(value);
+  if (parsed) return parsed;
+  return parseXhsObjectIdTime(fallbackId);
+}
+
+function parsePublishTime(value) {
+  if (value === undefined || value === null || value === "") return "";
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (value <= 0) return "";
+    const ms = value > 10_000_000_000 ? value : value * 1000;
+    return new Date(ms).toISOString();
+  }
+  const text = String(value).trim();
+  if (!text) return "";
+  if (/^\d+$/.test(text)) {
+    const numeric = Number(text);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      const ms = numeric > 10_000_000_000 ? numeric : numeric * 1000;
+      return new Date(ms).toISOString();
+    }
+  }
+  const relative = parseRelativeTime(text);
+  if (relative) return relative;
+  const monthDay = text.match(/(?:^|\\D)(\\d{1,2})[-./月](\\d{1,2})(?:日)?(?:\\D|$)/);
+  if (monthDay) {
+    const year = new Date().getFullYear();
+    const month = Number(monthDay[1]);
+    const day = Number(monthDay[2]);
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      return new Date(Date.UTC(year, month - 1, day)).toISOString();
+    }
+  }
+  const normalized = text.replace(/年|月/g, "-").replace(/日/g, "");
+  if (!/^\\d{4}-\\d{1,2}-\\d{1,2}(?:[ T]\\d{1,2}:\\d{1,2}(?::\\d{1,2})?)?$/.test(normalized)) return "";
+  const parsed = Date.parse(normalized);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : text;
+}
+
+function parseRelativeTime(text) {
+  const now = Date.now();
+  if (/刚刚/.test(text)) return new Date(now).toISOString();
+  const match = text.match(/(\d+)\s*(秒|分钟|小时|天|周|月|年)前/);
+  if (!match) return "";
+  const value = Number(match[1]);
+  const unit = match[2];
+  const multipliers = {
+    秒: 1000,
+    分钟: 60 * 1000,
+    小时: 60 * 60 * 1000,
+    天: 24 * 60 * 60 * 1000,
+    周: 7 * 24 * 60 * 60 * 1000,
+    月: 30 * 24 * 60 * 60 * 1000,
+    年: 365 * 24 * 60 * 60 * 1000
+  };
+  const date = new Date(now - value * multipliers[unit]);
+  if (["天", "周", "月", "年"].includes(unit)) {
+    date.setHours(0, 0, 0, 0);
+  }
+  return date.toISOString();
+}
+
+function parseXhsObjectIdTime(id) {
+  const text = String(id || "").trim();
+  if (!/^[0-9a-f]{24}$/i.test(text)) return "";
+  const prefix = text.slice(0, 8);
+  if (!/^[0-9a-f]{8}$/i.test(prefix)) return "";
+  const seconds = Number.parseInt(prefix, 16);
+  if (!Number.isFinite(seconds) || seconds < 1_500_000_000 || seconds > 2_100_000_000) return "";
+  return new Date(seconds * 1000).toISOString();
+}
+
 function uniqueComments(comments, limit, offset = 0) {
-  const seen = new Set();
-  const result = [];
-  let skipped = 0;
+  const unique = [];
+  const seenStableIds = new Set();
+  const seenContentKeys = new Map();
   for (const comment of comments) {
     const content = String(comment.content || comment.text || "").trim();
     if (!content) continue;
-    const key = String(comment.id || comment.comment_id || content);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    if (skipped < offset) {
-      skipped += 1;
+    const id = String(comment.id || comment.comment_id || content);
+    const contentKey = stableCommentContentKey(comment, content);
+    const unstableId = isFallbackCommentId(id);
+
+    if (!unstableId && seenStableIds.has(id)) continue;
+    if (contentKey && seenContentKeys.has(contentKey)) {
+      const existingIndex = seenContentKeys.get(contentKey);
+      const existing = unique[existingIndex];
+      if (unstableId || !existing || !isFallbackCommentId(existing.id)) continue;
+      unique[existingIndex] = normalizeComment(comment, id, content);
+      seenStableIds.add(id);
       continue;
     }
-    result.push({
-      id: key,
-      comment_id: key,
+
+    if (!unstableId) seenStableIds.add(id);
+    const index = unique.push(normalizeComment(comment, id, content)) - 1;
+    if (contentKey) seenContentKeys.set(contentKey, index);
+  }
+  const result = sortByPublishedAtDesc(unique);
+  if (offset > 0) return result.slice(offset, offset + limit);
+  return result.slice(0, limit);
+}
+
+function normalizeComment(comment, id, content) {
+  return {
+    id,
+    comment_id: id,
       content,
       text: content,
       author: comment.author || undefined,
       author_name: comment.author_name || comment.author || undefined,
       parent_id: comment.parent_id || undefined,
-      parent_comment_id: comment.parent_id || undefined
-    });
-    if (result.length >= limit) break;
-  }
-  return result;
+      parent_comment_id: comment.parent_id || undefined,
+      create_time: comment.create_time || comment.createTime || comment.published_at || comment.publishedAt || undefined,
+      published_at: comment.published_at || comment.publishedAt || undefined
+  };
+}
+
+function stableCommentContentKey(comment, content) {
+  return [
+    String(comment.parent_id || comment.parent_comment_id || ""),
+    String(comment.author || comment.author_name || ""),
+    String(comment.create_time || comment.createTime || comment.published_at || comment.publishedAt || ""),
+    content
+  ].join("\u0001");
+}
+
+function isFallbackCommentId(value) {
+  return /^comment-\d+-[0-9a-f]{6,16}$/i.test(String(value || ""));
+}
+
+function sortByPublishedAtDesc(items) {
+  return [...items].sort((a, b) => publishedAtMs(b) - publishedAtMs(a));
+}
+
+function publishedAtMs(item) {
+  const value = item?.publishedAt || item?.published_at || item?.create_time || item?.createTime;
+  const parsed = parsePublishTime(value);
+  if (!parsed) return 0;
+  const ms = Date.parse(parsed);
+  return Number.isFinite(ms) ? ms : 0;
 }
 
 async function autoScroll(page, steps, taskContext) {
@@ -1677,7 +1850,8 @@ function uniquePosts(posts) {
       author: post.author || undefined,
       xsecToken: post.xsecToken || parsed.xsecToken || undefined,
       likeCount: post.likeCount,
-      commentCount: post.commentCount
+      commentCount: post.commentCount,
+      publishedAt: post.publishedAt || normalizePublishTime(undefined, post.id) || undefined
     };
     const existing = byId.get(post.id);
     if (!existing) {
@@ -1694,6 +1868,7 @@ function uniquePosts(posts) {
     if (!existing.author && normalized.author) existing.author = normalized.author;
     if (existing.likeCount == null && normalized.likeCount != null) existing.likeCount = normalized.likeCount;
     if (existing.commentCount == null && normalized.commentCount != null) existing.commentCount = normalized.commentCount;
+    if (!existing.publishedAt && normalized.publishedAt) existing.publishedAt = normalized.publishedAt;
   }
   return result;
 }
@@ -1922,9 +2097,10 @@ function buildXhsUrl(id, xsecToken) {
 }
 
 function normalizeDetailInput(body) {
-  const rawUrl = String(body.url || body.share_text || body.shareText || "").trim();
-  const parsed = postFromUrl(extractUrl(rawUrl));
-  const id = String(body.feed_id || body.id || parsed.id || "").trim();
+  const rawId = String(body.feed_id || body.id || "").trim();
+  const rawUrl = String(body.url || body.share_text || body.shareText || (isLikelyUrl(rawId) ? rawId : "")).trim();
+  const parsed = postFromUrl(extractUrl(rawUrl || rawId));
+  const id = String(isLikelyUrl(rawId) ? parsed.id : rawId || parsed.id || "").trim();
   const cached = id ? postTokenCache.get(id) : undefined;
   const xsecToken = String(body.xsec_token || body.xsecToken || parsed.xsecToken || cached?.xsecToken || "").trim();
   const url = normalizeXhsDetailUrl(rawUrl || cached?.url || "", id, xsecToken);
@@ -1952,6 +2128,10 @@ function extractUrl(value) {
   if (!value) return "";
   const match = value.match(/https?:\/\/[^\s"'<>]+/i);
   return match?.[0] || value;
+}
+
+function isLikelyUrl(value) {
+  return /^(https?:)?\/\//i.test(String(value || "")) || /^(www\.)?(xiaohongshu|xhslink)\.com(\/|$)/i.test(String(value || ""));
 }
 
 function normalizeUrlCandidate(value) {
@@ -2051,12 +2231,17 @@ function pagedPayload(key, items, { page, limit }) {
 }
 
 async function ensureRuntimeBrowser() {
-  const payload = await fetchRuntimeJson("/health?ensure=1", {}, BROWSER_RUNTIME_TIMEOUT_MS);
+  const payload = await fetchRuntimeJson("/health", {}, BROWSER_RUNTIME_TIMEOUT_MS);
   const runtime = payload?.runtime || payload?.data?.runtime || payload;
+  const chromeReady = runtime?.chrome?.running === true;
+  const cdpReady = runtime?.cdp?.ready === true;
+  if (!chromeReady || !cdpReady) {
+    throw new Error(`Browser runtime not ready: ${JSON.stringify(runtime)}`);
+  }
   serviceLog("info", "runtime", "Browser runtime ensured.", {
     url: BROWSER_RUNTIME_URL,
-    chrome: runtime?.chrome?.running === true,
-    cdp: runtime?.cdp?.ready === true,
+    chrome: chromeReady,
+    cdp: cdpReady,
     noVnc: runtime?.noVnc?.ready === true
   });
   return runtime;

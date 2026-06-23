@@ -41,7 +41,7 @@ export async function searchOnlyPosts(config: AppConfig, options: SearchOnlyOpti
     await adapter.close?.();
   }
 
-  return { keywords, limit, posts };
+  return { keywords, limit, posts: posts.sort(comparePostPublishedAtDesc) };
 }
 
 function throwIfAborted(signal?: AbortSignal): void {
@@ -54,4 +54,14 @@ function throwIfAborted(signal?: AbortSignal): void {
 function normalizeLimit(value: number): number {
   if (!Number.isFinite(value)) return 20;
   return Math.max(1, Math.min(100, Math.floor(value)));
+}
+
+function comparePostPublishedAtDesc(a: XhsPost, b: XhsPost): number {
+  return parsePublishedAtMs(b.publishedAt) - parsePublishedAtMs(a.publishedAt);
+}
+
+function parsePublishedAtMs(value?: string): number {
+  if (!value) return 0;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : 0;
 }

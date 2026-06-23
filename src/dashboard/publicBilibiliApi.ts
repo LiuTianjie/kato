@@ -56,7 +56,8 @@ async function routePublicBilibiliApi(
     return fetchServiceJson(`/api/v1/videos/search${queryString(body, {
       keyword: body.keyword ?? body.query,
       pn: body.pn ?? body.page,
-      ps: body.ps ?? body.page_size ?? body.limit
+      ps: body.ps ?? body.page_size ?? body.limit,
+      order: body.order ?? orderFromSortLabel(body.sort_label, "totalrank")
     })}`, {}, options.signal);
   }
 
@@ -68,7 +69,8 @@ async function routePublicBilibiliApi(
     return fetchServiceJson(`/api/v1/videos/comments${queryString(body, {
       ...normalizeBilibiliVideoRequest(body),
       pn: body.pn ?? body.page ?? body.num,
-      ps: body.ps ?? body.page_size ?? body.limit ?? body.size
+      ps: body.ps ?? body.page_size ?? body.limit ?? body.size,
+      order: body.order ?? orderFromSortLabel(body.sort_label, "hot")
     })}`, {}, options.signal);
   }
 
@@ -77,7 +79,8 @@ async function routePublicBilibiliApi(
       ...normalizeBilibiliVideoRequest(body),
       root: body.root ?? body.root_id ?? body.rpid ?? body.comment_id,
       pn: body.pn ?? body.page ?? body.num,
-      ps: body.ps ?? body.page_size ?? body.limit ?? body.size
+      ps: body.ps ?? body.page_size ?? body.limit ?? body.size,
+      order: body.order ?? orderFromSortLabel(body.sort_label, "hot")
     })}`, {}, options.signal);
   }
 
@@ -105,6 +108,13 @@ function queryString(source: Record<string, unknown>, fields: Record<string, unk
   }
   const text = params.toString();
   return text ? `?${text}` : "";
+}
+
+function orderFromSortLabel(value: unknown, fallback: string): string {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (normalized === "latest") return fallback === "totalrank" ? "pubdate" : "time";
+  if (normalized === "hot") return fallback === "totalrank" ? "click" : "hot";
+  return fallback;
 }
 
 async function fetchServiceJson(endpoint: string, init: RequestInit = {}, signal?: AbortSignal): Promise<unknown> {

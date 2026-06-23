@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { createHash } from "node:crypto";
 
 const PORT = Number(process.env.PORT || process.env.BILIBILI_SERVICE_PORT || 18080);
 const COOKIES_PATH = process.env.BILIBILI_COOKIES_PATH || "/app/data/platforms/bilibili/cookies.json";
@@ -12,9 +13,16 @@ const USER_AGENT =
   process.env.BILIBILI_USER_AGENT ||
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 const BILIBILI_COOKIE_DOMAINS = [".bilibili.com", "bilibili.com", ".biligame.com", "biligame.com"];
+const WBI_MIXIN_KEY_ENC_TAB = [
+  46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+  27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+  37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+  22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52
+];
 
 let serviceLogSeq = 0;
 const serviceLogs = [];
+let wbiKeyCache = null;
 
 const server = createServer(async (req, res) => {
   try {
@@ -74,7 +82,7 @@ const server = createServer(async (req, res) => {
       if (!keyword) throw httpError(400, "INVALID_PARAMS", "keyword is required.");
       const pn = normalizePositiveInt(body.pn || body.page, 1);
       const ps = normalizeLimit(body.ps || body.page_size || body.limit, 20);
-      const data = await searchVideos(keyword, pn, ps);
+      const data = await searchVideos(keyword, pn, ps, body.order || sortOrderFromLabel(body.sort_label, "totalrank"));
       sendJson(res, 200, { success: true, data });
       return;
     }
@@ -118,12 +126,13 @@ server.listen(PORT, () => {
   serviceLog("info", "service", `kato-bilibili-service listening on http://0.0.0.0:${PORT}`);
 });
 
-async function searchVideos(keyword, pn, ps) {
+async function searchVideos(keyword, pn, ps, order = "totalrank") {
   const payload = await bilibiliApi("/x/web-interface/search/type", {
     search_type: "video",
     keyword,
     page: pn,
-    page_size: ps
+    page_size: ps,
+    order
   });
   const data = payload.data || {};
   const result = Array.isArray(data.result) ? data.result.map(toSearchVideo).filter((item) => item.bvid) : [];
@@ -145,6 +154,9 @@ async function fetchOneVideo(input) {
 
 async function fetchVideoComments(input, pn, ps) {
   const oid = await resolveAid(input);
+  const order = String(input.order || input.sort_label || "").toLowerCase();
+  const latest = ["time", "latest", "pubdate"].includes(order);
+  if (latest) return fetchVideoCommentsLatest(input, oid, pn, ps);
   const payload = await bilibiliApi("/x/v2/reply", { type: input.type || 1, oid, pn, ps, sort: input.sort || 2 });
   const data = payload.data || {};
   return {
@@ -153,7 +165,35 @@ async function fetchVideoComments(input, pn, ps) {
       num: numberValue(data.page?.num ?? pn),
       size: numberValue(data.page?.size ?? ps),
       count: numberValue(data.page?.count)
-    }
+    },
+    has_more: hasMoreByPage(data.page, pn, ps),
+    cursor: ""
+  };
+}
+
+async function fetchVideoCommentsLatest(input, oid, pn, ps) {
+  const pageSize = Math.max(1, Math.min(ps, 50));
+  const endpoint = await buildWbiCommentEndpoint({
+    oid,
+    page: pn,
+    pageSize,
+    cursor: stringValue(input.cursor)
+  });
+  const payload = await bilibiliApi(endpoint.pathname, Object.fromEntries(endpoint.searchParams.entries()));
+  const data = payload.data || {};
+  const page = data.page || {};
+  const cursor = extractWbiNextCursor(data);
+  const total = numberValue(data.cursor?.all_count ?? page.count);
+  const replies = Array.isArray(data.replies) ? data.replies.map(toReply) : [];
+  return {
+    replies,
+    page: {
+      num: numberValue(page.num ?? pn),
+      size: numberValue(page.size ?? pageSize),
+      count: total
+    },
+    cursor,
+    has_more: Boolean(cursor) && replies.length > 0 && !isWbiCursorEnded(data)
   };
 }
 
@@ -163,8 +203,13 @@ async function fetchCommentReplies(input, pn, ps) {
   if (!root) throw httpError(400, "INVALID_PARAMS", "root/rpid/comment_id is required.");
   const payload = await bilibiliApi("/x/v2/reply/reply", { type: input.type || 1, oid, root, pn, ps });
   const data = payload.data || {};
+  const order = String(input.order || input.sort_label || "").toLowerCase();
+  const replies = Array.isArray(data.replies) ? data.replies.map((reply) => toReply(reply, root)) : [];
+  if (["time", "latest", "pubdate"].includes(order)) {
+    replies.sort((left, right) => numberValue(right.ctime) - numberValue(left.ctime));
+  }
   return {
-    replies: Array.isArray(data.replies) ? data.replies.map((reply) => toReply(reply, root)) : [],
+    replies,
     page: {
       num: numberValue(data.page?.num ?? pn),
       size: numberValue(data.page?.size ?? ps),
@@ -265,6 +310,7 @@ function toDetailVideo(item) {
     },
     pubdate: numberValue(item.pubdate),
     ctime: numberValue(item.ctime),
+    reply: numberValue(stat.reply),
     stat: {
       view: numberValue(stat.view),
       reply: numberValue(stat.reply),
@@ -301,6 +347,114 @@ function toReply(item, rootId = "") {
     rcount: numberValue(item.rcount),
     raw_data: item
   };
+}
+
+async function buildWbiCommentEndpoint({ oid, page, pageSize, cursor }) {
+  const params = {
+    oid,
+    type: 1,
+    mode: 2,
+    plat: 1,
+    web_location: 1315875,
+    ps: Math.max(1, Math.min(pageSize, 50)),
+    wts: Math.round(Date.now() / 1000)
+  };
+  if (cursor) {
+    params.pagination_str = JSON.stringify({ offset: cursor });
+  } else if (page > 1) {
+    params.pagination_str = `{"offset":"{\\"type\\":1,\\"direction\\":1,\\"Data\\":{\\"cursor\\":${page - 1}}}"}`;
+  }
+  const signed = await signWbiParams(params);
+  const url = new URL("https://api.bilibili.com/x/v2/reply/wbi/main");
+  for (const [key, value] of Object.entries(signed)) {
+    if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
+  }
+  return url;
+}
+
+async function signWbiParams(params) {
+  const mixinKey = await getWbiMixinKey();
+  const cleaned = {};
+  for (const key of Object.keys(params).sort()) {
+    const value = String(params[key]).replace(/[!'()*]/g, "");
+    cleaned[key] = value;
+  }
+  const query = new URLSearchParams(cleaned).toString();
+  return {
+    ...params,
+    w_rid: createHash("md5").update(`${query}${mixinKey}`).digest("hex")
+  };
+}
+
+async function getWbiMixinKey() {
+  const now = Date.now();
+  if (wbiKeyCache && wbiKeyCache.expiresAt > now) return wbiKeyCache.mixinKey;
+  const payload = await bilibiliApi("/x/web-interface/nav", {});
+  const wbiImg = payload.data?.wbi_img || {};
+  const imgKey = extractWbiKey(wbiImg.img_url);
+  const subKey = extractWbiKey(wbiImg.sub_url);
+  if (!imgKey || !subKey) {
+    throw httpError(502, "UPSTREAM_ERROR", "Cannot resolve Bilibili WBI keys.");
+  }
+  const rawKey = `${imgKey}${subKey}`;
+  const mixinKey = WBI_MIXIN_KEY_ENC_TAB.map((index) => rawKey[index] || "").join("").slice(0, 32);
+  if (!mixinKey) throw httpError(502, "UPSTREAM_ERROR", "Cannot build Bilibili WBI mixin key.");
+  wbiKeyCache = {
+    mixinKey,
+    expiresAt: now + 6 * 60 * 60 * 1000
+  };
+  return mixinKey;
+}
+
+function extractWbiKey(value) {
+  const text = stringValue(value);
+  if (!text) return "";
+  const filename = text.split("/").pop() || "";
+  return filename.split(".")[0] || "";
+}
+
+function extractWbiNextCursor(data) {
+  const cursor = data?.cursor || {};
+  const paginationReply = cursor.pagination_reply || {};
+  const candidates = [
+    paginationReply.next_offset,
+    paginationReply.nextOffset,
+    cursor.next_offset,
+    cursor.nextOffset,
+    data.next_offset,
+    data.nextOffset
+  ];
+  for (const value of candidates) {
+    const text = stringValue(value);
+    if (text) return text;
+  }
+  return "";
+}
+
+function isWbiCursorEnded(data) {
+  const cursor = data?.cursor || {};
+  const paginationReply = cursor.pagination_reply || {};
+  return Boolean(
+    cursor.is_end ||
+      cursor.isEnd ||
+      paginationReply.is_end ||
+      paginationReply.isEnd ||
+      data?.is_end ||
+      data?.isEnd
+  );
+}
+
+function hasMoreByPage(page, pn, ps) {
+  const total = numberValue(page?.count);
+  if (!total) return false;
+  return pn * ps < total;
+}
+
+function sortOrderFromLabel(label, fallback) {
+  const normalized = String(label || "").trim().toLowerCase();
+  if (normalized === "latest") return "pubdate";
+  if (normalized === "hot") return "click";
+  return fallback;
 }
 
 async function persistCookieHeader(cookie) {

@@ -257,6 +257,7 @@ class HttpMcpXhsAdapter implements XhsAdapter {
   private async searchFeedsRest(query: string, limit: number, options: XhsAdapterRequestOptions = {}): Promise<XhsPost[]> {
     const url = new URL("/api/v1/feeds/search", this.restBaseUrl);
     url.searchParams.set("keyword", query);
+    url.searchParams.set("limit", String(limit));
     const response = await fetchWithTimeout(url, {}, this.restTimeoutMs, options.signal);
     if (!response.ok) {
       throw new Error(`XHS REST search failed: HTTP ${response.status} ${await response.text()}`);
@@ -639,7 +640,8 @@ function coerceComments(value: unknown): XhsComment[] {
       id: String(item.id ?? item.comment_id ?? item.commentId ?? ""),
       content: String(item.content ?? item.text ?? item.comment_content ?? ""),
       author: optionalText(item.author ?? item.author_name ?? item.nickname),
-      parentId: optionalText(item.parentId ?? item.parent_id ?? item.parent_comment_id ?? item.parentCommentId)
+      parentId: optionalText(item.parentId ?? item.parent_id ?? item.parent_comment_id ?? item.parentCommentId),
+      publishedAt: optionalText(item.publishedAt ?? item.published_at ?? item.create_time ?? item.createTime)
     }))
     .filter((item) => item.id && item.content);
 }

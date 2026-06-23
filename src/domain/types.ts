@@ -44,6 +44,7 @@ export interface XhsComment {
   content: string;
   author?: string;
   parentId?: string;
+  publishedAt?: string;
 }
 
 export interface ScoredPost extends XhsPost {

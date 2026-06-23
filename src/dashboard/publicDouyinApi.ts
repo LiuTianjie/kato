@@ -64,12 +64,17 @@ async function routePublicDouyinApi(
   if (req.method === "GET" && path === "/api/douyin/web/search_videos") {
     const keyword = String(body.keyword ?? body.query ?? body.keyword_query ?? "").trim();
     const limit = normalizeLimit(body.count ?? body.limit ?? body.page_size ?? body.ps, 20);
-    const page = normalizePositiveInt(body.page ?? body.cursor ?? body.pn, 1);
-    const payload = await postServiceJson("/api/v1/posts/search", { keyword, limit, page }, options.signal);
-    const posts = extractList(payload, ["posts", "items", "data"]).map(toServerxDouyinVideo);
+    const page = normalizePositiveInt(body.page ?? body.pn, 1);
+    const cursor = normalizeNonNegativeInt(body.cursor, (page - 1) * limit);
+    const payload = await postServiceJson(
+      "/api/v1/posts/search",
+      { keyword, limit, page, cursor, sort_label: body.sort_label, sort_type: body.sort_type, publish_time: body.publish_time },
+      options.signal
+    );
+    const posts = sortByCreateTimeDesc(extractList(payload, ["posts", "items", "data"]).map(toServerxDouyinVideo));
     return {
       videos: posts,
-      cursor: String(page + 1),
+      cursor: String(cursor + limit),
       has_more: posts.length >= limit
     };
   }
@@ -89,9 +94,13 @@ async function routePublicDouyinApi(
 
   if (req.method === "GET" && path === "/api/douyin/web/fetch_video_comments") {
     const limit = normalizeLimit(body.count ?? body.limit ?? body.page_size ?? body.ps, 20);
-    const payload = await postServiceJson("/api/v1/posts/comments", { ...normalizeDouyinVideoRequest(body), limit, cursor: body.cursor ?? 0 }, options.signal);
+    const payload = await postServiceJson(
+      "/api/v1/posts/comments",
+      { ...normalizeDouyinVideoRequest(body), limit, cursor: body.cursor ?? 0, sort_label: body.sort_label },
+      options.signal
+    );
     const data = asRecord(payload);
-    const comments = extractList(payload, ["comments", "items", "data"]).map((comment) => toServerxDouyinComment(comment));
+    const comments = sortByCreateTimeDesc(extractList(payload, ["comments", "items", "data"]).map((comment) => toServerxDouyinComment(comment)));
     return {
       comments,
       cursor: String(data.cursor ?? ""),
@@ -104,11 +113,11 @@ async function routePublicDouyinApi(
     const commentId = String(body.comment_id ?? body.commentId ?? body.cid ?? body.root ?? "").trim();
     const payload = await postServiceJson(
       "/api/v1/posts/comment_replies",
-      { ...normalizeDouyinVideoRequest(body), comment_id: commentId, limit, cursor: body.cursor ?? 0 },
+      { ...normalizeDouyinVideoRequest(body), comment_id: commentId, limit, cursor: body.cursor ?? 0, sort_label: body.sort_label },
       options.signal
     );
     const data = asRecord(payload);
-    const comments = extractList(payload, ["comments", "items", "data"]).map((comment) => toServerxDouyinComment(comment, commentId));
+    const comments = sortByCreateTimeDesc(extractList(payload, ["comments", "items", "data"]).map((comment) => toServerxDouyinComment(comment, commentId)));
     return {
       comments,
       cursor: String(data.cursor ?? ""),
@@ -299,6 +308,12 @@ function normalizePositiveInt(value: unknown, fallback: number): number {
   return Math.floor(parsed);
 }
 
+function normalizeNonNegativeInt(value: unknown, fallback: number): number {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isFinite(parsed) || parsed < 0) return Math.max(0, fallback);
+  return Math.floor(parsed);
+}
+
 function isFailure(payload: unknown): boolean {
   return Boolean(payload && typeof payload === "object" && "success" in payload && (payload as { success?: unknown }).success === false);
 }
@@ -402,6 +417,10 @@ function numberValue(value: unknown): number {
 function secondsValue(value: unknown): number {
   if (typeof value === "string" && /\d{4}-\d{2}-\d{2}T/.test(value)) return Math.floor(Date.parse(value) / 1000);
   return numberValue(value);
+}
+
+function sortByCreateTimeDesc<T extends Record<string, unknown>>(items: T[]): T[] {
+  return items.sort((left, right) => secondsValue(right.create_time) - secondsValue(left.create_time));
 }
 
 function normalizeDouyinVideoUrl(value: string, id: string): string {

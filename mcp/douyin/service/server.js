@@ -246,7 +246,13 @@ const server = createServer(async (req, res) => {
       const keyword = String(body.keyword || body.query || "").trim();
       const limit = normalizeLimit(body.limit, 20);
       const page = normalizePositiveInt(body.page, 1);
-      const data = await enqueueBrowserTask("posts:search", (taskContext) => searchPosts(keyword, limit, { page, taskContext }), {
+      const data = await enqueueBrowserTask("posts:search", (taskContext) => searchPosts(keyword, limit, {
+        page,
+        cursor: body.cursor,
+        sort_type: normalizeDouyinSortType(body.sort_type, body.sort_label),
+        publish_time: body.publish_time,
+        taskContext
+      }), {
         signal: requestSignal
       });
       sendJson(res, 200, {
@@ -759,15 +765,22 @@ async function searchPosts(keyword, limit, options = {}) {
     async () => {
       if (!keyword.trim()) return [];
       const pageNumber = normalizePositiveInt(options.page, 1);
-      serviceLog("info", "posts", "Douyin search requested.", { keyword, limit, page: pageNumber });
       const page = await newTaskPage(taskContext);
-      const offset = (pageNumber - 1) * limit;
+      const offset = normalizeCursorOffset(options.cursor, (pageNumber - 1) * limit);
+      const fallbackScrollPages = Math.max(2, pageNumber + 1, Math.floor(offset / Math.max(limit, 1)) + 2);
+      serviceLog("info", "posts", "Douyin search requested.", { keyword, limit, page: pageNumber, cursor: options.cursor, offset });
       let directSearch = false;
       let payloads = [];
       try {
         await prepareDouyinApiPage(page, "search:api");
         const directPayload = await withTimeout(
-          fetchSearchInPage(page, { keyword, offset, count: limit }),
+          fetchSearchInPage(page, {
+            keyword,
+            offset,
+            count: limit,
+            sort_type: options.sort_type,
+            publish_time: options.publish_time
+          }),
           25_000,
           "Douyin search API timed out."
         );
@@ -782,7 +795,7 @@ async function searchPosts(keyword, limit, options = {}) {
             serviceLog("warn", "posts", `Search navigation warning: ${errorMessage(navigationError)}`);
           });
           await humanDelay("search:settle", 2_500, 5_500, { signal: taskContext?.signal });
-          await autoScroll(page, Math.max(2, pageNumber + 1), taskContext);
+          await autoScroll(page, fallbackScrollPages, taskContext);
         } finally {
           payloads = await capture.stop();
         }
@@ -791,9 +804,10 @@ async function searchPosts(keyword, limit, options = {}) {
       const parsedPosts = uniquePosts(extractPostsFromPayloads(payloads));
       const fallbackPosts = parsedPosts.length ? [] : await scrapePosts(page);
       const posts = uniquePosts([...parsedPosts, ...fallbackPosts]);
+      posts.sort((left, right) => postTimeValue(right) - postTimeValue(left));
       const relevantPosts = filterPostsByKeyword(posts, keyword);
-      const sourcePosts = relevantPosts.length || shouldRequireKeywordRelevance(keyword) ? relevantPosts : posts;
-      const start = directSearch ? 0 : (pageNumber - 1) * limit;
+      const sourcePosts = relevantPosts.length ? relevantPosts : posts;
+      const start = directSearch ? 0 : offset;
       const result = sourcePosts.slice(start, start + limit);
       const pageTitle = await page.title().catch(() => "");
       const bodyPreview = result.length ? "" : await page.locator("body").innerText({ timeout: 2_000 }).catch(() => "");
@@ -1475,6 +1489,26 @@ function normalizePost(item) {
     publishedAt: dateFromSeconds(item.create_time ?? item.createTime),
     raw: item
   };
+}
+
+function normalizeDouyinSortType(value, label) {
+  if (value !== undefined && value !== null && String(value).trim() !== "") return value;
+  const normalized = String(label || "").trim().toLowerCase();
+  if (normalized === "latest") return "2";
+  if (normalized === "hot") return "1";
+  return "0";
+}
+
+function normalizeCursorOffset(value, fallback) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) return Math.max(0, Number(fallback) || 0);
+  return Math.floor(numeric);
+}
+
+function postTimeValue(post) {
+  const raw = post?.raw || post || {};
+  const time = Number(raw.create_time ?? raw.createTime ?? Date.parse(post?.publishedAt || "") / 1000);
+  return Number.isFinite(time) ? time : 0;
 }
 
 function extractCommentsPayload(payloads, parentId) {
