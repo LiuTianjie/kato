@@ -298,9 +298,10 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/api/v1/feeds/search") {
       const keyword = url.searchParams.get("keyword") || url.searchParams.get("query") || "";
-      const limit = normalizeLimit(url.searchParams.get("limit"), 20);
+      const limit = normalizeLimit(url.searchParams.get("limit") ?? url.searchParams.get("page_size") ?? url.searchParams.get("pageSize"), 20);
       const page = normalizePositiveInt(url.searchParams.get("page"), 1);
-      const feeds = await enqueueBrowserTask("feeds:search", (taskContext) => searchFeeds(keyword, limit, { page, taskContext }), { signal: requestSignal });
+      const filters = searchFilterOptions(Object.fromEntries(url.searchParams.entries()));
+      const feeds = await enqueueBrowserTask("feeds:search", (taskContext) => searchFeeds(keyword, limit, { ...filters, page, taskContext }), { signal: requestSignal });
       sendJson(res, 200, { success: true, data: pagedPayload("feeds", feeds, { page, limit }) });
       return;
     }
@@ -308,9 +309,9 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/v1/feeds/search") {
       const body = await readJson(req);
       const keyword = String(body.keyword || body.query || "");
-      const limit = normalizeLimit(body.limit, 20);
+      const limit = normalizeLimit(body.limit ?? body.page_size ?? body.pageSize, 20);
       const page = normalizePositiveInt(body.page, 1);
-      const feeds = await enqueueBrowserTask("feeds:search", (taskContext) => searchFeeds(keyword, limit, { page, taskContext }), { signal: requestSignal });
+      const feeds = await enqueueBrowserTask("feeds:search", (taskContext) => searchFeeds(keyword, limit, { ...searchFilterOptions(body), page, taskContext }), { signal: requestSignal });
       sendJson(res, 200, { success: true, data: pagedPayload("feeds", feeds, { page, limit }) });
       return;
     }
@@ -1095,8 +1096,33 @@ async function searchFeeds(keyword, limit, options = {}) {
   return withBrowserRecovery("searchFeeds", async () => {
     if (!keyword.trim()) return [];
     const pageNumber = normalizePositiveInt(options.page, 1);
-    serviceLog("info", "feeds", "Search feeds requested.", { keyword, limit, page: pageNumber });
+    serviceLog("info", "feeds", "Search feeds requested.", {
+      keyword,
+      limit,
+      page: pageNumber,
+      sort: normalizeSearchSort(options.sort_type ?? options.sortType ?? options.sort),
+      noteType: normalizeSearchNoteType(options.note_type ?? options.noteType),
+      timeFilter: normalizeSearchTimeFilter(options.time_filter ?? options.timeFilter)
+    });
     const page = await servicePage(taskContext);
+    const apiPosts = await searchFeedsByWebApi(page, keyword, limit, { ...options, page: pageNumber }).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      serviceLog("warn", "feeds", `Search feeds web API failed; falling back to page crawl: ${message}`, {
+        keyword,
+        page: pageNumber
+      });
+      return [];
+    });
+    if (apiPosts.length) {
+      const unique = uniquePosts(apiPosts);
+      rememberPosts(unique);
+      serviceLog("info", "feeds", "Search feeds web API completed.", {
+        keyword,
+        page: pageNumber,
+        returned: unique.length
+      });
+      return unique.slice(0, limit);
+    }
     let lastDiagnostics = null;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       const capture = startPostResponseCapture(page);
@@ -1148,6 +1174,114 @@ async function searchFeeds(keyword, limit, options = {}) {
     serviceLog("warn", "feeds", "Search feeds returned empty result.", { keyword, page: pageNumber, diagnostics: lastDiagnostics || undefined });
     return [];
   }, taskContext);
+}
+
+async function searchFeedsByWebApi(page, keyword, limit, options = {}) {
+  const pageNumber = normalizePositiveInt(options.page, 1);
+  const pageSize = normalizeLimit(options.page_size ?? options.pageSize ?? limit, limit);
+  const searchId = String(options.search_id || options.searchId || randomSearchId()).trim();
+  const sort = normalizeSearchSort(options.sort_type ?? options.sortType ?? options.sort);
+  const noteType = normalizeSearchNoteType(options.note_type ?? options.noteType);
+  const timeFilter = normalizeSearchTimeFilter(options.time_filter ?? options.timeFilter);
+  await ensureSearchPageReady(page, keyword, taskContextFromOptions(options));
+  const payload = await page.evaluate(
+    async ({ keyword, pageNumber, pageSize, searchId, sort, noteType, timeFilter }) => {
+      const filters = [
+        { tags: [sort], type: "sort_type" },
+        { tags: [noteType.tag], type: "filter_note_type" },
+        { tags: [timeFilter], type: "filter_note_time" },
+        { tags: ["不限"], type: "filter_note_range" },
+        { tags: ["不限"], type: "filter_pos_distance" }
+      ];
+      const requestBody = {
+        keyword,
+        page: pageNumber,
+        page_size: pageSize,
+        search_id: searchId,
+        sort,
+        note_type: noteType.value,
+        ext_flags: [],
+        filters,
+        geo: "",
+        image_formats: ["jpg", "webp", "avif"]
+      };
+      const signHeaders = typeof window._webmsxyw === "function" ? window._webmsxyw("/api/sns/web/v1/search/notes", requestBody) : {};
+      const response = await fetch("https://edith.xiaohongshu.com/api/sns/web/v1/search/notes", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json", ...signHeaders },
+        body: JSON.stringify(requestBody)
+      });
+      const text = await response.text();
+      let json = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {
+        json = null;
+      }
+      return { ok: response.ok, status: response.status, text, json };
+    },
+    { keyword, pageNumber, pageSize, searchId, sort, noteType, timeFilter }
+  );
+  if (!payload?.ok) {
+    throw new Error(`XHS search web API HTTP ${payload?.status || "unknown"}`);
+  }
+  if (payload.json?.success === false || (payload.json?.code != null && Number(payload.json.code) !== 0)) {
+    throw new Error(`XHS search web API failed: ${payload.json?.msg || payload.json?.message || payload.text || "unknown error"}`);
+  }
+  const posts = extractPostsFromPayload(payload.json);
+  return uniquePosts(posts).slice(0, limit);
+}
+
+async function ensureSearchPageReady(page, keyword, taskContext) {
+  const currentUrl = page.url();
+  const target = new URL("https://www.xiaohongshu.com/search_result");
+  target.searchParams.set("keyword", keyword);
+  target.searchParams.set("source", "web_search_result_notes");
+  target.searchParams.set("type", "51");
+  if (!currentUrl.includes("xiaohongshu.com/search_result") || !currentUrl.includes(encodeURIComponent(keyword))) {
+    taskContext?.throwIfCancelled?.();
+    await page.goto(target.toString(), { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => undefined);
+  }
+}
+
+function taskContextFromOptions(options) {
+  return options?.taskContext;
+}
+
+function searchFilterOptions(value) {
+  return {
+    sort_type: value.sort_type ?? value.sortType ?? value.sort,
+    note_type: value.note_type ?? value.noteType,
+    time_filter: value.time_filter ?? value.timeFilter,
+    page_size: value.page_size ?? value.pageSize,
+    search_id: value.search_id ?? value.searchId
+  };
+}
+
+function normalizeSearchSort(value) {
+  const text = String(value || "").trim();
+  if (["time_descending", "popularity_descending", "comment_descending", "collect_descending"].includes(text)) return text;
+  if (text === "latest" || text === "最新") return "time_descending";
+  return "general";
+}
+
+function normalizeSearchNoteType(value) {
+  const text = String(value || "").trim();
+  if (text === "视频" || text === "视频笔记" || text === "1" || text === "video") return { tag: "视频笔记", value: 1 };
+  if (text === "图文" || text === "普通笔记" || text === "2" || text === "normal") return { tag: "普通笔记", value: 2 };
+  return { tag: "不限", value: 0 };
+}
+
+function normalizeSearchTimeFilter(value) {
+  const text = String(value || "").trim();
+  if (["一天内", "一周内", "半年内"].includes(text)) return text;
+  return "不限";
+}
+
+function randomSearchId() {
+  return `kato-${Date.now()}-${randomUUID().slice(0, 8)}`;
 }
 
 async function searchPageDiagnostics(page) {
@@ -1305,7 +1439,7 @@ async function callTool(params, taskContext) {
   if (name === "search_feeds") {
     const limit = normalizeLimit(args.limit, 20);
     const page = normalizePositiveInt(args.page, 1);
-    const feeds = await searchFeeds(String(args.keyword || args.query || ""), limit, { page, taskContext });
+    const feeds = await searchFeeds(String(args.keyword || args.query || ""), limit, { ...searchFilterOptions(args), page, taskContext });
     return toolJson(pagedPayload("feeds", feeds, { page, limit }));
   }
   if (name === "get_feed_detail") {

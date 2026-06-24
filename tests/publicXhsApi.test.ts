@@ -570,6 +570,65 @@ test("TikHub-compatible XHS API accepts official pagination parameters", async (
   }
 });
 
+test("TikHub-compatible XHS search forwards platform filters to REST search", async () => {
+  const fixture = createFixture();
+  const originalToken = process.env.XHS_API_TOKEN;
+  const originalFetch = globalThis.fetch;
+  const calls: string[] = [];
+  process.env.XHS_API_TOKEN = "secret-token";
+  fixture.config.xhs = {
+    provider: "http",
+    mcp: { url: "http://fake.local/mcp" }
+  };
+  globalThis.fetch = async (input) => {
+    const requestUrl = String(input);
+    calls.push(requestUrl);
+    if (requestUrl.includes("/api/v1/feeds/search")) {
+      return new Response(
+        JSON.stringify({
+          success: true,
+          data: {
+            feeds: [
+              {
+                id: "post-1",
+                url: "https://www.xiaohongshu.com/explore/post-1?xsec_token=token-1",
+                xsecToken: "token-1",
+                noteCard: { displayTitle: "AI工具真实搜索结果" }
+              }
+            ]
+          }
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    throw new Error(`Unexpected fetch: ${requestUrl}`);
+  };
+
+  try {
+    const search = await callApi(fixture.config, fixture.db, {
+      method: "GET",
+      pathname:
+        "/api/v1/xiaohongshu/app_v2/search_notes?keyword=AI%E5%B7%A5%E5%85%B7&page=2&limit=10&sort_type=time_descending&note_type=%E8%A7%86%E9%A2%91%E7%AC%94%E8%AE%B0&time_filter=%E4%B8%80%E5%A4%A9%E5%86%85&search_id=search-1",
+      token: "secret-token"
+    });
+
+    assert.equal(search.status, 200);
+    const url = new URL(calls.find((item) => item.includes("/api/v1/feeds/search")) ?? "");
+    assert.equal(url.searchParams.get("keyword"), "AI工具");
+    assert.equal(url.searchParams.get("page"), "2");
+    assert.equal(url.searchParams.get("limit"), "10");
+    assert.equal(url.searchParams.get("page_size"), "10");
+    assert.equal(url.searchParams.get("sort_type"), "time_descending");
+    assert.equal(url.searchParams.get("note_type"), "视频笔记");
+    assert.equal(url.searchParams.get("time_filter"), "一天内");
+    assert.equal(url.searchParams.get("search_id"), "search-1");
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("XHS_API_TOKEN", originalToken);
+    cleanupFixture(fixture);
+  }
+});
+
 test("TikHub-compatible XHS API supports image and video detail endpoints", async () => {
   const fixture = createFixture();
   const originalToken = process.env.XHS_API_TOKEN;
