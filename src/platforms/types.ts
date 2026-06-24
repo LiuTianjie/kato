@@ -2,6 +2,14 @@ export type PlatformId = "xhs" | "bilibili" | "douyin";
 
 export interface PlatformRequestOptions {
   signal?: AbortSignal;
+  cursor?: string;
+  index?: number;
+  pageArea?: string;
+  sortType?: string;
+  noteType?: string;
+  timeFilter?: string;
+  pageSize?: number;
+  searchId?: string;
 }
 
 export interface PlatformPostBase {

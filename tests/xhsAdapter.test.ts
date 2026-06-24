@@ -38,7 +38,14 @@ test("http adapter parses XHS browser service REST search data.feeds responses",
 
   try {
     const adapter = createXhsAdapter(httpConfig());
-    const posts = await adapter.searchPosts("AI工具", 5);
+    const posts = await adapter.searchPosts("AI工具", 5, {
+      index: 1,
+      pageSize: 50,
+      sortType: "time_descending",
+      noteType: "视频笔记",
+      timeFilter: "一天内",
+      searchId: "search-1"
+    });
     assert.equal(posts.length, 1);
     assert.equal(posts[0].id, "feed-1");
     assert.equal(posts[0].xsecToken, "xsec-token");
@@ -50,6 +57,13 @@ test("http adapter parses XHS browser service REST search data.feeds responses",
 
     assert.equal(urls.length, 1);
     assert.match(urls[0], /^http:\/\/fake\.local\/api\/v1\/feeds\/search\?keyword=AI/);
+    const searchUrl = new URL(urls[0]);
+    assert.equal(searchUrl.searchParams.get("page"), "2");
+    assert.equal(searchUrl.searchParams.get("page_size"), "50");
+    assert.equal(searchUrl.searchParams.get("sort_type"), "time_descending");
+    assert.equal(searchUrl.searchParams.get("note_type"), "视频笔记");
+    assert.equal(searchUrl.searchParams.get("time_filter"), "一天内");
+    assert.equal(searchUrl.searchParams.get("search_id"), "search-1");
   } finally {
     globalThis.fetch = originalFetch;
   }

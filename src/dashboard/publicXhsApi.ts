@@ -23,6 +23,9 @@ interface ApiErrorPayload {
 
 interface RouteOptions {
   signal?: AbortSignal;
+  cursor?: string;
+  index?: number;
+  pageArea?: string;
 }
 
 class PublicApiError extends Error {
@@ -50,7 +53,8 @@ class PublicFetchTimeoutError extends Error {
   }
 }
 
-const idempotencyResults = new Map<string, Promise<unknown>>();
+const IDEMPOTENCY_RESULT_TTL_MS = normalizePositiveEnv("XHS_PUBLIC_IDEMPOTENCY_RESULT_TTL_MS", 10 * 60_000);
+const idempotencyResults = new Map<string, { promise: Promise<unknown>; timer?: ReturnType<typeof setTimeout> }>();
 const MCP_FETCH_TIMEOUT_MS = normalizePositiveEnv("XHS_PUBLIC_MCP_FETCH_TIMEOUT_MS", 600_000);
 
 export async function handlePublicXhsApi(
@@ -213,18 +217,16 @@ async function searchNotesForServerx(
   options: RouteOptions = {}
 ): Promise<Record<string, unknown>[]> {
   const keyword = String(body.keyword ?? body.query ?? "").trim();
-  const keywords = keyword ? [keyword] : normalizeKeywords(body);
   const limit = normalizeLimit(body.limit, 20);
-  const result = await searchOnlyPosts(config, { keywords, limit, signal: options.signal });
+  const posts = await searchFilteredPosts(config, keyword ? [keyword] : normalizeKeywords(body), limit, body, options);
   const includeComments = parseBooleanFlag(body.include_comments ?? body.includeComments, true);
   const commentLimit = includeComments ? normalizeOptionalLimit(body.max_comments ?? body.maxComments, 20) : 0;
-  const posts = await Promise.all(
-    result.posts.slice(0, limit).map(async (post) => {
+  return Promise.all(
+    posts.slice(0, limit).map(async (post) => {
       const comments = commentLimit > 0 ? await safeGetComments(config, post, commentLimit, options) : [];
       return toServerxPost(post, comments);
     })
   );
-  return posts;
 }
 
 async function searchNotesForTikHub(
@@ -235,13 +237,10 @@ async function searchNotesForTikHub(
   const page = normalizePositiveInt(body.page, 1);
   const pageSize = normalizeLimit(body.limit ?? body.page_size ?? body.pageSize, 20);
   const keyword = String(body.keyword ?? body.query ?? "").trim();
-  const result = await searchOnlyPosts(config, {
-    keywords: keyword ? [keyword] : normalizeKeywords(body),
-    limit: page * pageSize,
-    signal: options.signal
-  });
-  const start = (page - 1) * pageSize;
-  const posts = result.posts.slice(start, start + pageSize).map((post) => toServerxPost(post));
+  const posts = (await searchFilteredPosts(config, keyword ? [keyword] : normalizeKeywords(body), pageSize, body, {
+    ...options,
+    index: page - 1
+  })).map((post) => toServerxPost(post));
   return {
     data: posts,
     items: posts,
@@ -251,13 +250,49 @@ async function searchNotesForTikHub(
       search_id: String(body.search_id ?? ""),
       search_session_id: String(body.search_session_id ?? "")
     },
-    has_more: result.posts.length > start + posts.length,
+    has_more: posts.length >= pageSize,
     page,
     page_size: pageSize,
     sort_type: body.sort_type ?? "general",
     note_type: body.note_type ?? "不限",
     time_filter: body.time_filter ?? "不限"
   };
+}
+
+async function searchFilteredPosts(
+  config: AppConfig,
+  keywords: string[],
+  limit: number,
+  body: Record<string, unknown>,
+  options: RouteOptions = {}
+): Promise<XhsPost[]> {
+  const adapter = createXhsAdapter(config);
+  const posts: XhsPost[] = [];
+  const seen = new Set<string>();
+  try {
+    for (const keyword of keywords) {
+      if (posts.length >= limit) break;
+      const results = await adapter.searchPosts(keyword, Math.max(limit - posts.length, 1), {
+        signal: options.signal,
+        index: options.index,
+        sortType: normalizeText(body.sort_type ?? body.sortType ?? body.sort_label ?? body.sortLabel, "time_descending"),
+        noteType: normalizeText(body.note_type ?? body.noteType, "不限"),
+        timeFilter: normalizeText(body.time_filter ?? body.timeFilter, "不限"),
+        pageSize: normalizeLimit(body.page_size ?? body.pageSize ?? body.limit, limit),
+        searchId: normalizeText(body.search_id ?? body.searchId, "")
+      });
+      for (const post of results) {
+        const key = post.id || post.url;
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        posts.push(post);
+        if (posts.length >= limit) break;
+      }
+    }
+  } finally {
+    await adapter.close?.();
+  }
+  return posts;
 }
 
 async function noteDetailForServerx(
@@ -297,9 +332,14 @@ async function noteCommentsForTikHub(
 ): Promise<Record<string, unknown>> {
   const page = normalizeCursorPage(body.index, body.cursor, 0);
   const pageSize = normalizeLimit(body.limit ?? body.max_comments ?? body.page_size, 50);
-  const comments = await noteCommentsForServerx(config, { ...body, max_comments: (page + 1) * pageSize }, options);
-  const start = page * pageSize;
-  const items = comments.slice(start, start + pageSize);
+  const post = normalizePostInput(normalizeServerxPostInput(body));
+  const comments = await getCommentsStrict(config, post, pageSize, {
+    ...options,
+    cursor: String(body.cursor ?? ""),
+    index: page,
+    pageArea: String(body.pageArea ?? body.page_area ?? "UNFOLDED")
+  });
+  const items = dedupeXhsComments(comments).map(toServerxComment);
   const nextIndex = page + 1;
   return {
     data: items,
@@ -310,7 +350,7 @@ async function noteCommentsForTikHub(
       index: nextIndex,
       pageArea: body.pageArea ?? body.page_area ?? "UNFOLDED"
     },
-    has_more: comments.length > start + items.length,
+    has_more: items.length >= pageSize,
     pageArea: body.pageArea ?? body.page_area ?? "UNFOLDED",
     sort_strategy: body.sort_strategy ?? "latest_v2"
   };
@@ -360,7 +400,7 @@ async function safeGetComments(config: AppConfig, post: XhsPost, limit: number, 
   const adapter = createXhsAdapter(config);
   try {
     if (!adapter.getComments) return [];
-    return await adapter.getComments(post, limit, { signal: options.signal });
+    return await adapter.getComments(post, limit, options);
   } catch (error) {
     if (isAbortLikeError(error)) throw error;
     return [];
@@ -373,7 +413,7 @@ async function getCommentsStrict(config: AppConfig, post: XhsPost, limit: number
   const adapter = createXhsAdapter(config);
   try {
     if (!adapter.getComments) return [];
-    return await adapter.getComments(post, limit, { signal: options.signal });
+    return await adapter.getComments(post, limit, options);
   } finally {
     await adapter.close?.();
   }
@@ -429,6 +469,11 @@ function normalizeLimit(value: unknown, fallback: number): number {
   const numberValue = Number(value ?? fallback);
   if (!Number.isFinite(numberValue)) return fallback;
   return Math.max(1, Math.min(100, Math.floor(numberValue)));
+}
+
+function normalizeText(value: unknown, fallback: string): string {
+  const text = String(value ?? "").trim();
+  return text || fallback;
 }
 
 function normalizeOptionalLimit(value: unknown, fallback: number): number {
@@ -751,11 +796,16 @@ function requireIdempotencyKey(body: Record<string, unknown>): string {
 
 async function runIdempotent(key: string, task: () => Promise<unknown>): Promise<unknown> {
   const existing = idempotencyResults.get(key);
-  if (existing) return existing;
-  const promise = task().finally(() => {
+  if (existing) return existing.promise;
+  const promise = task().catch((error) => {
     idempotencyResults.delete(key);
+    throw error;
   });
-  idempotencyResults.set(key, promise);
+  const timer = setTimeout(() => {
+    idempotencyResults.delete(key);
+  }, IDEMPOTENCY_RESULT_TTL_MS);
+  timer.unref?.();
+  idempotencyResults.set(key, { promise, timer });
   return promise;
 }
 

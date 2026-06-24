@@ -119,7 +119,17 @@ class HttpMcpXhsAdapter implements XhsAdapter {
     }
 
     await this.ensureInitialized();
-    const result = await this.callTool(this.tools.searchPosts, { query, limit });
+    const result = await this.callTool(this.tools.searchPosts, {
+      query,
+      limit,
+      page: options.index != null ? options.index + 1 : undefined,
+      cursor: options.cursor,
+      page_size: options.pageSize,
+      sort_type: options.sortType,
+      note_type: options.noteType,
+      time_filter: options.timeFilter,
+      search_id: options.searchId
+    });
     return coercePosts(result).slice(0, limit);
   }
 
@@ -258,11 +268,19 @@ class HttpMcpXhsAdapter implements XhsAdapter {
     const url = new URL("/api/v1/feeds/search", this.restBaseUrl);
     url.searchParams.set("keyword", query);
     url.searchParams.set("limit", String(limit));
+    if (options.index != null) url.searchParams.set("page", String(options.index + 1));
+    if (options.pageSize != null) url.searchParams.set("page_size", String(options.pageSize));
+    if (options.sortType) url.searchParams.set("sort_type", options.sortType);
+    if (options.noteType) url.searchParams.set("note_type", options.noteType);
+    if (options.timeFilter) url.searchParams.set("time_filter", options.timeFilter);
+    if (options.searchId) url.searchParams.set("search_id", options.searchId);
     const response = await fetchWithTimeout(url, {}, this.restTimeoutMs, options.signal);
     if (!response.ok) {
       throw new Error(`XHS REST search failed: HTTP ${response.status} ${await response.text()}`);
     }
-    return coercePosts(await response.json()).slice(0, limit);
+    const payload = await response.json();
+    assertXhsRestPayloadHealthy(payload, "search");
+    return coercePosts(payload).slice(0, limit);
   }
 
   private async getFeedDetailRest(post: XhsPost, options: XhsAdapterRequestOptions = {}): Promise<XhsPost | null> {
@@ -282,7 +300,9 @@ class HttpMcpXhsAdapter implements XhsAdapter {
     if (!response.ok) {
       throw new Error(`XHS REST detail failed: HTTP ${response.status} ${await response.text()}`);
     }
-    return coercePosts(await response.json())[0] ?? post;
+    const payload = await response.json();
+    assertXhsRestPayloadHealthy(payload, "detail");
+    return coercePosts(payload)[0] ?? post;
   }
 
   private async getFeedCommentsRest(post: XhsPost, limit: number, options: XhsAdapterRequestOptions = {}): Promise<XhsComment[]> {
@@ -293,13 +313,18 @@ class HttpMcpXhsAdapter implements XhsAdapter {
         feed_id: post.id,
         xsec_token: post.xsecToken,
         url: post.url,
-        limit
+        limit,
+        cursor: options.cursor,
+        index: options.index,
+        pageArea: options.pageArea
       })
     }, this.restTimeoutMs, options.signal);
     if (!response.ok) {
       throw new Error(`XHS REST comments failed: HTTP ${response.status} ${await response.text()}`);
     }
-    return coerceComments(await response.json()).slice(0, limit);
+    const payload = await response.json();
+    assertXhsRestPayloadHealthy(payload, "comments");
+    return coerceComments(payload).slice(0, limit);
   }
 }
 
@@ -328,9 +353,19 @@ class StdioMcpXhsAdapter implements XhsAdapter {
     };
   }
 
-  async searchPosts(query: string, limit: number): Promise<XhsPost[]> {
+  async searchPosts(query: string, limit: number, options: XhsAdapterRequestOptions = {}): Promise<XhsPost[]> {
     await this.ensureInitialized();
-    const result = await this.callTool(this.tools.searchPosts, { query, limit });
+    const result = await this.callTool(this.tools.searchPosts, {
+      query,
+      limit,
+      page: options.index != null ? options.index + 1 : undefined,
+      cursor: options.cursor,
+      page_size: options.pageSize,
+      sort_type: options.sortType,
+      note_type: options.noteType,
+      time_filter: options.timeFilter,
+      search_id: options.searchId
+    });
     return coercePosts(result);
   }
 
@@ -350,7 +385,7 @@ class StdioMcpXhsAdapter implements XhsAdapter {
     return posts[0] ?? null;
   }
 
-  async getComments(postOrUrl: XhsPost | string, limit: number): Promise<XhsComment[]> {
+  async getComments(postOrUrl: XhsPost | string, limit: number, options: XhsAdapterRequestOptions = {}): Promise<XhsComment[]> {
     await this.ensureInitialized();
     const post = typeof postOrUrl === "string" ? urlToPost(postOrUrl) : postOrUrl;
     const result = await this.callTool("get_feed_comments", {
@@ -358,7 +393,10 @@ class StdioMcpXhsAdapter implements XhsAdapter {
       url: post.url,
       feed_id: post.id,
       xsec_token: post.xsecToken,
-      limit
+      limit,
+      cursor: options.cursor,
+      index: options.index,
+      pageArea: options.pageArea
     });
     return coerceComments(result).slice(0, limit);
   }
@@ -644,6 +682,41 @@ function coerceComments(value: unknown): XhsComment[] {
       publishedAt: optionalText(item.publishedAt ?? item.published_at ?? item.create_time ?? item.createTime)
     }))
     .filter((item) => item.id && item.content);
+}
+
+function assertXhsRestPayloadHealthy(value: unknown, action: string): void {
+  const payload = value as Record<string, unknown> | null;
+  if (payload && typeof payload === "object" && payload.success === false) {
+    const message = extractXhsRestErrorMessage(payload);
+    throw new Error(`XHS REST ${action} failed: ${message}`);
+  }
+  const text = safeJsonPreview(value);
+  if (/QUEUE_BUSY/i.test(text)) {
+    throw new Error(`XHS REST ${action} failed: browser queue busy`);
+  }
+  if (/login\?redirectPath|xiaohongshu\.com\/login/i.test(text)) {
+    throw new Error(`XHS REST ${action} failed: browser redirected to login, please sync cookie`);
+  }
+}
+
+function extractXhsRestErrorMessage(payload: Record<string, unknown>): string {
+  const error = payload.error as Record<string, unknown> | undefined;
+  const detail = payload.detail as Record<string, unknown> | undefined;
+  return String(
+    error?.message ??
+      detail?.message ??
+      payload.message ??
+      payload.error ??
+      "unknown error"
+  );
+}
+
+function safeJsonPreview(value: unknown): string {
+  try {
+    return JSON.stringify(value).slice(0, 4000);
+  } catch {
+    return String(value).slice(0, 4000);
+  }
 }
 
 function unwrapMcpContent(value: unknown): unknown {
