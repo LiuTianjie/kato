@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 const PORT = Number(process.env.PORT || process.env.BILIBILI_SERVICE_PORT || 18080);
 const COOKIES_PATH = process.env.BILIBILI_COOKIES_PATH || "/app/data/platforms/bilibili/cookies.json";
@@ -23,6 +23,8 @@ const WBI_MIXIN_KEY_ENC_TAB = [
 let serviceLogSeq = 0;
 const serviceLogs = [];
 let wbiKeyCache = null;
+const collectionJobs = new Map();
+const credentialQueues = new Map();
 
 const server = createServer(async (req, res) => {
   try {
@@ -82,14 +84,14 @@ const server = createServer(async (req, res) => {
       if (!keyword) throw httpError(400, "INVALID_PARAMS", "keyword is required.");
       const pn = normalizePositiveInt(body.pn || body.page, 1);
       const ps = normalizeLimit(body.ps || body.page_size || body.limit, 20);
-      const data = await searchVideos(keyword, pn, ps, body.order || sortOrderFromLabel(body.sort_label, "totalrank"));
+      const data = await searchVideos(keyword, pn, ps, body.order || sortOrderFromLabel(body.sort_label, "totalrank"), body.auth);
       sendJson(res, 200, { success: true, data });
       return;
     }
 
     if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/v1/videos/detail") {
       const body = req.method === "POST" ? await readJson(req) : Object.fromEntries(url.searchParams.entries());
-      const data = await fetchOneVideo(body);
+      const data = await fetchOneVideo(body, body.auth);
       sendJson(res, 200, { success: true, data });
       return;
     }
@@ -98,7 +100,7 @@ const server = createServer(async (req, res) => {
       const body = req.method === "POST" ? await readJson(req) : Object.fromEntries(url.searchParams.entries());
       const pn = normalizePositiveInt(body.pn || body.page || body.num, 1);
       const ps = normalizeLimit(body.ps || body.page_size || body.limit || body.size, 20);
-      const data = await fetchVideoComments(body, pn, ps);
+      const data = await fetchVideoComments(body, pn, ps, body.auth);
       sendJson(res, 200, { success: true, data });
       return;
     }
@@ -107,8 +109,23 @@ const server = createServer(async (req, res) => {
       const body = req.method === "POST" ? await readJson(req) : Object.fromEntries(url.searchParams.entries());
       const pn = normalizePositiveInt(body.pn || body.page || body.num, 1);
       const ps = normalizeLimit(body.ps || body.page_size || body.limit || body.size, 20);
-      const data = await fetchCommentReplies(body, pn, ps);
+      const data = await fetchCommentReplies(body, pn, ps, body.auth);
       sendJson(res, 200, { success: true, data });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/v1/collection/jobs") {
+      const body = await readJson(req);
+      const job = await createCollectionJob(body);
+      sendJson(res, 200, { success: true, data: job });
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname.startsWith("/api/v1/collection/jobs/")) {
+      const jobId = url.pathname.split("/").pop();
+      const job = collectionJobs.get(jobId);
+      if (!job) throw httpError(404, "JOB_NOT_FOUND", "collection job not found.");
+      sendJson(res, 200, { success: true, data: job });
       return;
     }
 
@@ -126,14 +143,14 @@ server.listen(PORT, () => {
   serviceLog("info", "service", `kato-bilibili-service listening on http://0.0.0.0:${PORT}`);
 });
 
-async function searchVideos(keyword, pn, ps, order = "totalrank") {
+async function searchVideos(keyword, pn, ps, order = "totalrank", auth) {
   const payload = await bilibiliApi("/x/web-interface/search/type", {
     search_type: "video",
     keyword,
     page: pn,
     page_size: ps,
     order
-  });
+  }, auth);
   const data = payload.data || {};
   const result = Array.isArray(data.result) ? data.result.map(toSearchVideo).filter((item) => item.bvid) : [];
   return {
@@ -146,18 +163,18 @@ async function searchVideos(keyword, pn, ps, order = "totalrank") {
   };
 }
 
-async function fetchOneVideo(input) {
+async function fetchOneVideo(input, auth) {
   const identity = normalizeVideoIdentity(input);
-  const payload = await bilibiliApi("/x/web-interface/view", identity);
+  const payload = await bilibiliApi("/x/web-interface/view", identity, auth);
   return toDetailVideo(payload.data || {});
 }
 
-async function fetchVideoComments(input, pn, ps) {
-  const oid = await resolveAid(input);
+async function fetchVideoComments(input, pn, ps, auth) {
+  const oid = await resolveAid(input, auth);
   const order = String(input.order || input.sort_label || "").toLowerCase();
   const latest = ["time", "latest", "pubdate"].includes(order);
-  if (latest) return fetchVideoCommentsLatest(input, oid, pn, ps);
-  const payload = await bilibiliApi("/x/v2/reply", { type: input.type || 1, oid, pn, ps, sort: input.sort || 2 });
+  if (latest) return fetchVideoCommentsLatest(input, oid, pn, ps, auth);
+  const payload = await bilibiliApi("/x/v2/reply", { type: input.type || 1, oid, pn, ps, sort: input.sort || 2 }, auth);
   const data = payload.data || {};
   return {
     replies: Array.isArray(data.replies) ? data.replies.map(toReply) : [],
@@ -171,15 +188,15 @@ async function fetchVideoComments(input, pn, ps) {
   };
 }
 
-async function fetchVideoCommentsLatest(input, oid, pn, ps) {
+async function fetchVideoCommentsLatest(input, oid, pn, ps, auth) {
   const pageSize = Math.max(1, Math.min(ps, 50));
   const endpoint = await buildWbiCommentEndpoint({
     oid,
     page: pn,
     pageSize,
     cursor: stringValue(input.cursor)
-  });
-  const payload = await bilibiliApi(endpoint.pathname, Object.fromEntries(endpoint.searchParams.entries()));
+  }, auth);
+  const payload = await bilibiliApi(endpoint.pathname, Object.fromEntries(endpoint.searchParams.entries()), auth);
   const data = payload.data || {};
   const page = data.page || {};
   const cursor = extractWbiNextCursor(data);
@@ -197,11 +214,11 @@ async function fetchVideoCommentsLatest(input, oid, pn, ps) {
   };
 }
 
-async function fetchCommentReplies(input, pn, ps) {
-  const oid = await resolveAid(input);
+async function fetchCommentReplies(input, pn, ps, auth) {
+  const oid = await resolveAid(input, auth);
   const root = String(input.root || input.root_id || input.rpid || input.comment_id || "").trim();
   if (!root) throw httpError(400, "INVALID_PARAMS", "root/rpid/comment_id is required.");
-  const payload = await bilibiliApi("/x/v2/reply/reply", { type: input.type || 1, oid, root, pn, ps });
+  const payload = await bilibiliApi("/x/v2/reply/reply", { type: input.type || 1, oid, root, pn, ps }, auth);
   const data = payload.data || {};
   const order = String(input.order || input.sort_label || "").toLowerCase();
   const replies = Array.isArray(data.replies) ? data.replies.map((reply) => toReply(reply, root)) : [];
@@ -218,12 +235,12 @@ async function fetchCommentReplies(input, pn, ps) {
   };
 }
 
-async function resolveAid(input) {
+async function resolveAid(input, auth) {
   const aid = String(input.aid || input.oid || input.id || "").trim();
   if (aid && /^\d+$/.test(aid)) return aid;
   const bvid = extractBvid(String(input.bvid || input.bv_id || input.bvId || input.url || ""));
   if (!bvid) throw httpError(400, "INVALID_PARAMS", "aid/oid or bvid is required.");
-  const detail = await fetchOneVideo({ bvid });
+  const detail = await fetchOneVideo({ bvid }, auth);
   if (!detail.aid) throw httpError(400, "INVALID_PARAMS", "Cannot resolve aid from bvid.");
   return String(detail.aid);
 }
@@ -236,12 +253,12 @@ function normalizeVideoIdentity(input) {
   throw httpError(400, "INVALID_PARAMS", "bvid, aid or url is required.");
 }
 
-async function bilibiliApi(pathname, params) {
+async function bilibiliApi(pathname, params, auth) {
   const url = new URL(`https://api.bilibili.com${pathname}`);
   for (const [key, value] of Object.entries(params || {})) {
     if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
   }
-  const cookie = await loadCookieHeader();
+  const cookie = normalizeAuthCookie(auth) || (await loadCookieHeader());
   const headers = {
     "User-Agent": USER_AGENT,
     "Accept": "application/json,text/plain,*/*",
@@ -261,6 +278,91 @@ async function bilibiliApi(pathname, params) {
     throw httpError(status, code, String(payload.message || payload.msg || `Bilibili API code ${payload.code}`));
   }
   return payload;
+}
+
+async function createCollectionJob(input) {
+  const jobId = randomUUID();
+  const platform = String(input.platform || "bilibili");
+  if (platform !== "bilibili") throw httpError(400, "INVALID_PARAMS", "bilibili service only accepts bilibili jobs.");
+  const type = String(input.type || input.job_type || "").trim();
+  const payload = input.payload && typeof input.payload === "object" ? input.payload : {};
+  const auth = input.auth && typeof input.auth === "object" ? input.auth : {};
+  const credentialId = String(auth.credential_id || auth.account_id || "anonymous");
+  const startedAt = new Date().toISOString();
+  const baseJob = {
+    job_id: jobId,
+    platform,
+    type,
+    credential_id: credentialId,
+    status: "running",
+    created_at: startedAt,
+    started_at: startedAt,
+    finished_at: null,
+    result: null,
+    error: null
+  };
+  collectionJobs.set(jobId, baseJob);
+  try {
+    const result = await runCredentialQueued(credentialId, () => runCollectionJob(type, payload, auth));
+    const finished = { ...baseJob, status: "succeeded", finished_at: new Date().toISOString(), result };
+    collectionJobs.set(jobId, finished);
+    return finished;
+  } catch (error) {
+    const failed = {
+      ...baseJob,
+      status: "failed",
+      finished_at: new Date().toISOString(),
+      error: normalizeCollectionError(error)
+    };
+    collectionJobs.set(jobId, failed);
+    return failed;
+  }
+}
+
+async function runCollectionJob(type, payload, auth) {
+  if (type === "keyword_search") {
+    const keyword = String(payload.keyword || payload.query || "").trim();
+    if (!keyword) throw httpError(400, "INVALID_PARAMS", "keyword is required.");
+    const page = normalizePositiveInt(payload.page || payload.pn, 1);
+    const limit = normalizeLimit(payload.limit || payload.ps || payload.page_size, 20);
+    return searchVideos(keyword, page, limit, payload.order || sortOrderFromLabel(payload.sort_label, "totalrank"), auth);
+  }
+  if (type === "post_detail") return fetchOneVideo(payload, auth);
+  if (type === "post_comments") {
+    const page = normalizePositiveInt(payload.page || payload.pn || payload.num, 1);
+    const limit = normalizeLimit(payload.limit || payload.ps || payload.page_size || payload.size, 20);
+    return fetchVideoComments(payload, page, limit, auth);
+  }
+  if (type === "comment_replies") {
+    const page = normalizePositiveInt(payload.page || payload.pn || payload.num, 1);
+    const limit = normalizeLimit(payload.limit || payload.ps || payload.page_size || payload.size, 20);
+    return fetchCommentReplies(payload, page, limit, auth);
+  }
+  throw httpError(400, "INVALID_PARAMS", `unsupported collection job type: ${type}`);
+}
+
+function runCredentialQueued(credentialId, task) {
+  const key = credentialId || "anonymous";
+  const previous = credentialQueues.get(key) || Promise.resolve();
+  const current = previous.then(task, task);
+  const queued = current.catch(() => undefined).finally(() => {
+    if (credentialQueues.get(key) === queued) credentialQueues.delete(key);
+  });
+  credentialQueues.set(key, queued);
+  return current;
+}
+
+function normalizeAuthCookie(auth) {
+  if (!auth || typeof auth !== "object") return "";
+  return String(auth.cookie || auth.cookies || "").trim();
+}
+
+function normalizeCollectionError(error) {
+  return {
+    code: error?.code || "INTERNAL_ERROR",
+    message: error instanceof Error ? error.message : String(error),
+    status: error?.status || 500
+  };
 }
 
 function toSearchVideo(item) {
@@ -349,7 +451,7 @@ function toReply(item, rootId = "") {
   };
 }
 
-async function buildWbiCommentEndpoint({ oid, page, pageSize, cursor }) {
+async function buildWbiCommentEndpoint({ oid, page, pageSize, cursor }, auth) {
   const params = {
     oid,
     type: 1,
@@ -364,7 +466,7 @@ async function buildWbiCommentEndpoint({ oid, page, pageSize, cursor }) {
   } else if (page > 1) {
     params.pagination_str = `{"offset":"{\\"type\\":1,\\"direction\\":1,\\"Data\\":{\\"cursor\\":${page - 1}}}"}`;
   }
-  const signed = await signWbiParams(params);
+  const signed = await signWbiParams(params, auth);
   const url = new URL("https://api.bilibili.com/x/v2/reply/wbi/main");
   for (const [key, value] of Object.entries(signed)) {
     if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
@@ -372,8 +474,8 @@ async function buildWbiCommentEndpoint({ oid, page, pageSize, cursor }) {
   return url;
 }
 
-async function signWbiParams(params) {
-  const mixinKey = await getWbiMixinKey();
+async function signWbiParams(params, auth) {
+  const mixinKey = await getWbiMixinKey(auth);
   const cleaned = {};
   for (const key of Object.keys(params).sort()) {
     const value = String(params[key]).replace(/[!'()*]/g, "");
@@ -386,10 +488,10 @@ async function signWbiParams(params) {
   };
 }
 
-async function getWbiMixinKey() {
+async function getWbiMixinKey(auth) {
   const now = Date.now();
   if (wbiKeyCache && wbiKeyCache.expiresAt > now) return wbiKeyCache.mixinKey;
-  const payload = await bilibiliApi("/x/web-interface/nav", {});
+  const payload = await bilibiliApi("/x/web-interface/nav", {}, auth);
   const wbiImg = payload.data?.wbi_img || {};
   const imgKey = extractWbiKey(wbiImg.img_url);
   const subKey = extractWbiKey(wbiImg.sub_url);

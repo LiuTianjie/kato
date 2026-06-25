@@ -153,6 +153,27 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     return;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/platforms/export-auth") {
+    const body = await readJson(req);
+    const platform = requirePlatformSpec(body.platform);
+    sendJson(res, 200, { success: true, data: await exportPlatformAuth(platform.id) });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/v1/collection/jobs") {
+    const body = await readJson(req);
+    const platform = requirePlatformSpec(body.platform);
+    sendJson(res, 200, { success: true, data: await postPlatformCollectionJob(platform.id, body) });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname.startsWith("/api/v1/collection/jobs/")) {
+    const platform = requirePlatformSpec(url.searchParams.get("platform") || "bilibili");
+    const jobId = url.pathname.split("/").pop() || "";
+    sendJson(res, 200, { success: true, data: await fetchPlatformCollectionJob(platform.id, jobId) });
+    return;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/platforms/worker-status") {
     sendJson(res, 200, { platforms: await Promise.all(listPlatformSpecs().map((platform) => getPlatformWorkerStatus(platform.id))) });
     return;
@@ -420,6 +441,21 @@ async function postBilibiliJson(endpoint: string, body: Record<string, unknown>,
   return data;
 }
 
+async function postPlatformCollectionJob(platform: PlatformId, body: Record<string, unknown>): Promise<unknown> {
+  if (platform === "bilibili") {
+    return unwrapMcpData(await postBilibiliJson("/api/v1/collection/jobs", body, 35_000));
+  }
+  throw new Error(`Collection jobs for ${platform} are not implemented yet.`);
+}
+
+async function fetchPlatformCollectionJob(platform: PlatformId, jobId: string): Promise<unknown> {
+  if (!jobId) throw new Error("job_id is required.");
+  if (platform === "bilibili") {
+    return unwrapMcpData(await fetchBilibiliJson(`/api/v1/collection/jobs/${encodeURIComponent(jobId)}`, 20_000));
+  }
+  throw new Error(`Collection jobs for ${platform} are not implemented yet.`);
+}
+
 async function fetchRuntimeJson(baseUrl: string, endpoint: string, timeoutMs = 20_000): Promise<unknown> {
   const response = await fetchWithTimeout(`${baseUrl.replace(/\/$/, "")}${endpoint}`, {}, timeoutMs);
   const text = await response.text();
@@ -507,6 +543,57 @@ async function syncPlatformCookies(platform: PlatformId): Promise<Record<string,
         : await postMcpJson("/api/v1/browser/sync-cookies", {}, 35_000);
   const data = unwrapMcpData(payload) as Record<string, unknown>;
   return { platform: spec.id, label: spec.label, synced: true, ...data };
+}
+
+async function exportPlatformAuth(platform: PlatformId): Promise<Record<string, unknown>> {
+  const spec = getPlatformSpec(platform);
+  if (!spec.implemented || !spec.capabilities.login) {
+    return { platform: spec.id, label: spec.label, exported: false, error: "未接入登录能力" };
+  }
+  const [cookiesPayload, storagePayload] = await Promise.all([
+    postRuntimeJson(
+      runtimeUrlForKind(spec, "viewer"),
+      "/browser/cookies/export",
+      { domains: spec.cookieDomains },
+      35_000
+    ),
+    postRuntimeJson(
+      runtimeUrlForKind(spec, "viewer"),
+      "/browser/storage/export",
+      { domains: spec.cookieDomains, origins: spec.cookieDomains },
+      35_000
+    ).catch(() => ({}))
+  ]);
+  const cookiesData = unwrapMcpData(cookiesPayload) as Record<string, unknown>;
+  const storageData = unwrapMcpData(storagePayload) as Record<string, unknown>;
+  const cookies = Array.isArray(cookiesData.cookies) ? cookiesData.cookies : [];
+  const storage = Array.isArray(storageData.storage) ? storageData.storage : [];
+  return {
+    platform: spec.id,
+    label: spec.label,
+    exported: true,
+    cookie: cookiesToHeader(cookies),
+    cookies,
+    storage,
+    storage_json: JSON.stringify(storage),
+    cookie_count: cookies.length,
+    storage_origin_count: storage.length
+  };
+}
+
+function cookiesToHeader(cookies: unknown[]): string {
+  const pairs: string[] = [];
+  const seen = new Set<string>();
+  for (const item of cookies) {
+    if (!item || typeof item !== "object") continue;
+    const cookie = item as Record<string, unknown>;
+    const name = String(cookie.name || "").trim();
+    const value = String(cookie.value || "").trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    pairs.push(`${name}=${value}`);
+  }
+  return pairs.join("; ");
 }
 
 async function getPlatformWorkerStatus(platform: PlatformId): Promise<Record<string, unknown>> {
