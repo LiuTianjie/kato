@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { createDouyinAdapter } from "../adapters/douyin.js";
 import { getRequestApiToken, isValidApiToken } from "./apiAuth.js";
 import { captureRawPayload } from "../diagnostics/rawCapture.js";
+import { extractItemsWithLlm } from "../llm/parseFallback.js";
 
 interface RouteOptions {
   signal?: AbortSignal;
@@ -72,15 +73,9 @@ async function routePublicDouyinApi(
       { keyword, limit, page, cursor, sort_label: body.sort_label, sort_type: body.sort_type, publish_time: body.publish_time },
       options.signal
     );
-    const posts = sortByCreateTimeDesc(extractList(payload, ["posts", "items", "data"]).map(toServerxDouyinVideo));
+    let posts = sortByCreateTimeDesc(extractList(payload, ["posts", "items", "data"]).map(toServerxDouyinVideo));
     if (posts.length === 0 && hasUpstreamContent(payload)) {
-      await captureRawPayload({
-        platform: "douyin",
-        kind: "search",
-        reason: "empty-result",
-        request: { keyword, limit, page, cursor },
-        payload
-      });
+      posts = sortByCreateTimeDesc(await recoverDouyinVideos(payload, { keyword, limit, page, cursor }, "search", options.signal));
     }
     return {
       videos: posts,
@@ -99,15 +94,10 @@ async function routePublicDouyinApi(
   if (req.method === "GET" && path === "/api/douyin/web/fetch_one_video") {
     const payload = await postServiceJson("/api/v1/posts/detail", normalizeDouyinVideoRequest(body), options.signal);
     const post = extractList(payload, ["items", "posts", "data"])[0] ?? asRecord(payload).post ?? asRecord(payload).item ?? payload;
-    const detail = toServerxDouyinVideo(post);
+    let detail = toServerxDouyinVideo(post);
     if (!detail.aweme_id && hasUpstreamContent(payload)) {
-      await captureRawPayload({
-        platform: "douyin",
-        kind: "detail",
-        reason: "empty-result",
-        request: normalizeDouyinVideoRequest(body),
-        payload
-      });
+      const recovered = await recoverDouyinVideos(payload, normalizeDouyinVideoRequest(body), "detail", options.signal);
+      if (recovered[0]?.aweme_id) detail = recovered[0];
     }
     return { aweme_detail: detail };
   }
@@ -120,15 +110,11 @@ async function routePublicDouyinApi(
       options.signal
     );
     const data = asRecord(payload);
-    const comments = sortByCreateTimeDesc(extractList(payload, ["comments", "items", "data"]).map((comment) => toServerxDouyinComment(comment)));
+    let comments = sortByCreateTimeDesc(extractList(payload, ["comments", "items", "data"]).map((comment) => toServerxDouyinComment(comment)));
     if (comments.length === 0 && hasUpstreamContent(payload)) {
-      await captureRawPayload({
-        platform: "douyin",
-        kind: "comments",
-        reason: "empty-result",
-        request: { ...normalizeDouyinVideoRequest(body), limit, cursor: body.cursor ?? 0 },
-        payload
-      });
+      comments = sortByCreateTimeDesc(
+        await recoverDouyinComments(payload, { ...normalizeDouyinVideoRequest(body), limit, cursor: body.cursor ?? 0 }, "comments", "", options.signal)
+      );
     }
     return {
       comments,
@@ -146,15 +132,17 @@ async function routePublicDouyinApi(
       options.signal
     );
     const data = asRecord(payload);
-    const comments = sortByCreateTimeDesc(extractList(payload, ["comments", "items", "data"]).map((comment) => toServerxDouyinComment(comment, commentId)));
+    let comments = sortByCreateTimeDesc(extractList(payload, ["comments", "items", "data"]).map((comment) => toServerxDouyinComment(comment, commentId)));
     if (comments.length === 0 && hasUpstreamContent(payload)) {
-      await captureRawPayload({
-        platform: "douyin",
-        kind: "comment_replies",
-        reason: "empty-result",
-        request: { ...normalizeDouyinVideoRequest(body), comment_id: commentId, limit, cursor: body.cursor ?? 0 },
-        payload
-      });
+      comments = sortByCreateTimeDesc(
+        await recoverDouyinComments(
+          payload,
+          { ...normalizeDouyinVideoRequest(body), comment_id: commentId, limit, cursor: body.cursor ?? 0 },
+          "comment_replies",
+          commentId,
+          options.signal
+        )
+      );
     }
     return {
       comments,
@@ -437,6 +425,54 @@ function toServerxDouyinComment(value: unknown, parentId = ""): Record<string, u
     reply_comment_total: numberValue(raw.reply_comment_total ?? raw.reply_count),
     create_time: secondsValue(raw.create_time ?? item.create_time)
   };
+}
+
+/**
+ * 解析失配恢复(视频):先落 raw 供诊断,再(若启用)调 LLM 从原始 payload 抽松散 item,
+ * 用现有 toServerxDouyinVideo 归一化保证 shape 一致、raw 仍保留。失败返回空数组。
+ */
+async function recoverDouyinVideos(
+  payload: unknown,
+  request: unknown,
+  kind: string,
+  signal?: AbortSignal
+): Promise<Record<string, unknown>[]> {
+  await captureRawPayload({ platform: "douyin", kind, reason: "empty-result", request, payload });
+  const items = await extractItemsWithLlm({
+    platform: "douyin",
+    kind: "video",
+    payload,
+    fieldHint:
+      "aweme_id(视频ID,字符串)、desc(标题文案)、share_url(视频链接)、author:{nickname(作者昵称)}、" +
+      "statistics:{digg_count(点赞数),comment_count(评论数),share_count,collect_count}、create_time(发布时间戳,秒)",
+    signal
+  });
+  if (!items) return [];
+  return items.map(toServerxDouyinVideo);
+}
+
+/**
+ * 解析失配恢复(评论):同上,归一化走 toServerxDouyinComment。
+ */
+async function recoverDouyinComments(
+  payload: unknown,
+  request: unknown,
+  kind: string,
+  parentId: string,
+  signal?: AbortSignal
+): Promise<Record<string, unknown>[]> {
+  await captureRawPayload({ platform: "douyin", kind, reason: "empty-result", request, payload });
+  const items = await extractItemsWithLlm({
+    platform: "douyin",
+    kind: "comment",
+    payload,
+    fieldHint:
+      "cid(评论ID,字符串)、text(评论正文)、user:{nickname(用户昵称)}、digg_count(点赞数)、" +
+      "reply_id(父评论ID,子评论才有)、reply_comment_total(子评论数)、create_time(发布时间戳,秒)",
+    signal
+  });
+  if (!items) return [];
+  return items.map((item) => toServerxDouyinComment(item, parentId));
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
