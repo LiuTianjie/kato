@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createDouyinAdapter } from "../adapters/douyin.js";
 import { getRequestApiToken, isValidApiToken } from "./apiAuth.js";
+import { captureRawPayload } from "../diagnostics/rawCapture.js";
 
 interface RouteOptions {
   signal?: AbortSignal;
@@ -72,6 +73,15 @@ async function routePublicDouyinApi(
       options.signal
     );
     const posts = sortByCreateTimeDesc(extractList(payload, ["posts", "items", "data"]).map(toServerxDouyinVideo));
+    if (posts.length === 0 && hasUpstreamContent(payload)) {
+      await captureRawPayload({
+        platform: "douyin",
+        kind: "search",
+        reason: "empty-result",
+        request: { keyword, limit, page, cursor },
+        payload
+      });
+    }
     return {
       videos: posts,
       cursor: String(cursor + limit),
@@ -89,7 +99,17 @@ async function routePublicDouyinApi(
   if (req.method === "GET" && path === "/api/douyin/web/fetch_one_video") {
     const payload = await postServiceJson("/api/v1/posts/detail", normalizeDouyinVideoRequest(body), options.signal);
     const post = extractList(payload, ["items", "posts", "data"])[0] ?? asRecord(payload).post ?? asRecord(payload).item ?? payload;
-    return { aweme_detail: toServerxDouyinVideo(post) };
+    const detail = toServerxDouyinVideo(post);
+    if (!detail.aweme_id && hasUpstreamContent(payload)) {
+      await captureRawPayload({
+        platform: "douyin",
+        kind: "detail",
+        reason: "empty-result",
+        request: normalizeDouyinVideoRequest(body),
+        payload
+      });
+    }
+    return { aweme_detail: detail };
   }
 
   if (req.method === "GET" && path === "/api/douyin/web/fetch_video_comments") {
@@ -101,6 +121,15 @@ async function routePublicDouyinApi(
     );
     const data = asRecord(payload);
     const comments = sortByCreateTimeDesc(extractList(payload, ["comments", "items", "data"]).map((comment) => toServerxDouyinComment(comment)));
+    if (comments.length === 0 && hasUpstreamContent(payload)) {
+      await captureRawPayload({
+        platform: "douyin",
+        kind: "comments",
+        reason: "empty-result",
+        request: { ...normalizeDouyinVideoRequest(body), limit, cursor: body.cursor ?? 0 },
+        payload
+      });
+    }
     return {
       comments,
       cursor: String(data.cursor ?? ""),
@@ -118,6 +147,15 @@ async function routePublicDouyinApi(
     );
     const data = asRecord(payload);
     const comments = sortByCreateTimeDesc(extractList(payload, ["comments", "items", "data"]).map((comment) => toServerxDouyinComment(comment, commentId)));
+    if (comments.length === 0 && hasUpstreamContent(payload)) {
+      await captureRawPayload({
+        platform: "douyin",
+        kind: "comment_replies",
+        reason: "empty-result",
+        request: { ...normalizeDouyinVideoRequest(body), comment_id: commentId, limit, cursor: body.cursor ?? 0 },
+        payload
+      });
+    }
     return {
       comments,
       cursor: String(data.cursor ?? ""),
@@ -403,6 +441,25 @@ function toServerxDouyinComment(value: unknown, parentId = ""): Record<string, u
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+}
+
+/**
+ * 判断上游 payload 是否"确实带了内容、却被归一化成空"——用于区分
+ * 真·空结果(没有评论的视频)和解析失配(平台改版导致字段路径失效)。
+ * 只有后者才值得落盘做诊断/兜底。
+ */
+function hasUpstreamContent(payload: unknown): boolean {
+  const data = unwrapData(payload);
+  if (Array.isArray(data)) return data.length > 0;
+  if (!data || typeof data !== "object") return false;
+  const record = data as Record<string, unknown>;
+  for (const key of ["posts", "items", "data", "comments", "aweme_list", "aweme_detail", "post", "item"]) {
+    const child = record[key];
+    if (Array.isArray(child) && child.length > 0) return true;
+    if (child && typeof child === "object" && Object.keys(child).length > 0) return true;
+  }
+  // 顶层就是单个对象且字段较多,也算有内容
+  return Object.keys(record).length > 3;
 }
 
 function stringValue(value: unknown): string {

@@ -1,6 +1,5 @@
 import type { AccountPersona, ContentDraft, ContentSource, ContentType, WebResearchSource } from "../domain/types.js";
-
-type ChatMessage = { role: "system" | "user"; content: string };
+import { callArk, canUseArk as canUseArkClient, parseArkJson } from "../llm/arkClient.js";
 
 export interface ContentDraftInput {
   projectId: number;
@@ -20,60 +19,63 @@ export async function generateContentDraft(input: ContentDraftInput): Promise<Co
 }
 
 export function parseContentDraftJson(value: string, projectId: number): ContentDraft {
-  const parsed = parseJsonObject(value) as Partial<ContentDraft>;
+  const parsed = parseArkJson<Partial<ContentDraft>>(value, "Content agent");
   return normalizeDraft(projectId, parsed);
 }
 
 function canUseArk(): boolean {
-  return Boolean(process.env.ARK_API_KEY && (process.env.CONTENT_MODEL || process.env.ARK_MODEL));
+  return canUseArkClient("content");
 }
 
 async function generateWithArk(input: ContentDraftInput): Promise<ContentDraft> {
-  const content = await callArk([
-    {
-      role: "system",
-      content:
-        "你是小红书图文笔记创作者。你必须基于给定来源写作：事实只能来自来源，个人观点可以表达，但不能虚构亲身经历、数据、案例或结论。只输出严格 JSON，不要 Markdown。"
-    },
-    {
-      role: "user",
-      content: [
-        `关键词：${input.keyword}`,
-        `内容类型：${input.contentType}`,
-        "账号人设：",
-        JSON.stringify(input.persona ?? { warning: "未配置账号人设" }, null, 2),
-        "小红书参考来源：",
-        JSON.stringify(
-          input.sources.map((source) => ({
-            title: source.title,
-            snippet: source.snippet,
-            author: source.author,
-            likeCount: source.likeCount,
-            commentCount: source.commentCount,
-            heatScore: source.heatScore,
-            heatReason: source.heatReason,
-            analysis: source.sourceAnalysis
-          })),
-          null,
-          2
-        ),
-        "网页辅助资料：",
-        JSON.stringify(
-          input.webSources.map((source) => ({
-            title: source.title,
-            snippet: source.snippet,
-            extractedText: source.extractedText.slice(0, 700),
-            status: source.status
-          })),
-          null,
-          2
-        ),
-        `研究摘要：${input.researchSummary}`,
-        "返回 JSON 字段：titleCandidates:string[]、coverText:string、body:string、tags:string[]、imagePlan:string[]、visualStyle:string、personaFit:string、humanVoiceReview:{passed:boolean,issues:string[],revisionNotes:string[]}、originalityCheck:{reusedAngles:string[],uniqueAngle:string,riskNotes:string[]}、factualClaims:string[]、sourceRefs:string[]、unsupportedClaims:string[]、riskNotes:string[]。",
-        "正文要求：像真人表达，但不要写没有来源的亲身经历。可以写'我的判断是'这类观点；所有具体事实、产品能力、数据、趋势判断必须能在 factualClaims 中列出，并在 sourceRefs 中用来源标题或 URL 标注出处。无法确认的事实必须放入 unsupportedClaims，不要硬写。"
-      ].join("\n")
-    }
-  ]);
+  const content = await callArk(
+    [
+      {
+        role: "system",
+        content:
+          "你是小红书图文笔记创作者。你必须基于给定来源写作：事实只能来自来源，个人观点可以表达，但不能虚构亲身经历、数据、案例或结论。只输出严格 JSON，不要 Markdown。"
+      },
+      {
+        role: "user",
+        content: [
+          `关键词：${input.keyword}`,
+          `内容类型：${input.contentType}`,
+          "账号人设：",
+          JSON.stringify(input.persona ?? { warning: "未配置账号人设" }, null, 2),
+          "小红书参考来源：",
+          JSON.stringify(
+            input.sources.map((source) => ({
+              title: source.title,
+              snippet: source.snippet,
+              author: source.author,
+              likeCount: source.likeCount,
+              commentCount: source.commentCount,
+              heatScore: source.heatScore,
+              heatReason: source.heatReason,
+              analysis: source.sourceAnalysis
+            })),
+            null,
+            2
+          ),
+          "网页辅助资料：",
+          JSON.stringify(
+            input.webSources.map((source) => ({
+              title: source.title,
+              snippet: source.snippet,
+              extractedText: source.extractedText.slice(0, 700),
+              status: source.status
+            })),
+            null,
+            2
+          ),
+          `研究摘要：${input.researchSummary}`,
+          "返回 JSON 字段：titleCandidates:string[]、coverText:string、body:string、tags:string[]、imagePlan:string[]、visualStyle:string、personaFit:string、humanVoiceReview:{passed:boolean,issues:string[],revisionNotes:string[]}、originalityCheck:{reusedAngles:string[],uniqueAngle:string,riskNotes:string[]}、factualClaims:string[]、sourceRefs:string[]、unsupportedClaims:string[]、riskNotes:string[]。",
+          "正文要求：像真人表达，但不要写没有来源的亲身经历。可以写'我的判断是'这类观点；所有具体事实、产品能力、数据、趋势判断必须能在 factualClaims 中列出，并在 sourceRefs 中用来源标题或 URL 标注出处。无法确认的事实必须放入 unsupportedClaims，不要硬写。"
+        ].join("\n")
+      }
+    ],
+    { modelKind: "content", temperature: 0.78, maxTokens: 1800, label: "Ark content generation" }
+  );
   return parseContentDraftJson(content, input.projectId);
 }
 
@@ -163,24 +165,27 @@ function reviewHumanVoice(draft: ContentDraft, persona: AccountPersona | null): 
 
 async function reviseDraftOnce(draft: ContentDraft, input: ContentDraftInput): Promise<ContentDraft> {
   if (!canUseArk()) return localRevise(draft);
-  const content = await callArk([
-    {
-      role: "system",
-      content: "你是小红书内容编辑。把草稿改得更像真人账号本人，保留原意，只输出严格 JSON。"
-    },
-    {
-      role: "user",
-      content: [
-        "账号人设：",
-        JSON.stringify(input.persona ?? { warning: "未配置账号人设" }, null, 2),
-        "需要修正的问题：",
-        JSON.stringify(draft.humanVoiceReview.issues, null, 2),
-        "原草稿：",
-        JSON.stringify(draft, null, 2),
-        "返回同样 JSON 结构。"
-      ].join("\n")
-    }
-  ]);
+  const content = await callArk(
+    [
+      {
+        role: "system",
+        content: "你是小红书内容编辑。把草稿改得更像真人账号本人，保留原意，只输出严格 JSON。"
+      },
+      {
+        role: "user",
+        content: [
+          "账号人设：",
+          JSON.stringify(input.persona ?? { warning: "未配置账号人设" }, null, 2),
+          "需要修正的问题：",
+          JSON.stringify(draft.humanVoiceReview.issues, null, 2),
+          "原草稿：",
+          JSON.stringify(draft, null, 2),
+          "返回同样 JSON 结构。"
+        ].join("\n")
+      }
+    ],
+    { modelKind: "content", temperature: 0.78, maxTokens: 1800, label: "Ark content revision" }
+  );
   return reviewHumanVoice(parseContentDraftJson(content, input.projectId), input.persona);
 }
 
@@ -191,32 +196,6 @@ function localRevise(draft: ContentDraft): ContentDraft {
     .replace(/综上所述|总而言之/g, "我的结论是")
     .replace(/赶快收藏|不容错过/g, "可以先试试");
   return reviewHumanVoice({ ...draft, body, status: draft.unsupportedClaims.length ? "needs_revision" : draft.status }, null);
-}
-
-async function callArk(messages: ChatMessage[]): Promise<string> {
-  const apiKey = process.env.ARK_API_KEY;
-  const model = process.env.CONTENT_MODEL || process.env.ARK_MODEL;
-  const baseUrl = process.env.ARK_BASE_URL ?? "https://ark.cn-beijing.volces.com/api/v3";
-  if (!apiKey || !model) throw new Error("Content generation requires ARK_API_KEY and CONTENT_MODEL or ARK_MODEL.");
-
-  const response = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify({
-      model,
-      temperature: 0.78,
-      max_tokens: 1800,
-      messages
-    })
-  });
-  if (!response.ok) throw new Error(`Ark content generation failed: HTTP ${response.status} ${await response.text()}`);
-  const payload = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
-  const content = payload.choices?.[0]?.message?.content?.trim();
-  if (!content) throw new Error("Ark content generation returned empty content.");
-  return content;
 }
 
 function normalizeDraft(projectId: number, parsed: Partial<ContentDraft>): ContentDraft {
@@ -247,22 +226,6 @@ function normalizeDraft(projectId: number, parsed: Partial<ContentDraft>): Conte
     publishStatus: "not_published",
     status: toStringArray(parsed.unsupportedClaims).length ? "needs_revision" : "drafted"
   };
-}
-
-function parseJsonObject(value: string): unknown {
-  const trimmed = value
-    .trim()
-    .replace(/^```json\s*/i, "")
-    .replace(/^```\s*/i, "")
-    .replace(/```$/i, "")
-    .trim();
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    const match = /\{[\s\S]*\}/.exec(trimmed);
-    if (!match) throw new Error(`Content agent did not return JSON: ${value}`);
-    return JSON.parse(match[0]);
-  }
 }
 
 function toStringArray(value: unknown): string[] {

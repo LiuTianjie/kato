@@ -251,16 +251,36 @@ async function bilibiliApi(pathname, params) {
   const response = await fetchWithTimeout(url, { headers }, FETCH_TIMEOUT_MS);
   const text = await response.text();
   const payload = text ? JSON.parse(text) : {};
-  if (response.status === 401 || response.status === 403 || response.status === 412) {
-    throw httpError(401, "COOKIE_EXPIRED", "cookie expired or anti-bot challenge");
+  // 412 是 B站典型风控特征码,不是普通 cookie 失效:归为人工验证挑战。
+  if (response.status === 412) {
+    serviceLog("warn", "challenge", `Bilibili ${pathname} hit HTTP 412 anti-bot challenge`);
+    throw httpError(428, "CHALLENGE_REQUIRED", "Bilibili anti-bot challenge (HTTP 412); 需在控制台完成人工验证并同步 Cookie");
+  }
+  if (response.status === 401 || response.status === 403) {
+    throw httpError(401, "COOKIE_EXPIRED", "cookie expired or unauthorized");
   }
   if (!response.ok) throw httpError(response.status, "UPSTREAM_ERROR", `Bilibili HTTP ${response.status}`);
   if (payload.code !== 0) {
-    const code = payload.code === -101 || payload.code === -102 ? "COOKIE_EXPIRED" : "UPSTREAM_ERROR";
-    const status = code === "COOKIE_EXPIRED" ? 401 : 502;
-    throw httpError(status, code, String(payload.message || payload.msg || `Bilibili API code ${payload.code}`));
+    const classified = classifyBilibiliCode(payload.code);
+    if (classified === "CHALLENGE_REQUIRED") {
+      serviceLog("warn", "challenge", `Bilibili ${pathname} risk-control code ${payload.code}`);
+    }
+    const status = classified === "CHALLENGE_REQUIRED" ? 428 : classified === "COOKIE_EXPIRED" ? 401 : 502;
+    throw httpError(status, classified, String(payload.message || payload.msg || `Bilibili API code ${payload.code}`));
   }
   return payload;
+}
+
+/**
+ * 区分 B站非 0 业务码:
+ *  - 风控/频控(-352 校验失败、-509/-799 请求过于频繁)→ 需人工验证的挑战
+ *  - 账号态(-101 未登录、-102 被封停)→ cookie 失效
+ *  - 其余 → 上游错误
+ */
+function classifyBilibiliCode(code) {
+  if (code === -352 || code === -509 || code === -799) return "CHALLENGE_REQUIRED";
+  if (code === -101 || code === -102) return "COOKIE_EXPIRED";
+  return "UPSTREAM_ERROR";
 }
 
 function toSearchVideo(item) {

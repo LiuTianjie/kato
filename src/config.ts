@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { loadDotEnv } from "./env.js";
+import { arkModelFor, resolveArkSettings } from "./llm/arkClient.js";
 
 export interface XhsConfig {
   provider: "fixture" | "stdio" | "http";
@@ -21,12 +22,37 @@ export interface XhsConfig {
   };
 }
 
+export interface ArkConfigSnapshot {
+  /** 是否具备最低生产条件:有 key 且能解析出默认模型 */
+  enabled: boolean;
+  hasApiKey: boolean;
+  baseUrl: string;
+  defaultModel?: string;
+  fastModel?: string;
+  relevanceModel?: string;
+  contentModel?: string;
+}
+
 export interface AppConfig {
   rootDir: string;
   dataDir: string;
   outputDir: string;
   sqlitePath: string;
   xhs: XhsConfig;
+  ark: ArkConfigSnapshot;
+}
+
+function loadArkSnapshot(): ArkConfigSnapshot {
+  const settings = resolveArkSettings();
+  return {
+    enabled: Boolean(settings.apiKey && arkModelFor("default", settings)),
+    hasApiKey: Boolean(settings.apiKey),
+    baseUrl: settings.baseUrl,
+    defaultModel: settings.defaultModel,
+    fastModel: settings.fastModel,
+    relevanceModel: settings.relevanceModel,
+    contentModel: settings.contentModel
+  };
 }
 
 export function loadConfig(rootDir = process.cwd()): AppConfig {
@@ -43,7 +69,8 @@ export function loadConfig(rootDir = process.cwd()): AppConfig {
     dataDir,
     outputDir,
     sqlitePath: path.join(dataDir, "app.sqlite"),
-    xhs
+    xhs,
+    ark: loadArkSnapshot()
   };
 }
 

@@ -187,7 +187,14 @@ function sendServerxSuccess(res: ServerResponse, data: unknown): void {
 }
 
 function sendServerxError(res: ServerResponse, error: PublicApiError): void {
-  const code = error.status === 401 || error.status === 403 ? 40101 : error.status === 400 ? 40001 : 50001;
+  const code =
+    error.code === "CHALLENGE_REQUIRED"
+      ? 40102
+      : error.status === 401 || error.status === 403
+        ? 40101
+        : error.status === 400
+          ? 40001
+          : 50001;
   sendJson(res, error.status >= 400 && error.status < 600 ? error.status : 500, {
     code,
     message: error.message,

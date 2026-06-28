@@ -165,6 +165,8 @@ export function initSchema(db: Db): void {
     CREATE INDEX IF NOT EXISTS idx_content_events_project ON content_events(project_id, id);
   `);
   ensureColumn(db, "posts", "xsec_token", "TEXT");
+  ensureColumn(db, "interactions", "relevance_confidence", "REAL");
+  ensureColumn(db, "interactions", "relevance_source", "TEXT");
   ensureColumn(db, "content_sources", "heat_score", "REAL");
   ensureColumn(db, "content_sources", "heat_reason", "TEXT NOT NULL DEFAULT ''");
   ensureColumn(db, "content_sources", "detail_error", "TEXT");

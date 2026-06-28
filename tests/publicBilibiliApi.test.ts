@@ -183,6 +183,36 @@ test("serverx-compatible Bilibili API maps cookie challenge to 40101", async () 
   }
 });
 
+test("serverx-compatible Bilibili API maps anti-bot challenge to 40102", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalToken = process.env.XHS_API_TOKEN;
+  const originalBaseUrl = process.env.BILIBILI_SERVICE_URL;
+  process.env.XHS_API_TOKEN = "secret-token";
+  process.env.BILIBILI_SERVICE_URL = "http://fake-bilibili.local";
+  globalThis.fetch = async () =>
+    jsonResponse(
+      {
+        success: false,
+        error: { code: "CHALLENGE_REQUIRED", message: "Bilibili anti-bot challenge (HTTP 412)" }
+      },
+      428
+    );
+  try {
+    const response = await callApi({
+      method: "GET",
+      pathname: "/api/bilibili/web/search_videos?keyword=test",
+      token: "secret-token"
+    });
+    assert.equal(response.payload.code, 40102);
+    assert.match(response.payload.message, /challenge/i);
+    assert.equal(response.payload.data, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreEnv("XHS_API_TOKEN", originalToken);
+    restoreEnv("BILIBILI_SERVICE_URL", originalBaseUrl);
+  }
+});
+
 async function callApi(options: { method: string; pathname: string; body?: unknown; token?: string }): Promise<{ status: number; payload: any }> {
   const rawBody = options.body === undefined ? "" : JSON.stringify(options.body);
   const req = Readable.from(rawBody ? [rawBody] : []) as IncomingMessage;

@@ -1,6 +1,7 @@
 import type { Note, ScoredPost } from "../domain/types.js";
 import { matchBestNote } from "../notes/matcher.js";
 import { getRuleRejectionReason } from "./scorer.js";
+import { callArk, canUseArk, parseArkJson } from "../llm/arkClient.js";
 
 export interface RelevanceDecision {
   keep: boolean;
@@ -9,8 +10,6 @@ export interface RelevanceDecision {
   confidence: number;
   source: "ark" | "rules";
 }
-
-type ChatMessage = { role: "system" | "user"; content: string };
 
 export async function evaluatePostRelevance(
   post: ScoredPost,
@@ -31,7 +30,7 @@ export async function evaluatePostRelevance(
 export function shouldUseArkRelevance(): boolean {
   if (process.env.RELEVANCE_EVALUATOR === "off") return false;
   const provider = process.env.RELEVANCE_PROVIDER ?? process.env.COMMENT_PROVIDER;
-  return Boolean(provider === "ark" && process.env.ARK_API_KEY && relevanceModel());
+  return Boolean(provider === "ark" && canUseArk("relevance"));
 }
 
 function evaluateWithRules(post: ScoredPost, notes: Note[]): RelevanceDecision {
@@ -57,63 +56,71 @@ function evaluateWithRules(post: ScoredPost, notes: Note[]): RelevanceDecision {
 }
 
 async function evaluateWithArk(post: ScoredPost, notes: Note[], keywords: string[]): Promise<RelevanceDecision> {
-  const content = await callArk([
+  const content = await callArk(
+    [
+      {
+        role: "system",
+        content:
+          "你是小红书运营选帖质检器。你的任务是快速判断帖子是否值得进入互动队列。只输出严格 JSON，不要 Markdown。"
+      },
+      {
+        role: "user",
+        content: [
+          "判断标准：",
+          "1. 帖子必须适合账号用真实经验自然评论，不要硬广。",
+          "2. 优先保留能自然关联到我的某篇笔记的帖子。",
+          "3. 纯抽奖、互赞互关、低价引流、招聘、无上下文吐槽、内容太空泛的帖子应跳过。",
+          "4. 搜索关键词只是线索，不要求逐字命中；语义相关且能接上笔记即可保留。",
+          "",
+          "搜索关键词：",
+          JSON.stringify(keywords),
+          "",
+          "候选帖子：",
+          JSON.stringify(
+            {
+              title: post.title,
+              snippet: post.snippet,
+              author: post.author,
+              likeCount: post.likeCount,
+              commentCount: post.commentCount,
+              ruleScore: post.score,
+              matchedKeywords: post.matchedKeywords
+            },
+            null,
+            2
+          ),
+          "",
+          "我的笔记库：",
+          JSON.stringify(
+            notes.map((note) => ({
+              id: note.id,
+              title: note.title,
+              summary: note.summary,
+              keywords: note.keywords,
+              scenarios: note.scenarios
+            })),
+            null,
+            2
+          ),
+          "",
+          '返回格式：{"keep":true或false,"noteId":数字或null,"confidence":0到1,"reason":"20字以内中文理由"}。'
+        ].join("\n")
+      }
+    ],
     {
-      role: "system",
-      content:
-        "你是小红书运营选帖质检器。你的任务是快速判断帖子是否值得进入互动队列。只输出严格 JSON，不要 Markdown。"
-    },
-    {
-      role: "user",
-      content: [
-        "判断标准：",
-        "1. 帖子必须适合账号用真实经验自然评论，不要硬广。",
-        "2. 优先保留能自然关联到我的某篇笔记的帖子。",
-        "3. 纯抽奖、互赞互关、低价引流、招聘、无上下文吐槽、内容太空泛的帖子应跳过。",
-        "4. 搜索关键词只是线索，不要求逐字命中；语义相关且能接上笔记即可保留。",
-        "",
-        "搜索关键词：",
-        JSON.stringify(keywords),
-        "",
-        "候选帖子：",
-        JSON.stringify(
-          {
-            title: post.title,
-            snippet: post.snippet,
-            author: post.author,
-            likeCount: post.likeCount,
-            commentCount: post.commentCount,
-            ruleScore: post.score,
-            matchedKeywords: post.matchedKeywords
-          },
-          null,
-          2
-        ),
-        "",
-        "我的笔记库：",
-        JSON.stringify(
-          notes.map((note) => ({
-            id: note.id,
-            title: note.title,
-            summary: note.summary,
-            keywords: note.keywords,
-            scenarios: note.scenarios
-          })),
-          null,
-          2
-        ),
-        "",
-        '返回格式：{"keep":true或false,"noteId":数字或null,"confidence":0到1,"reason":"20字以内中文理由"}。'
-      ].join("\n")
+      modelKind: "relevance",
+      temperature: 0.1,
+      maxTokens: 120,
+      label: "Ark relevance evaluator"
     }
-  ]);
+  );
 
-  const parsed = parseJsonObject(content) as {
+  const parsed = parseArkJson<{
     keep?: boolean;
     noteId?: number | string | null;
     confidence?: number | string;
     reason?: string;
-  };
+  }>(content, "Ark relevance evaluator");
   const noteId = parsed.noteId == null ? null : Number(parsed.noteId);
   const validNote = Number.isFinite(noteId) ? notes.find((note) => note.id === noteId) : null;
   const confidence = clamp01(Number(parsed.confidence ?? 0.5));
@@ -126,58 +133,6 @@ async function evaluateWithArk(post: ScoredPost, notes: Note[], keywords: string
     confidence,
     source: "ark"
   };
-}
-
-async function callArk(messages: ChatMessage[]): Promise<string> {
-  const apiKey = process.env.ARK_API_KEY;
-  const model = relevanceModel();
-  const baseUrl = process.env.ARK_BASE_URL ?? "https://ark.cn-beijing.volces.com/api/v3";
-  if (!apiKey || !model) throw new Error("Ark relevance evaluator requires ARK_API_KEY and model.");
-
-  const response = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify({
-      model,
-      temperature: 0.1,
-      max_tokens: 120,
-      messages
-    })
-  });
-
-  if (!response.ok) {
-    throw new Error(`Ark relevance evaluation failed: HTTP ${response.status} ${await response.text()}`);
-  }
-
-  const payload = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
-  const content = payload.choices?.[0]?.message?.content?.trim();
-  if (!content) throw new Error("Ark relevance evaluation returned empty content.");
-  return content;
-}
-
-function relevanceModel(): string | undefined {
-  return process.env.ARK_RELEVANCE_MODEL || process.env.ARK_FAST_MODEL || process.env.ARK_MODEL;
-}
-
-function parseJsonObject(value: string): unknown {
-  const trimmed = value
-    .trim()
-    .replace(/^```json\s*/i, "")
-    .replace(/^```\s*/i, "")
-    .replace(/```$/i, "")
-    .trim();
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    const match = /\{[\s\S]*\}/.exec(trimmed);
-    if (!match) throw new Error(`Ark relevance evaluator did not return JSON: ${value}`);
-    return JSON.parse(match[0]);
-  }
 }
 
 function clamp01(value: number): number {
