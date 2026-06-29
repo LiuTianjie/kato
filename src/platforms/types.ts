@@ -2,6 +2,7 @@ export type PlatformId = "xhs" | "bilibili" | "douyin";
 
 export interface PlatformRequestOptions {
   signal?: AbortSignal;
+  auth?: unknown;
   cursor?: string;
   index?: number;
   pageArea?: string;

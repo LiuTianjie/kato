@@ -311,7 +311,7 @@ const server = createServer(async (req, res) => {
       const keyword = String(body.keyword || body.query || "");
       const limit = normalizeLimit(body.limit ?? body.page_size ?? body.pageSize, 20);
       const page = normalizePositiveInt(body.page, 1);
-      const feeds = await enqueueBrowserTask("feeds:search", (taskContext) => searchFeeds(keyword, limit, { ...searchFilterOptions(body), page, taskContext }), { signal: requestSignal });
+      const feeds = await enqueueBrowserTask("feeds:search", (taskContext) => searchFeeds(keyword, limit, { ...searchFilterOptions(body), auth: body.auth, page, taskContext }), { signal: requestSignal });
       sendJson(res, 200, { success: true, data: pagedPayload("feeds", feeds, { page, limit }) });
       return;
     }
@@ -1094,6 +1094,7 @@ async function currentUserSummary(taskContext) {
 async function searchFeeds(keyword, limit, options = {}) {
   const taskContext = options.taskContext;
   return withBrowserRecovery("searchFeeds", async () => {
+    await applyRequestAuth(options.auth, "feeds:search");
     if (!keyword.trim()) return [];
     const pageNumber = normalizePositiveInt(options.page, 1);
     serviceLog("info", "feeds", "Search feeds requested.", {
@@ -1158,6 +1159,9 @@ async function searchFeeds(keyword, limit, options = {}) {
         diagnostics: lastDiagnostics || undefined
       });
       if (result.length || attempt >= 2) {
+        if (!result.length && isSearchLoginOrPermissionBlocked(lastDiagnostics)) {
+          throw new Error("XHS login required: search page requires login or has no permission, please sync cookie.");
+        }
         serviceLog("info", "feeds", "Search feeds completed.", {
           keyword,
           page: pageNumber,
@@ -1172,6 +1176,9 @@ async function searchFeeds(keyword, limit, options = {}) {
       await humanDelay("search:retry", 1_200, 2_400, { signal: taskContext?.signal });
     }
     serviceLog("warn", "feeds", "Search feeds returned empty result.", { keyword, page: pageNumber, diagnostics: lastDiagnostics || undefined });
+    if (isSearchLoginOrPermissionBlocked(lastDiagnostics)) {
+      throw new Error("XHS login required: search page requires login or has no permission, please sync cookie.");
+    }
     return [];
   }, taskContext);
 }
@@ -1298,8 +1305,15 @@ async function searchPageDiagnostics(page) {
   }).catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
 }
 
+function isSearchLoginOrPermissionBlocked(diagnostics) {
+  if (!diagnostics || typeof diagnostics !== "object") return false;
+  const text = `${diagnostics.title || ""} ${diagnostics.bodyPreview || ""}`;
+  return /登录后查看|手机号登录|请登录|没有权限访问|账号没有权限|二维码已过期/i.test(text);
+}
+
 async function getFeedDetail(body, taskContext) {
   return withBrowserRecovery("getFeedDetail", async () => {
+    await applyRequestAuth(body.auth, "feeds:detail");
     const { id, xsecToken, url } = normalizeDetailInput(body);
     if (!url && !id) throw new Error("feed_id or url is required.");
     if (isTokenRequiredForDetailUrl(url) && !xsecToken) {
@@ -1560,6 +1574,7 @@ async function scrapePosts(page) {
 async function getFeedComments(body, limit, options = {}) {
   const taskContext = options.taskContext;
   return withBrowserRecovery("getFeedComments", async () => {
+    await applyRequestAuth(body.auth, "feeds:comments");
     const detailInput = normalizeDetailInput(body);
     const index = normalizeCursorIndex(options.index, options.cursor, 0);
     serviceLog("info", "comments", "Note comments requested.", {
@@ -1568,8 +1583,30 @@ async function getFeedComments(body, limit, options = {}) {
       limit,
       index
     });
-    await getFeedDetail(body, taskContext);
+    await ensureFeedDetailForComments(body, taskContext);
     const page = await servicePage(taskContext);
+    let apiComments = [];
+    let apiError = "";
+    try {
+      apiComments = await fetchCommentsByWebApi(page, detailInput, limit, index, taskContext);
+    } catch (error) {
+      apiError = error instanceof Error ? error.message : String(error);
+      serviceLog("warn", "comments", `XHS comments web API failed, fallback to DOM scrape: ${apiError}`, {
+        id: detailInput.id,
+        index
+      });
+    }
+    if (apiComments.length) {
+      const comments = uniqueComments(apiComments, limit, 0);
+      serviceLog("info", "comments", "Note comments completed.", {
+        id: detailInput.id,
+        index,
+        scraped: apiComments.length,
+        returned: comments.length,
+        source: "web_api"
+      });
+      return comments;
+    }
     await humanDelay("comments:before-scroll", 700, 1_800, { signal: taskContext?.signal });
     await autoScroll(page, Math.max(3, index + 3), taskContext);
     taskContext?.throwIfCancelled?.();
@@ -1580,10 +1617,143 @@ async function getFeedComments(body, limit, options = {}) {
       index,
       scraped: scraped.length,
       returned: comments.length,
-      currentUrl: safeLogUrl(page.url())
+      currentUrl: safeLogUrl(page.url()),
+      source: "dom",
+      apiError
     });
+    if (!comments.length && isXhsAuthOrChallengeError(apiError)) {
+      throw new Error(`XHS challenge required: ${apiError}`);
+    }
     return comments;
   }, taskContext);
+}
+
+async function ensureFeedDetailForComments(body, taskContext) {
+  let lastError;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      return await getFeedDetail(body, taskContext);
+    } catch (error) {
+      lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      if (!isXhsAuthOrChallengeError(message) || attempt >= 2) break;
+      serviceLog("warn", "comments", "XHS detail login redirect before comments, retrying once.", {
+        attempt,
+        error: message
+      });
+      await humanDelay("comments:detail-retry", 2_000, 4_000, { signal: taskContext?.signal });
+      await applyRequestAuth(body.auth, "feeds:comments:retry");
+    }
+  }
+  throw lastError;
+}
+
+async function fetchCommentsByWebApi(page, detailInput, limit, index, taskContext) {
+  const noteId = String(detailInput.id || "").trim();
+  if (!noteId) return [];
+  taskContext?.throwIfCancelled?.();
+  const payload = await page.evaluate(
+    async ({ noteId, xsecToken, limit, index }) => {
+      const path = "/api/sns/web/v2/comment/page";
+      const params = new URLSearchParams({
+        note_id: noteId,
+        cursor: index > 0 ? String(index * limit) : "",
+        top_comment_id: "",
+        image_formats: "jpg,webp,avif"
+      });
+      if (xsecToken) params.set("xsec_token", xsecToken);
+      const pathWithQuery = `${path}?${params.toString()}`;
+      const signHeaders =
+        typeof window._webmsxyw === "function" ? window._webmsxyw(pathWithQuery, null) : {};
+      const response = await fetch(`https://edith.xiaohongshu.com${pathWithQuery}`, {
+        method: "GET",
+        credentials: "include",
+        headers: {
+          Accept: "application/json, text/plain, */*",
+          ...signHeaders
+        }
+      });
+      const text = await response.text();
+      let json = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {
+        json = null;
+      }
+      return { ok: response.ok, status: response.status, text, json };
+    },
+    { noteId, xsecToken: detailInput.xsecToken || "", limit, index }
+  );
+  if (!payload?.ok) {
+    throw new Error(`XHS comments web API HTTP ${payload?.status || "unknown"} ${String(payload?.text || "").slice(0, 200)}`);
+  }
+  if (payload.json?.success === false || (payload.json?.code != null && Number(payload.json.code) !== 0)) {
+    throw new Error(`XHS comments web API failed: ${payload.json?.msg || payload.json?.message || payload.text || "unknown error"}`);
+  }
+  return commentsFromWebPayload(payload.json);
+}
+
+function commentsFromWebPayload(payload) {
+  const result = [];
+  const seen = new Set();
+  const roots =
+    firstArray(
+      payload?.data?.comments,
+      payload?.data?.comment_list,
+      payload?.comments,
+      payload?.comment_list,
+      payload?.items
+    ) || [];
+  for (const item of roots) {
+    collectCommentPayload(item, "", result, seen);
+  }
+  return result;
+}
+
+function isXhsAuthOrChallengeError(message) {
+  return /登录|请登录|login|required|账号存在异常|切换账号|验证|challenge|风控|risk/i.test(String(message || ""));
+}
+
+function collectCommentPayload(item, parentId, result, seen) {
+  if (!item || typeof item !== "object") return;
+  const id = firstText(item.id, item.comment_id, item.commentId);
+  const content = firstText(
+    item.content,
+    item.text,
+    item.comment_content,
+    item.content_info?.content,
+    item.contentInfo?.content
+  );
+  if (id && content && !seen.has(id)) {
+    seen.add(id);
+    const user = objectValue(item.user_info) || objectValue(item.userInfo) || objectValue(item.user) || {};
+    result.push({
+      id,
+      comment_id: id,
+      content,
+      text: content,
+      author: firstText(user.nickname, user.nick_name, user.name, item.author, item.author_name),
+      author_name: firstText(user.nickname, user.nick_name, user.name, item.author_name, item.author),
+      parent_id: parentId,
+      parent_comment_id: parentId,
+      create_time: item.create_time || item.createTime || item.time || item.create_time_millis,
+      published_at: item.published_at || item.publishedAt || item.create_time || item.createTime
+    });
+  }
+  const children =
+    firstArray(
+      item.sub_comments,
+      item.subComments,
+      item.sub_comment_list,
+      item.subCommentList,
+      item.replies,
+      item.reply_list
+    ) || [];
+  for (const child of children) collectCommentPayload(child, id || parentId, result, seen);
+}
+
+function firstArray(...values) {
+  return values.find((value) => Array.isArray(value));
 }
 
 function startPostResponseCapture(page) {
@@ -2089,6 +2259,71 @@ async function restoreStorage(context, storage) {
   }
   loadedStorageOrigins = restored;
   return restored;
+}
+
+async function applyRequestAuth(auth, source) {
+  if (!auth || typeof auth !== "object") return;
+  const cookies = normalizeRequestAuthCookies(auth);
+  const storage = normalizeRequestAuthStorage(auth);
+  if (!cookies.length && !storage.length) return;
+  const context = await ensureContext();
+  if (cookies.length) await context.addCookies(cookies).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    serviceLog("warn", "cookies", `XHS request cookie restore failed during ${source}: ${message}`);
+  });
+  if (storage.length) await restoreStorage(context, storage).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    serviceLog("warn", "storage", `XHS request storage restore failed during ${source}: ${message}`);
+  });
+  serviceLog("info", "cookies", "XHS request auth applied.", {
+    source,
+    credentialId: String(auth.credential_id || auth.account_id || ""),
+    cookies: cookies.length,
+    storageOrigins: storage.length
+  });
+}
+
+function normalizeRequestAuthCookies(auth) {
+  if (!auth || typeof auth !== "object") return [];
+  if (Array.isArray(auth.cookies)) return filterXhsCookies(auth.cookies);
+  const cookieHeader = String(auth.cookie || auth.cookies || "").trim();
+  if (!cookieHeader) return [];
+  return parseCookieHeader(cookieHeader, ".xiaohongshu.com");
+}
+
+function normalizeRequestAuthStorage(auth) {
+  if (!auth || typeof auth !== "object") return [];
+  const raw = auth.storage_json || auth.storage;
+  if (Array.isArray(raw)) return filterXhsStorageEntries(raw);
+  if (typeof raw !== "string" || !raw.trim()) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return filterXhsStorageEntries(Array.isArray(parsed) ? parsed : []);
+  } catch {
+    return [];
+  }
+}
+
+function parseCookieHeader(cookieHeader, domain) {
+  const expires = Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60;
+  return cookieHeader
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const separator = part.indexOf("=");
+      if (separator <= 0) return null;
+      const name = part.slice(0, separator).trim();
+      const value = part.slice(separator + 1).trim();
+      if (!name || ["path", "domain", "expires", "max-age", "secure", "httponly", "samesite"].includes(name.toLowerCase())) return null;
+      return { name, value, domain, path: "/", expires, httpOnly: false, secure: true, sameSite: "Lax" };
+    })
+    .filter(Boolean);
+}
+
+function filterXhsCookies(cookies) {
+  if (!Array.isArray(cookies)) return [];
+  return cookies.filter((cookie) => cookie && typeof cookie === "object" && /xiaohongshu|xhs|rednote/i.test(String(cookie.domain || "")));
 }
 
 async function persistContextCookies(context, reason = "auto") {

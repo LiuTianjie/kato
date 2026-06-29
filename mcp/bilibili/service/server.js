@@ -171,7 +171,7 @@ async function fetchOneVideo(input, auth) {
 
 async function fetchVideoComments(input, pn, ps, auth) {
   const oid = await resolveAid(input, auth);
-  const order = String(input.order || input.sort_label || "").toLowerCase();
+  const order = String(input.order || input.sort_label || input.sort || "").toLowerCase();
   const latest = ["time", "latest", "pubdate"].includes(order);
   if (latest) return fetchVideoCommentsLatest(input, oid, pn, ps, auth);
   const payload = await bilibiliApi("/x/v2/reply", { type: input.type || 1, oid, pn, ps, sort: input.sort || 2 }, auth);

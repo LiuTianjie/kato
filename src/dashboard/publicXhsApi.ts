@@ -23,6 +23,7 @@ interface ApiErrorPayload {
 
 interface RouteOptions {
   signal?: AbortSignal;
+  auth?: unknown;
   cursor?: string;
   index?: number;
   pageArea?: string;
@@ -106,19 +107,19 @@ async function routePublicXhsApi(
   }
 
   if (req.method === "POST" && serverxPath === "/search_notes") {
-    return searchNotesForServerx(context.config, body, options);
+    return searchNotesForServerx(context.config, body, withBodyAuth(options, body));
   }
 
   if (req.method === "POST" && serverxPath === "/note_detail") {
-    return noteDetailForServerx(context.config, body, options);
+    return noteDetailForServerx(context.config, body, withBodyAuth(options, body));
   }
 
   if (req.method === "POST" && serverxPath === "/note_comments") {
-    return noteCommentsForServerx(context.config, body, options);
+    return noteCommentsForServerx(context.config, body, withBodyAuth(options, body));
   }
 
   if (req.method === "POST" && serverxPath === "/note_sub_comments") {
-    return noteSubCommentsForServerx(context.config, body, options);
+    return noteSubCommentsForServerx(context.config, body, withBodyAuth(options, body));
   }
 
   if (req.method === "GET" && path === "/api/v1/xhs/health") {
@@ -161,6 +162,10 @@ async function routePublicXhsApi(
   }
 
   throw new PublicApiError(404, "NOT_FOUND", "API endpoint not found.");
+}
+
+function withBodyAuth(options: RouteOptions, body: Record<string, unknown>): RouteOptions {
+  return body.auth ? { ...options, auth: body.auth } : options;
 }
 
 export function isPublicXhsApiPath(pathname: string): boolean {
@@ -279,7 +284,8 @@ async function searchFilteredPosts(
         noteType: normalizeText(body.note_type ?? body.noteType, "不限"),
         timeFilter: normalizeText(body.time_filter ?? body.timeFilter, "不限"),
         pageSize: normalizeLimit(body.page_size ?? body.pageSize ?? body.limit, limit),
-        searchId: normalizeText(body.search_id ?? body.searchId, "")
+        searchId: normalizeText(body.search_id ?? body.searchId, ""),
+        auth: options.auth
       });
       for (const post of results) {
         const key = post.id || post.url;

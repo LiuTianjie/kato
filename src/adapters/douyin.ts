@@ -20,18 +20,20 @@ class HttpDouyinAdapter implements DouyinAdapter {
   }
 
   async searchPosts(query: string, limit: number, options: PlatformRequestOptions = {}): Promise<PlatformPost[]> {
-    const payload = await this.postJson("/api/v1/posts/search", { keyword: query, limit }, options);
+    const payload = await this.postJson("/api/v1/posts/search", { keyword: query, limit, ...(options.auth ? { auth: options.auth } : {}) }, options);
     return coercePosts(payload).slice(0, limit);
   }
 
   async getPost(postOrUrl: PlatformPost | string, options: PlatformRequestOptions = {}): Promise<PlatformPost | null> {
-    const input = typeof postOrUrl === "string" ? { url: postOrUrl } : { id: postOrUrl.id, url: postOrUrl.url };
+    const input: Record<string, unknown> = typeof postOrUrl === "string" ? { url: postOrUrl } : { id: postOrUrl.id, url: postOrUrl.url };
+    if (options.auth) input.auth = options.auth;
     const payload = await this.postJson("/api/v1/posts/detail", input, options);
     return coercePosts(payload)[0] ?? null;
   }
 
   async getComments(postOrUrl: PlatformPost | string, limit: number, options: PlatformRequestOptions = {}): Promise<PlatformComment[]> {
-    const input = typeof postOrUrl === "string" ? { url: postOrUrl, limit } : { id: postOrUrl.id, url: postOrUrl.url, limit };
+    const input: Record<string, unknown> = typeof postOrUrl === "string" ? { url: postOrUrl, limit } : { id: postOrUrl.id, url: postOrUrl.url, limit };
+    if (options.auth) input.auth = options.auth;
     const payload = await this.postJson("/api/v1/posts/comments", input, options);
     return coerceComments(payload).slice(0, limit);
   }

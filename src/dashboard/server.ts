@@ -804,7 +804,7 @@ async function waitForBrowserViewerReady(platform: PlatformId, kind: RuntimeKind
   let lastError = "";
   while (Date.now() < deadline) {
     try {
-      const runtime = await fetchRuntimeJson(runtimeUrlForKind(spec, kind), "/health?ensure=1", 3_000);
+      const runtime = await fetchRuntimeJson(runtimeUrlForKind(spec, kind), "/health?ensure=1", 12_000);
       const ready = (runtime as { runtime?: { noVnc?: { ready?: boolean } } }).runtime?.noVnc?.ready === true;
       if (ready) return;
       lastError = "runtime noVNC not ready";

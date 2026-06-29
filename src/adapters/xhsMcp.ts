@@ -265,16 +265,30 @@ class HttpMcpXhsAdapter implements XhsAdapter {
   }
 
   private async searchFeedsRest(query: string, limit: number, options: XhsAdapterRequestOptions = {}): Promise<XhsPost[]> {
+    const requestBody = {
+      keyword: query,
+      limit,
+      ...(options.index != null ? { page: options.index + 1 } : {}),
+      ...(options.pageSize != null ? { page_size: options.pageSize } : {}),
+      ...(options.sortType ? { sort_type: options.sortType } : {}),
+      ...(options.noteType ? { note_type: options.noteType } : {}),
+      ...(options.timeFilter ? { time_filter: options.timeFilter } : {}),
+      ...(options.searchId ? { search_id: options.searchId } : {})
+    };
     const url = new URL("/api/v1/feeds/search", this.restBaseUrl);
-    url.searchParams.set("keyword", query);
-    url.searchParams.set("limit", String(limit));
-    if (options.index != null) url.searchParams.set("page", String(options.index + 1));
-    if (options.pageSize != null) url.searchParams.set("page_size", String(options.pageSize));
-    if (options.sortType) url.searchParams.set("sort_type", options.sortType);
-    if (options.noteType) url.searchParams.set("note_type", options.noteType);
-    if (options.timeFilter) url.searchParams.set("time_filter", options.timeFilter);
-    if (options.searchId) url.searchParams.set("search_id", options.searchId);
-    const response = await fetchWithTimeout(url, {}, this.restTimeoutMs, options.signal);
+    let init: RequestInit = {};
+    if (options.auth) {
+      init = {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...requestBody, auth: options.auth })
+      };
+    } else {
+      for (const [key, value] of Object.entries(requestBody)) {
+        if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
+      }
+    }
+    const response = await fetchWithTimeout(url, init, this.restTimeoutMs, options.signal);
     if (!response.ok) {
       throw new Error(`XHS REST search failed: HTTP ${response.status} ${await response.text()}`);
     }
@@ -294,7 +308,8 @@ class HttpMcpXhsAdapter implements XhsAdapter {
         comment_config: {
           max_comment_items: 10,
           scroll_speed: "normal"
-        }
+        },
+        ...(options.auth ? { auth: options.auth } : {})
       })
     }, this.restTimeoutMs, options.signal);
     if (!response.ok) {
@@ -316,7 +331,8 @@ class HttpMcpXhsAdapter implements XhsAdapter {
         limit,
         cursor: options.cursor,
         index: options.index,
-        pageArea: options.pageArea
+        pageArea: options.pageArea,
+        ...(options.auth ? { auth: options.auth } : {})
       })
     }, this.restTimeoutMs, options.signal);
     if (!response.ok) {

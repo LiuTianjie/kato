@@ -40,6 +40,7 @@ const DOUYIN_COMMENTS_DIRECT_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_COMMENTS_
 const DOUYIN_REPLIES_DIRECT_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_REPLIES_DIRECT_TIMEOUT_MS", 12_000);
 const DOUYIN_REPLIES_PAGE_FALLBACK_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_REPLIES_PAGE_FALLBACK_TIMEOUT_MS", 32_000);
 const DOUYIN_REPLIES_PAGE_MAX_ROUNDS = normalizePositiveEnv("DOUYIN_REPLIES_PAGE_MAX_ROUNDS", 6);
+const DOUYIN_REPLIES_PAGE_FALLBACK_ENABLED = process.env.DOUYIN_REPLIES_PAGE_FALLBACK_ENABLED === "1";
 const DOUYIN_SIGNER_URL = stringValue(process.env.DOUYIN_SIGNER_URL || "");
 const DOUYIN_SIGNER_REQUIRED = process.env.DOUYIN_SIGNER_REQUIRED === "1";
 const DOUYIN_SIGNER_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_SIGNER_TIMEOUT_MS", 8_000);
@@ -234,7 +235,10 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/v1/links/resolve") {
       const body = await readJson(req);
-      const data = await enqueueBrowserTask("links:resolve", (taskContext) => resolveDouyinLink(String(body.url || body.text || ""), taskContext), {
+      const data = await enqueueBrowserTask("links:resolve", async (taskContext) => {
+        await applyRequestAuth(body.auth, "links:resolve");
+        return resolveDouyinLink(String(body.url || body.text || ""), taskContext);
+      }, {
         signal: requestSignal
       });
       sendJson(res, 200, { success: true, data });
@@ -247,6 +251,7 @@ const server = createServer(async (req, res) => {
       const limit = normalizeLimit(body.limit, 20);
       const page = normalizePositiveInt(body.page, 1);
       const data = await enqueueBrowserTask("posts:search", (taskContext) => searchPosts(keyword, limit, {
+        auth: body.auth,
         page,
         cursor: body.cursor,
         sort_type: normalizeDouyinSortType(body.sort_type, body.sort_label),
@@ -763,6 +768,7 @@ async function searchPosts(keyword, limit, options = {}) {
   return withBrowserRecovery(
     "searchPosts",
     async () => {
+      await applyRequestAuth(options.auth, "posts:search");
       if (!keyword.trim()) return [];
       const pageNumber = normalizePositiveInt(options.page, 1);
       const page = await newTaskPage(taskContext);
@@ -833,6 +839,7 @@ async function getPostDetail(body, taskContext) {
   return withBrowserRecovery(
     "getPostDetail",
     async () => {
+      await applyRequestAuth(body.auth, "posts:detail");
       const resolved = await normalizePostInput(body, taskContext);
       if (!resolved.awemeId && !resolved.url) throw new Error("aweme_id, id or url is required.");
       const url = resolved.url || canonicalPostUrl(resolved.awemeId);
@@ -867,6 +874,7 @@ async function getPostComments(body, limit, taskContext) {
   return withBrowserRecovery(
     "getPostComments",
     async () => {
+      await applyRequestAuth(body.auth, "posts:comments");
       const resolved = await normalizePostInput(body, taskContext);
       if (!resolved.awemeId && !resolved.url) throw new Error("aweme_id, id or url is required.");
       const cursor = normalizeCursor(body.cursor, 0);
@@ -916,6 +924,7 @@ async function getCommentReplies(body, limit, taskContext) {
   return withBrowserRecovery(
     "getCommentReplies",
     async () => {
+      await applyRequestAuth(body.auth, "posts:comment_replies");
       const itemId = String(body.item_id || body.aweme_id || body.id || "").trim();
       const commentId = String(body.comment_id || body.commentId || "").trim();
       if (!itemId || !commentId) throw new Error("item_id/aweme_id and comment_id are required.");
@@ -937,22 +946,44 @@ async function getCommentReplies(body, limit, taskContext) {
         serviceLog("warn", "comments", `Direct replies fetch failed: ${errorMessage(error)}`);
       }
       if (directError && !isInitialCursor(cursor)) throw directError;
-      if (!extracted.comments.length && isInitialCursor(cursor)) {
+      if (!extracted.comments.length && isInitialCursor(cursor) && DOUYIN_REPLIES_PAGE_FALLBACK_ENABLED) {
         source = "page";
-        extracted = await runStepWithTimeout(
-          "comments:reply-page-fallback",
-          (signal) => expandRepliesFromPage(page, { itemId, commentId, cursor, limit, signal }),
-          DOUYIN_REPLIES_PAGE_FALLBACK_TIMEOUT_MS,
-          `Douyin reply page fallback timed out after ${DOUYIN_REPLIES_PAGE_FALLBACK_TIMEOUT_MS}ms.`,
-          taskContext?.signal,
-          {
+        try {
+          extracted = await runStepWithTimeout(
+            "comments:reply-page-fallback",
+            (signal) => expandRepliesFromPage(page, { itemId, commentId, cursor, limit, signal }),
+            DOUYIN_REPLIES_PAGE_FALLBACK_TIMEOUT_MS,
+            `Douyin reply page fallback timed out after ${DOUYIN_REPLIES_PAGE_FALLBACK_TIMEOUT_MS}ms.`,
+            taskContext?.signal,
+            {
+              itemId,
+              commentId,
+              cursor,
+              limit,
+              directError: directError ? errorMessage(directError).slice(0, 240) : ""
+            }
+          );
+        } catch (error) {
+          serviceLog("warn", "comments", "Douyin replies fallback failed; returning empty replies.", {
             itemId,
             commentId,
             cursor,
             limit,
-            directError: directError ? errorMessage(directError).slice(0, 240) : ""
-          }
-        );
+            directError: directError ? errorMessage(directError).slice(0, 240) : "",
+            fallbackError: errorMessage(error).slice(0, 240)
+          });
+          extracted = { comments: [], cursor: "", hasMore: false };
+          source = "none";
+        }
+      } else if (!extracted.comments.length && directError) {
+        serviceLog("warn", "comments", "Douyin replies direct fetch failed; page fallback disabled, returning empty replies.", {
+          itemId,
+          commentId,
+          cursor,
+          limit,
+          directError: errorMessage(directError).slice(0, 240)
+        });
+        source = "none";
       }
       const comments = uniqueComments(extracted.comments.map((comment) => ({ ...comment, parentId: comment.parentId || commentId }))).slice(0, limit);
       const hasMore = extracted.hasMore || comments.length >= limit;
@@ -1185,16 +1216,61 @@ async function fetchCommentsInPage(page, type, params) {
   const defaults = {
     ...douyinWebApiDefaults(runtimeParams),
     item_type: "0",
-    insert_ids: "",
-    whale_cut_token: "",
-    cut_version: "1",
-    rcFT: ""
+    ...(type === "reply"
+      ? {}
+      : {
+          insert_ids: "",
+          whale_cut_token: "",
+          cut_version: "1",
+          rcFT: ""
+        })
   };
   for (const [key, value] of Object.entries({ ...defaults, ...params })) {
     if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
   }
+  if (type === "reply") {
+    serviceLog("info", "comments", "Douyin replies direct request prepared.", {
+      itemId: stringValue(params.item_id),
+      commentId: stringValue(params.comment_id),
+      cursor: stringValue(params.cursor),
+      count: stringValue(params.count),
+      hasMsToken: Boolean(runtimeParams.msToken),
+      hasTtwid: Boolean(runtimeParams.ttwid),
+      hasVerifyFp: Boolean(runtimeParams.verifyFp)
+    });
+  }
   const requestUrl = await signDouyinApiUrl(page, url.toString(), runtimeParams, type === "reply" ? "commentReply" : "comment");
+  if (type === "reply") {
+    return fetchJsonWithPageCookies(page, requestUrl, 20_000, "Douyin reply fetch timed out.");
+  }
   return fetchJsonInPage(page, requestUrl, 20_000, "Douyin comment fetch timed out.");
+}
+
+async function fetchJsonWithPageCookies(page, requestUrl, timeoutMs, timeoutMessage) {
+  const cookies = await page.context().cookies("https://www.douyin.com").catch(() => []);
+  const cookieHeader = cookies
+    .filter((cookie) => cookie?.name)
+    .map((cookie) => `${cookie.name}=${cookie.value || ""}`)
+    .join("; ");
+  const response = await fetchWithTimeout(
+    requestUrl,
+    {
+      headers: {
+        accept: "application/json, text/plain, */*",
+        "accept-language": WINDOWS_ACCEPT_LANGUAGE,
+        "user-agent": WINDOWS_USER_AGENT,
+        referer: "https://www.douyin.com/",
+        ...(cookieHeader ? { cookie: cookieHeader } : {})
+      }
+    },
+    timeoutMs
+  ).catch((error) => {
+    if (/timed out|abort/i.test(errorMessage(error))) throw new Error(timeoutMessage);
+    throw error;
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`HTTP ${response.status}: ${text.slice(0, 500)}`);
+  return text ? JSON.parse(text) : {};
 }
 
 function douyinWebApiDefaults(runtimeParams = {}) {
@@ -2014,6 +2090,45 @@ async function restoreStorage(context, storage) {
     } finally {
       await page.close({ runBeforeUnload: false }).catch(() => undefined);
     }
+  }
+}
+
+async function applyRequestAuth(auth, source) {
+  if (!auth || typeof auth !== "object") return;
+  const cookies = normalizeRequestAuthCookies(auth);
+  const storage = normalizeRequestAuthStorage(auth);
+  if (!cookies.length && !storage.length) return;
+  const context = await ensureContext();
+  if (cookies.length) await addCookiesToContext(context, cookies, source);
+  if (storage.length) await restoreStorage(context, storage).catch((error) => {
+    serviceLog("warn", "storage", `Douyin request storage restore failed during ${source}: ${errorMessage(error)}`);
+  });
+  serviceLog("info", "cookies", "Douyin request auth applied.", {
+    source,
+    credentialId: stringValue(auth.credential_id || auth.account_id),
+    cookies: cookies.length,
+    storageOrigins: storage.length
+  });
+}
+
+function normalizeRequestAuthCookies(auth) {
+  if (!auth || typeof auth !== "object") return [];
+  if (Array.isArray(auth.cookies)) return normalizeCookiesForPlaywright(auth.cookies);
+  const cookieHeader = stringValue(auth.cookie || auth.cookies);
+  if (!cookieHeader) return [];
+  return parseCookieHeader(cookieHeader, ".douyin.com");
+}
+
+function normalizeRequestAuthStorage(auth) {
+  if (!auth || typeof auth !== "object") return [];
+  const raw = auth.storage_json || auth.storage;
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw !== "string" || !raw.trim()) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
   }
 }
 
