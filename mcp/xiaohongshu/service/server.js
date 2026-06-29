@@ -1340,16 +1340,26 @@ async function getFeedDetail(body, taskContext) {
     });
     const parsed = postFromUrl(url);
     const finalUrl = page.url();
+    const redirectedToLogin =
+      /xiaohongshu\.com\/login(?:\?|$)/i.test(finalUrl) ||
+      /手机号登录|登录后查看|请登录/i.test(detail.title || detail.text || "");
     const looksBlockedOrMissing =
       /\/404(?:\?|$)/.test(finalUrl) ||
       /当前笔记暂时无法浏览|你访问的页面不见了|扫码查看|error_code=300031/.test(detail.text || "");
-    serviceLog(looksBlockedOrMissing ? "warn" : "info", "detail", "Note detail page loaded.", {
+    serviceLog(looksBlockedOrMissing || redirectedToLogin ? "warn" : "info", "detail", "Note detail page loaded.", {
       id: id || parsed.id,
       status: response?.status?.(),
       finalUrl: safeLogUrl(finalUrl),
       title: cleanTitle(detail.title),
-      blockedOrMissing: looksBlockedOrMissing
+      blockedOrMissing: looksBlockedOrMissing,
+      redirectedToLogin
     });
+    if (redirectedToLogin) {
+      throw new Error("XHS login required: browser redirected to login page, please sync cookie.");
+    }
+    if (looksBlockedOrMissing) {
+      throw new Error("XHS note unavailable or blocked.");
+    }
     const result = {
       id: id || parsed.id,
       xsecToken: xsecToken || parsed.xsecToken,

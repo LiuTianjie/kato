@@ -156,7 +156,7 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
   if (req.method === "POST" && url.pathname === "/api/platforms/export-auth") {
     const body = await readJson(req);
     const platform = requirePlatformSpec(body.platform);
-    sendJson(res, 200, { success: true, data: await exportPlatformAuth(platform.id) });
+    sendJson(res, 200, { success: true, data: await exportPlatformAuth(platform.id, normalizeRuntimeKind(body.kind ?? body.runtimeKind)) });
     return;
   }
 
@@ -229,6 +229,21 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       kind,
       viewerUrl: noVncViewerUrl(platform.id, kind),
       loginUrl: targetUrl,
+      homeUrl: platform.homeUrl
+    });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/browser-viewer/url") {
+    const body = await readJson(req);
+    const platform = getPlatformSpec(body.platform);
+    const kind = normalizeRuntimeKind(body.kind ?? body.runtimeKind);
+    await waitForBrowserViewerReady(platform.id, kind, 10_000);
+    sendJson(res, 200, {
+      opened: false,
+      platform: platform.id,
+      kind,
+      viewerUrl: noVncViewerUrl(platform.id, kind),
       homeUrl: platform.homeUrl
     });
     return;
@@ -545,20 +560,20 @@ async function syncPlatformCookies(platform: PlatformId): Promise<Record<string,
   return { platform: spec.id, label: spec.label, synced: true, ...data };
 }
 
-async function exportPlatformAuth(platform: PlatformId): Promise<Record<string, unknown>> {
+async function exportPlatformAuth(platform: PlatformId, kind: RuntimeKind = "viewer"): Promise<Record<string, unknown>> {
   const spec = getPlatformSpec(platform);
   if (!spec.implemented || !spec.capabilities.login) {
     return { platform: spec.id, label: spec.label, exported: false, error: "未接入登录能力" };
   }
   const [cookiesPayload, storagePayload] = await Promise.all([
     postRuntimeJson(
-      runtimeUrlForKind(spec, "viewer"),
+      runtimeUrlForKind(spec, kind),
       "/browser/cookies/export",
       { domains: spec.cookieDomains },
       35_000
     ),
     postRuntimeJson(
-      runtimeUrlForKind(spec, "viewer"),
+      runtimeUrlForKind(spec, kind),
       "/browser/storage/export",
       { domains: spec.cookieDomains, origins: spec.cookieDomains },
       35_000
@@ -572,6 +587,7 @@ async function exportPlatformAuth(platform: PlatformId): Promise<Record<string, 
     platform: spec.id,
     label: spec.label,
     exported: true,
+    runtime_kind: kind,
     cookie: cookiesToHeader(cookies),
     cookies,
     storage,

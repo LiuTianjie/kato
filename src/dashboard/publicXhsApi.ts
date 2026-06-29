@@ -319,10 +319,37 @@ async function noteCommentsForServerx(
   config: AppConfig,
   body: Record<string, unknown>,
   options: RouteOptions = {}
-): Promise<Record<string, unknown>[]> {
+): Promise<Record<string, unknown>> {
+  const page = normalizeCursorPage(body.index, body.cursor, 0);
+  const pageSize = normalizeLimit(body.max_comments ?? body.limit, 50);
+  const pageArea = String(body.pageArea ?? body.page_area ?? "UNFOLDED");
   const post = normalizePostInput(normalizeServerxPostInput(body));
-  const comments = await getCommentsStrict(config, post, normalizeLimit(body.max_comments ?? body.limit, 50), options);
-  return dedupeXhsComments(comments).map(toServerxComment);
+  const comments = await getCommentsStrict(config, post, pageSize, {
+    ...options,
+    cursor: String(body.cursor ?? ""),
+    index: page,
+    pageArea
+  });
+  const items = dedupeXhsComments(comments).map(toServerxComment);
+  const nextIndex = page + 1;
+  const nextCursor = items.length ? `offset:${nextIndex}` : "";
+  return {
+    data: items,
+    items,
+    comments: items,
+    comment_list: items,
+    cursor: {
+      cursor: nextCursor,
+      index: nextIndex,
+      pageArea
+    },
+    next_cursor: nextCursor,
+    has_more: Boolean(nextCursor),
+    raw_count: comments.length,
+    parsed_count: items.length,
+    pageArea,
+    sort_strategy: body.sort_strategy ?? "latest_v2"
+  };
 }
 
 async function noteCommentsForTikHub(
