@@ -79,6 +79,7 @@ export interface PlatformSpec {
   homeUrl: string;
   loginUrl?: string;
   cookieDomains: string[];
+  storageOrigins?: string[];
   defaultDataDir: string;
   defaultServicePort?: number;
   viewerRuntimeUrl?: string;

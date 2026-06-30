@@ -97,7 +97,7 @@ async function routePublicDouyinApi(
     const limit = normalizeLimit(body.count ?? body.limit ?? body.page_size ?? body.ps, 20);
     const payload = await postServiceJson(
       "/api/v1/posts/comments",
-      { ...normalizeDouyinVideoRequest(body), limit, cursor: body.cursor ?? 0, sort_label: body.sort_label, auth: body.auth },
+      { ...normalizeDouyinVideoRequest(body), limit, cursor: body.cursor ?? 0, sort_label: body.sort_label, sort_type: body.sort_type, auth: body.auth },
       options.signal
     );
     const data = asRecord(payload);
@@ -109,12 +109,29 @@ async function routePublicDouyinApi(
     };
   }
 
+  if ((req.method === "GET" || req.method === "POST") && path === "/api/douyin/web/fetch_video_comments_full") {
+    const payload = await postServiceJson(
+      "/api/v1/posts/comments_full",
+      { ...normalizeDouyinVideoRequest(body), cursor: body.cursor ?? 0, sort_label: body.sort_label, sort_type: body.sort_type, auth: body.auth },
+      options.signal
+    );
+    const data = asRecord(payload);
+    const comments = sortByCreateTimeDesc(extractList(payload, ["comments", "items", "data"]).map((comment) => toServerxDouyinComment(comment)));
+    return {
+      comments,
+      items: comments,
+      cursor: String(data.cursor ?? ""),
+      has_more: Boolean(data.has_more ?? data.hasMore),
+      stats: data.stats ?? {}
+    };
+  }
+
   if ((req.method === "GET" || req.method === "POST") && path === "/api/douyin/web/fetch_video_comment_replies") {
     const limit = normalizeLimit(body.count ?? body.limit ?? body.page_size ?? body.ps, 20);
     const commentId = String(body.comment_id ?? body.commentId ?? body.cid ?? body.root ?? "").trim();
     const payload = await postServiceJson(
       "/api/v1/posts/comment_replies",
-      { ...normalizeDouyinVideoRequest(body), comment_id: commentId, limit, cursor: body.cursor ?? 0, sort_label: body.sort_label, auth: body.auth },
+      { ...normalizeDouyinVideoRequest(body), comment_id: commentId, limit, cursor: body.cursor ?? 0, sort_label: body.sort_label, sort_type: body.sort_type, auth: body.auth },
       options.signal
     );
     const data = asRecord(payload);
@@ -164,6 +181,10 @@ async function routePublicDouyinApi(
 
   if (req.method === "POST" && path === "/api/v1/douyin/posts/comments") {
     return postServiceJson("/api/v1/posts/comments", body, options.signal);
+  }
+
+  if (req.method === "POST" && path === "/api/v1/douyin/posts/comments_full") {
+    return postServiceJson("/api/v1/posts/comments_full", body, options.signal);
   }
 
   if (req.method === "POST" && path === "/api/v1/douyin/posts/comment_replies") {
@@ -304,7 +325,7 @@ function normalizeApiError(error: unknown): PublicApiError {
 function normalizeLimit(value: unknown, fallback: number): number {
   const parsed = Number(value ?? fallback);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
-  return Math.max(1, Math.min(100, Math.floor(parsed)));
+  return Math.max(1, Math.min(200, Math.floor(parsed)));
 }
 
 function normalizePositiveInt(value: unknown, fallback: number): number {

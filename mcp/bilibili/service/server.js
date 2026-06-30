@@ -5,6 +5,7 @@ import { createHash, randomUUID } from "node:crypto";
 
 const PORT = Number(process.env.PORT || process.env.BILIBILI_SERVICE_PORT || 18080);
 const COOKIES_PATH = process.env.BILIBILI_COOKIES_PATH || "/app/data/platforms/bilibili/cookies.json";
+const STORAGE_PATH = process.env.BILIBILI_STORAGE_PATH || "/app/data/platforms/bilibili/storage.json";
 const VIEWER_RUNTIME_URL = process.env.BILIBILI_VIEWER_RUNTIME_URL || "http://127.0.0.1:18120";
 const FETCH_TIMEOUT_MS = normalizePositiveEnv("BILIBILI_FETCH_TIMEOUT_MS", 60_000);
 const BROWSER_RUNTIME_TIMEOUT_MS = normalizePositiveEnv("BILIBILI_BROWSER_RUNTIME_TIMEOUT_MS", 30_000);
@@ -65,14 +66,21 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/api/v1/browser/sync-cookies") {
       const cookies = await exportViewerCookies(BILIBILI_COOKIE_DOMAINS);
+      const storage = await exportViewerStorage(BILIBILI_COOKIE_DOMAINS).catch((error) => {
+        serviceLog("warn", "storage", `Bilibili browser storage sync failed: ${errorMessage(error)}`);
+        return [];
+      });
       const cookieHeader = cookiesToHeader(cookies);
       if (!cookieHeader) throw httpError(401, "COOKIE_EXPIRED", "No Bilibili cookies found in viewer runtime.");
       await persistCookieHeader(cookieHeader);
+      await persistStorage(storage, "manual-sync");
       sendJson(res, 200, {
         success: true,
         data: {
           cookiesPath: COOKIES_PATH,
-          exportedCookies: cookies.length
+          storagePath: STORAGE_PATH,
+          exportedCookies: cookies.length,
+          exportedStorageOrigins: storage.length
         }
       });
       return;
@@ -134,7 +142,8 @@ const server = createServer(async (req, res) => {
     const status = error?.status || 500;
     const code = error?.code || "INTERNAL_ERROR";
     const message = error instanceof Error ? error.message : String(error);
-    serviceLog("error", "request", `${req.method || "GET"} ${req.url || "/"} failed: ${message}`);
+    const level = status >= 500 ? "error" : status === 401 ? "warn" : "info";
+    serviceLog(level, "request", `${req.method || "GET"} ${req.url || "/"} failed: ${message}`, { status, code });
     sendJson(res, status, { success: false, error: { code, message } });
   }
 });
@@ -565,6 +574,12 @@ async function persistCookieHeader(cookie) {
   serviceLog("info", "cookies", "Persisted Bilibili cookie.", { cookiesPath: COOKIES_PATH });
 }
 
+async function persistStorage(storage, source) {
+  await mkdir(path.dirname(STORAGE_PATH), { recursive: true });
+  await writeFile(STORAGE_PATH, JSON.stringify(storage, null, 2));
+  serviceLog("info", "storage", `Persisted ${storage.length} Bilibili storage origins.`, { source, storagePath: STORAGE_PATH });
+}
+
 async function exportViewerCookies(domains) {
   const payload = await fetchRuntimeJson(
     "/browser/cookies/export",
@@ -577,6 +592,20 @@ async function exportViewerCookies(domains) {
   );
   const data = payload?.data || payload;
   return Array.isArray(data?.cookies) ? data.cookies : [];
+}
+
+async function exportViewerStorage(domains) {
+  const payload = await fetchRuntimeJson(
+    "/browser/storage/export",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ domains })
+    },
+    BROWSER_RUNTIME_TIMEOUT_MS
+  );
+  const data = payload?.data || payload;
+  return Array.isArray(data?.storage) ? data.storage : [];
 }
 
 function cookiesToHeader(cookies) {

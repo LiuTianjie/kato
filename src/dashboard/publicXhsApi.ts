@@ -224,7 +224,7 @@ async function searchNotesForServerx(
   const keyword = String(body.keyword ?? body.query ?? "").trim();
   const limit = normalizeLimit(body.limit, 20);
   const posts = await searchFilteredPosts(config, keyword ? [keyword] : normalizeKeywords(body), limit, body, options);
-  const includeComments = parseBooleanFlag(body.include_comments ?? body.includeComments, true);
+  const includeComments = parseBooleanFlag(body.include_comments ?? body.includeComments, false);
   const commentLimit = includeComments ? normalizeOptionalLimit(body.max_comments ?? body.maxComments, 20) : 0;
   return Promise.all(
     posts.slice(0, limit).map(async (post) => {
@@ -330,15 +330,27 @@ async function noteCommentsForServerx(
   const pageSize = normalizeLimit(body.max_comments ?? body.limit, 50);
   const pageArea = String(body.pageArea ?? body.page_area ?? "UNFOLDED");
   const post = normalizePostInput(normalizeServerxPostInput(body));
-  const comments = await getCommentsStrict(config, post, pageSize, {
-    ...options,
+  const payload = await postMcpJson(config, "/api/v1/feeds/comments", {
+    feed_id: post.id,
+    note_id: post.id,
+    url: post.url,
+    xsec_token: post.xsecToken,
+    limit: pageSize,
     cursor: String(body.cursor ?? ""),
     index: page,
-    pageArea
-  });
+    pageArea,
+    ...(options.auth ? { auth: options.auth } : {})
+  }, options.signal);
+  const data = unwrapServiceData(payload);
+  const comments = extractUnknownList(data, "comments", "items", "data").map(coerceXhsComment);
   const items = dedupeXhsComments(comments).map(toServerxComment);
   const nextIndex = page + 1;
-  const nextCursor = items.length ? `offset:${nextIndex}` : "";
+  const cursorPayload = asUnknownRecord(data.cursor);
+  const rawNextCursor = String(data.next_cursor ?? data.platform_cursor ?? cursorPayload.cursor ?? "");
+  const explicitHasMore = data.has_more ?? data.hasMore;
+  const explicitMore = explicitHasMore === true || explicitHasMore === "true";
+  const hasMore = explicitHasMore == null ? Boolean(rawNextCursor) : explicitMore && Boolean(rawNextCursor);
+  const nextCursor = hasMore ? rawNextCursor : "";
   return {
     data: items,
     items,
@@ -346,11 +358,12 @@ async function noteCommentsForServerx(
     comment_list: items,
     cursor: {
       cursor: nextCursor,
-      index: nextIndex,
-      pageArea
+      index: Number(cursorPayload.index ?? nextIndex),
+      pageArea: String(cursorPayload.pageArea ?? cursorPayload.page_area ?? pageArea)
     },
     next_cursor: nextCursor,
-    has_more: Boolean(nextCursor),
+    platform_cursor: hasMore ? String(data.platform_cursor ?? rawNextCursor) : "",
+    has_more: hasMore,
     raw_count: comments.length,
     parsed_count: items.length,
     pageArea,
@@ -396,6 +409,26 @@ async function noteSubCommentsForServerx(
 ): Promise<Record<string, unknown>[]> {
   const post = normalizePostInput(normalizeServerxPostInput(body));
   const parentId = String(body.comment_id ?? body.parent_comment_id ?? body.parent_id ?? "").trim();
+  try {
+    const payload = await postMcpJson(config, "/api/v1/feeds/comment_replies", {
+      feed_id: post.id,
+      note_id: post.id,
+      url: post.url,
+      xsec_token: post.xsecToken,
+      comment_id: parentId,
+      limit: normalizeLimit(body.max_comments ?? body.limit, 20),
+      cursor: String(body.cursor ?? ""),
+      ...(options.auth ? { auth: options.auth } : {})
+    }, options.signal);
+    const data = unwrapServiceData(payload);
+    return extractUnknownList(data, "comments", "items", "data").map(coerceXhsComment).map((comment) => ({
+      ...toServerxComment(comment),
+      parent_comment_id: parentId || comment.parentId || "",
+      parent_id: parentId || comment.parentId || ""
+    }));
+  } catch (error) {
+    if (isAbortLikeError(error)) throw error;
+  }
   const comments = await getCommentsStrict(config, post, normalizeLimit(body.max_comments ?? body.limit, 20), options);
   const subComments = parentId ? comments.filter((comment) => comment.parentId === parentId) : comments;
   return (subComments.length ? subComments : comments).map((comment) => ({
@@ -639,6 +672,9 @@ function toServerxPost(post: XhsPost, comments: XhsComment[] = []): Record<strin
   const payloadComments = comments.map(toServerxComment);
   const url = normalizeXhsUrl(post.url, post.id, post.xsecToken);
   const xsecToken = post.xsecToken || extractXsecToken(url);
+  const commentCount = typeof post.commentCount === "number" && post.commentCount > 0
+    ? post.commentCount
+    : payloadComments.length;
   return {
     id: post.id,
     note_id: post.id,
@@ -675,7 +711,8 @@ function toServerxPost(post: XhsPost, comments: XhsComment[] = []): Record<strin
       url
     },
     like_count: post.likeCount,
-    comment_count: post.commentCount ?? payloadComments.length,
+    comment_count: commentCount,
+    commentCount,
     publish_time: secondsValue(post.publishedAt),
     create_time: secondsValue(post.publishedAt),
     published_at: post.publishedAt ?? "",
@@ -849,6 +886,104 @@ async function fetchMcpJson(config: AppConfig, endpoint: string, signal?: AbortS
   const data = text ? JSON.parse(text) : {};
   if (!response.ok) throw new PublicApiError(502, "MCP_ERROR", `MCP ${endpoint} failed: HTTP ${response.status}`);
   return data;
+}
+
+async function postMcpJson(config: AppConfig, endpoint: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
+  const base = config.xhs.mcp?.url ? new URL(config.xhs.mcp.url).origin : "http://localhost:18060";
+  const response = await fetchWithTimeout(`${base}${endpoint}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  }, MCP_FETCH_TIMEOUT_MS, signal);
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!response.ok || isMcpFailure(data)) {
+    const status = response.ok ? 502 : response.status;
+    const code = optionalString(asUnknownRecord(asUnknownRecord(data).error).code) || "MCP_ERROR";
+    throw new PublicApiError(status, code, mcpErrorMessage(data, `MCP ${endpoint} failed: HTTP ${response.status}`));
+  }
+  return data;
+}
+
+function unwrapServiceData(payload: unknown): Record<string, unknown> {
+  const record = asUnknownRecord(payload);
+  if (record.success === false) {
+    throw new PublicApiError(502, "MCP_ERROR", mcpErrorMessage(record, "MCP request failed."));
+  }
+  const data = asUnknownRecord(record.data);
+  return Object.keys(data).length ? data : record;
+}
+
+function extractUnknownList(value: unknown, ...keys: string[]): unknown[] {
+  const record = asUnknownRecord(value);
+  for (const key of keys) {
+    const item = record[key];
+    if (Array.isArray(item)) return item;
+  }
+  const nestedData = asUnknownRecord(record.data);
+  for (const key of keys) {
+    const item = nestedData[key];
+    if (Array.isArray(item)) return item;
+  }
+  return [];
+}
+
+function coerceXhsComment(value: unknown): XhsComment {
+  const record = asUnknownRecord(value);
+  const raw = asUnknownRecord(record.raw);
+  const user = asUnknownRecord(record.user ?? raw.user_info ?? raw.user);
+  const author = optionalString(
+    record.author ??
+      record.author_name ??
+      record.nickname ??
+      user.nickname ??
+      user.name
+  );
+  const content = optionalString(
+    record.content ??
+      record.text ??
+      record.comment_content ??
+      raw.content ??
+      raw.text
+  ) || "";
+  const id = optionalString(
+    record.id ??
+      record.comment_id ??
+      record.commentId ??
+      raw.id ??
+      raw.comment_id
+  ) || `comment-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const parentId = optionalString(
+    record.parentId ??
+      record.parent_id ??
+      record.parent_comment_id ??
+      raw.parent_comment_id ??
+      raw.root_comment_id
+  );
+  const publishedAt = optionalString(
+    record.publishedAt ??
+      record.published_at ??
+      record.ip_location ??
+      record.time ??
+      raw.create_time ??
+      raw.time
+  );
+  return { id, content, author, parentId, publishedAt };
+}
+
+function asUnknownRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function isMcpFailure(data: unknown): boolean {
+  const record = asUnknownRecord(data);
+  return record.success === false || record.ok === false;
+}
+
+function mcpErrorMessage(data: unknown, fallback: string): string {
+  const record = asUnknownRecord(data);
+  const error = asUnknownRecord(record.error);
+  return optionalString(error.message ?? record.message ?? record.error) || fallback;
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number, externalSignal?: AbortSignal): Promise<Response> {

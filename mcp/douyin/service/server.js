@@ -41,6 +41,10 @@ const DOUYIN_REPLIES_DIRECT_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_REPLIES_DI
 const DOUYIN_REPLIES_PAGE_FALLBACK_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_REPLIES_PAGE_FALLBACK_TIMEOUT_MS", 32_000);
 const DOUYIN_REPLIES_PAGE_MAX_ROUNDS = normalizePositiveEnv("DOUYIN_REPLIES_PAGE_MAX_ROUNDS", 6);
 const DOUYIN_REPLIES_PAGE_FALLBACK_ENABLED = process.env.DOUYIN_REPLIES_PAGE_FALLBACK_ENABLED === "1";
+const DOUYIN_COMMENTS_FULL_PAGE_SIZE = normalizePositiveEnv("DOUYIN_COMMENTS_FULL_PAGE_SIZE", 50);
+const DOUYIN_COMMENTS_FULL_REPLY_PAGE_SIZE = normalizePositiveEnv("DOUYIN_COMMENTS_FULL_REPLY_PAGE_SIZE", 50);
+const DOUYIN_COMMENTS_FULL_MAX_ROOT_PAGES = normalizePositiveEnv("DOUYIN_COMMENTS_FULL_MAX_ROOT_PAGES", 300);
+const DOUYIN_COMMENTS_FULL_MAX_REPLY_PAGES = normalizePositiveEnv("DOUYIN_COMMENTS_FULL_MAX_REPLY_PAGES", 300);
 const DOUYIN_SIGNER_URL = stringValue(process.env.DOUYIN_SIGNER_URL || "");
 const DOUYIN_SIGNER_REQUIRED = process.env.DOUYIN_SIGNER_REQUIRED === "1";
 const DOUYIN_SIGNER_TIMEOUT_MS = normalizePositiveEnv("DOUYIN_SIGNER_TIMEOUT_MS", 8_000);
@@ -193,14 +197,27 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/api/v1/browser/export-auth") {
+      const data = await persistedAuthPayload();
+      sendJson(res, 200, { success: true, data });
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/api/v1/browser/sync-cookies") {
+      await openViewerForStorageExport().catch((error) => {
+        serviceLog("info", "storage", `Douyin viewer navigation before storage sync skipped: ${errorMessage(error)}`);
+      });
       const cookies = await exportViewerCookies(DOUYIN_COOKIE_DOMAINS);
-      const storage = await exportViewerStorage(DOUYIN_COOKIE_DOMAINS).catch((error) => {
+      const storage = await exportViewerStorage(DOUYIN_COOKIE_DOMAINS, ["https://www.douyin.com"]).catch((error) => {
         serviceLog("warn", "storage", `Douyin browser storage sync failed: ${errorMessage(error)}`);
         return [];
       });
       await persistCookies(cookies, "manual-sync");
-      if (storage.length) await persistStorage(storage, "manual-sync");
+      if (storage.length) {
+        await persistStorage(storage, "manual-sync");
+      } else {
+        serviceLog("info", "storage", "Douyin browser storage sync returned no origins; keeping existing storage file.");
+      }
       const context = contextPromise ? await contextPromise.catch(() => undefined) : undefined;
       if (context && cookies.length) await addCookiesToContext(context, cookies, "manual-sync");
       if (context && storage.length) await restoreStorage(context, storage).catch((error) => {
@@ -291,6 +308,15 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/api/v1/posts/comments_full") {
+      const body = await readJson(req);
+      const result = await enqueueBrowserTask("posts:comments_full", (taskContext) => getPostCommentsFull(body, taskContext), {
+        signal: requestSignal
+      });
+      sendJson(res, 200, { success: true, data: result });
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/api/v1/posts/comment_replies") {
       const body = await readJson(req);
       const limit = normalizeLimit(body.limit || body.count || body.max_comments, 20);
@@ -305,12 +331,12 @@ const server = createServer(async (req, res) => {
   } catch (error) {
     const message = errorMessage(error);
     if (error instanceof BrowserTaskCancelledError) {
-      serviceLog("warn", "request", `${req.method || "GET"} ${req.url || "/"} cancelled: ${message}`);
+      serviceLog("info", "request", `${req.method || "GET"} ${req.url || "/"} cancelled: ${message}`);
       sendJson(res, 499, { success: false, error: { code: "CLIENT_CLOSED_REQUEST", message } });
       return;
     }
     if (error instanceof BrowserQueueBusyError) {
-      serviceLog("warn", "request", `${req.method || "GET"} ${req.url || "/"} queue busy: ${message}`);
+      serviceLog("info", "request", `${req.method || "GET"} ${req.url || "/"} queue busy: ${message}`);
       sendJson(res, error.statusCode, { success: false, error: { code: error.code, message, queue: browserQueueSummary() } });
       return;
     }
@@ -557,7 +583,7 @@ function enqueueBrowserTask(label, task, options = {}) {
         browserTaskActive.cancelled = true;
         browserTaskActive.cancelReason = abortReasonMessage(taskContext.signal);
         updateBrowserTaskRecord(id, { status: "cancelling", cancelled: true, cancelReason: browserTaskActive.cancelReason });
-        serviceLog("warn", "queue", `Browser task #${id} cancelled: ${label}.`, { reason: browserTaskActive.cancelReason });
+        serviceLog("info", "queue", `Browser task #${id} cancelled: ${label}.`, { reason: browserTaskActive.cancelReason });
       };
       taskContext.signal.addEventListener("abort", markCancelled, { once: true });
       const waitedMs = Date.now() - queuedAt;
@@ -878,6 +904,7 @@ async function getPostComments(body, limit, taskContext) {
       const resolved = await normalizePostInput(body, taskContext);
       if (!resolved.awemeId && !resolved.url) throw new Error("aweme_id, id or url is required.");
       const cursor = normalizeCursor(body.cursor, 0);
+      const sortType = normalizeDouyinSortType(body.sort_type, body.sort_label);
       const page = await newTaskPage(taskContext);
       let extracted = { comments: [], cursor: "", hasMore: false };
       let source = "direct";
@@ -885,7 +912,7 @@ async function getPostComments(body, limit, taskContext) {
       try {
         await prepareDouyinApiPage(page, "comments:api");
         const directPayload = await withTimeout(
-          fetchCommentsInPage(page, "list", { aweme_id: resolved.awemeId, cursor, count: limit }),
+          fetchCommentsInPage(page, "list", { aweme_id: resolved.awemeId, cursor, count: limit, sort_type: sortType }),
           DOUYIN_COMMENTS_DIRECT_TIMEOUT_MS,
           "Douyin comments API timed out."
         );
@@ -920,6 +947,158 @@ async function getPostComments(body, limit, taskContext) {
   );
 }
 
+async function getPostCommentsFull(body, taskContext) {
+  return withBrowserRecovery(
+    "getPostCommentsFull",
+    async () => {
+      await applyRequestAuth(body.auth, "posts:comments_full");
+      const resolved = await normalizePostInput(body, taskContext);
+      if (!resolved.awemeId && !resolved.url) throw new Error("aweme_id, id or url is required.");
+      const page = await newTaskPage(taskContext);
+      await prepareDouyinApiPage(page, "comments_full:api");
+      const itemId = resolved.awemeId;
+      const sortType = normalizeDouyinSortType(body.sort_type, body.sort_label);
+      const rootPageSize = normalizeFullPageSize(body.page_size || body.limit || body.count, DOUYIN_COMMENTS_FULL_PAGE_SIZE);
+      const replyPageSize = normalizeFullPageSize(body.reply_page_size || body.replyPageSize, DOUYIN_COMMENTS_FULL_REPLY_PAGE_SIZE);
+      const maxRootPages = normalizeFullPageCount(body.max_root_pages || body.maxRootPages, DOUYIN_COMMENTS_FULL_MAX_ROOT_PAGES);
+      const maxReplyPages = normalizeFullPageCount(body.max_reply_pages || body.maxReplyPages, DOUYIN_COMMENTS_FULL_MAX_REPLY_PAGES);
+      let cursor = normalizeCursor(body.cursor, 0);
+      let rootPages = 0;
+      let replyPages = 0;
+      let stoppedByLimit = false;
+      let stopReason = "";
+      const rootComments = [];
+      const replyComments = [];
+      const failedReplyParents = [];
+
+      while (rootPages < maxRootPages) {
+        taskContext?.throwIfCancelled?.();
+        const payload = await withTimeout(
+          fetchCommentsInPage(page, "list", { aweme_id: itemId, cursor, count: rootPageSize, sort_type: sortType }),
+          DOUYIN_COMMENTS_DIRECT_TIMEOUT_MS,
+          "Douyin comments full API timed out."
+        );
+        const extracted = extractCommentsPayload([payload], "");
+        const roots = uniqueComments(extracted.comments);
+        rootComments.push(...roots);
+        rootPages += 1;
+        serviceLog("info", "comments", "Douyin comments full root page fetched.", {
+          awemeId: itemId,
+          cursor,
+          nextCursor: extracted.cursor,
+          returned: roots.length,
+          hasMore: extracted.hasMore
+        });
+        for (const root of roots) {
+          taskContext?.throwIfCancelled?.();
+          const replyTotal = Number(root.raw?.reply_comment_total ?? root.raw?.reply_count ?? 0);
+          if (!Number.isFinite(replyTotal) || replyTotal <= 0) continue;
+          try {
+            const replyResult = await fetchAllCommentRepliesInPage(page, {
+              itemId,
+              commentId: root.id,
+              pageSize: replyPageSize,
+              sortType,
+              maxPages: maxReplyPages,
+              taskContext
+            });
+            replyPages += replyResult.pages;
+            replyComments.push(...replyResult.comments);
+            if (replyResult.stoppedByLimit) stoppedByLimit = true;
+          } catch (error) {
+            failedReplyParents.push({
+              comment_id: root.id,
+              expected: replyTotal,
+              error: errorMessage(error).slice(0, 240)
+            });
+            serviceLog("warn", "comments", "Douyin comments full replies failed.", {
+              awemeId: itemId,
+              commentId: root.id,
+              error: errorMessage(error).slice(0, 240)
+            });
+          }
+        }
+        if (!extracted.hasMore) {
+          cursor = "";
+          stopReason = "no_more";
+          break;
+        }
+        const nextCursor = normalizeNextCursor(extracted.cursor, cursor, rootPageSize, roots.length, extracted.hasMore);
+        if (!nextCursor || nextCursor === String(cursor)) {
+          cursor = "";
+          stopReason = "cursor_not_advanced";
+          break;
+        }
+        cursor = nextCursor;
+      }
+      if (rootPages >= maxRootPages && cursor) {
+        stoppedByLimit = true;
+        stopReason = "max_root_pages";
+      }
+      const uniqueRoots = uniqueComments(rootComments);
+      const uniqueReplies = uniqueComments(replyComments.map((comment) => ({ ...comment, parentId: comment.parentId || comment.raw?.reply_id || "" })));
+      const comments = uniqueComments([...uniqueRoots, ...uniqueReplies]);
+      serviceLog("info", "comments", "Douyin comments full completed.", {
+        awemeId: itemId,
+        roots: uniqueRoots.length,
+        replies: uniqueReplies.length,
+        total: comments.length,
+        rootPages,
+        replyPages,
+        failedReplyParents: failedReplyParents.length,
+        stoppedByLimit,
+        stopReason
+      });
+      return {
+        comments,
+        items: comments,
+        root_comments: uniqueRoots,
+        reply_comments: uniqueReplies,
+        cursor,
+        has_more: Boolean(cursor && stoppedByLimit),
+        stats: {
+          root_count: uniqueRoots.length,
+          reply_count: uniqueReplies.length,
+          total_count: comments.length,
+          root_pages: rootPages,
+          reply_pages: replyPages,
+          failed_reply_parents: failedReplyParents,
+          stopped_by_limit: stoppedByLimit,
+          stop_reason: stopReason
+        }
+      };
+    },
+    taskContext
+  );
+}
+
+async function fetchAllCommentRepliesInPage(page, { itemId, commentId, pageSize, sortType, maxPages, taskContext }) {
+  let cursor = 0;
+  let pages = 0;
+  const comments = [];
+  let stoppedByLimit = false;
+  while (pages < maxPages) {
+    taskContext?.throwIfCancelled?.();
+    const payload = await withTimeout(
+      fetchCommentsInPage(page, "reply", { item_id: itemId, comment_id: commentId, cursor, count: pageSize, sort_type: sortType }),
+      DOUYIN_REPLIES_DIRECT_TIMEOUT_MS,
+      "Douyin comments full replies API timed out."
+    );
+    const extracted = extractCommentsPayload([payload], commentId);
+    comments.push(...extracted.comments.map((comment) => ({ ...comment, parentId: comment.parentId || commentId })));
+    pages += 1;
+    if (!extracted.hasMore) {
+      cursor = "";
+      break;
+    }
+    const nextCursor = normalizeNextCursor(extracted.cursor, cursor, pageSize, extracted.comments.length, extracted.hasMore);
+    if (!nextCursor || nextCursor === String(cursor)) break;
+    cursor = nextCursor;
+  }
+  if (pages >= maxPages && cursor) stoppedByLimit = true;
+  return { comments: uniqueComments(comments), pages, stoppedByLimit };
+}
+
 async function getCommentReplies(body, limit, taskContext) {
   return withBrowserRecovery(
     "getCommentReplies",
@@ -929,6 +1108,7 @@ async function getCommentReplies(body, limit, taskContext) {
       const commentId = String(body.comment_id || body.commentId || "").trim();
       if (!itemId || !commentId) throw new Error("item_id/aweme_id and comment_id are required.");
       const cursor = normalizeCursor(body.cursor, 0);
+      const sortType = normalizeDouyinSortType(body.sort_type, body.sort_label);
       const page = await newTaskPage(taskContext);
       let extracted = { comments: [], cursor: "", hasMore: false };
       let directError = null;
@@ -936,7 +1116,7 @@ async function getCommentReplies(body, limit, taskContext) {
       try {
         await prepareDouyinApiPage(page, "replies:api");
         const directPayload = await withTimeout(
-          fetchCommentsInPage(page, "reply", { item_id: itemId, comment_id: commentId, cursor, count: limit }),
+          fetchCommentsInPage(page, "reply", { item_id: itemId, comment_id: commentId, cursor, count: limit, sort_type: sortType }),
           DOUYIN_REPLIES_DIRECT_TIMEOUT_MS,
           "Douyin replies API timed out."
         );
@@ -1593,8 +1773,16 @@ function extractCommentsPayload(payloads, parentId) {
   let hasMore = false;
   for (const entry of payloads) {
     const payload = entry?.payload ?? entry;
-    cursor ||= stringValue(payload.cursor ?? payload.next_cursor ?? payload.nextCursor);
-    hasMore = hasMore || payload.has_more === 1 || payload.has_more === true || payload.hasMore === true;
+    const data = payload && typeof payload.data === "object" && !Array.isArray(payload.data) ? payload.data : {};
+    cursor ||= stringValue(payload.cursor ?? payload.next_cursor ?? payload.nextCursor ?? data.cursor ?? data.next_cursor ?? data.nextCursor);
+    hasMore =
+      hasMore ||
+      payload.has_more === 1 ||
+      payload.has_more === true ||
+      payload.hasMore === true ||
+      data.has_more === 1 ||
+      data.has_more === true ||
+      data.hasMore === true;
     const lists = [];
     if (Array.isArray(payload.comments)) lists.push(payload.comments);
     if (Array.isArray(payload.data?.comments)) lists.push(payload.data.comments);
@@ -1878,13 +2066,25 @@ async function exportViewerCookies(domains) {
   return Array.isArray(data?.cookies) ? data.cookies : [];
 }
 
-async function exportViewerStorage(domains) {
+async function openViewerForStorageExport() {
+  await fetchViewerRuntimeJson(
+    "/browser/open",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "https://www.douyin.com" })
+    },
+    BROWSER_RUNTIME_TIMEOUT_MS
+  );
+}
+
+async function exportViewerStorage(domains, origins = []) {
   const payload = await fetchRuntimeJson(
     "/browser/storage/export",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ domains })
+      body: JSON.stringify({ domains, origins })
     },
     BROWSER_RUNTIME_TIMEOUT_MS
   );
@@ -1936,6 +2136,18 @@ async function fetchRuntimeJson(endpoint, init = {}, timeoutMs = BROWSER_RUNTIME
   return data;
 }
 
+async function fetchViewerRuntimeJson(endpoint, init = {}, timeoutMs = BROWSER_RUNTIME_TIMEOUT_MS) {
+  const url = `${VIEWER_RUNTIME_URL.replace(/\/$/, "")}${endpoint}`;
+  const response = await fetchWithTimeout(url, init, timeoutMs);
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : {};
+  if (!response.ok || (data && data.success === false)) {
+    const message = data?.error?.message || data?.message || `Viewer runtime ${endpoint} failed: HTTP ${response.status}`;
+    throw new Error(message);
+  }
+  return data;
+}
+
 async function fetchWithTimeout(url, init, timeoutMs) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(new Error(`Request timed out after ${timeoutMs}ms.`)), timeoutMs);
@@ -1963,6 +2175,22 @@ async function persistedLoginStatus() {
   const cookies = await readPersistedCookies();
   const storage = await readPersistedStorage();
   return summarizeLoginStatus(cookies, "file", { storageOrigins: storage.length });
+}
+
+async function persistedAuthPayload() {
+  const cookies = await readPersistedCookies();
+  const storage = await readPersistedStorage();
+  return {
+    exported: true,
+    source: "file",
+    cookie: cookiesToHeader(cookies),
+    cookies,
+    storage,
+    storage_json: JSON.stringify(storage),
+    cookie_count: cookies.length,
+    storage_origin_count: storage.length,
+    auth: summarizeLoginStatus(cookies, "file", { storageOrigins: storage.length })
+  };
 }
 
 async function readPersistedCookies() {
@@ -2163,6 +2391,19 @@ async function persistStorage(storage, source) {
   serviceLog("info", "storage", `Persisted ${storage.length} Douyin storage origins.`, { source, storagePath: STORAGE_PATH });
 }
 
+function cookiesToHeader(cookies) {
+  const pairs = [];
+  const seen = new Set();
+  for (const cookie of cookies) {
+    const name = stringValue(cookie?.name).trim();
+    const value = cookie?.value == null ? "" : String(cookie.value);
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    pairs.push(`${name}=${value}`);
+  }
+  return pairs.join("; ");
+}
+
 function parseCookieHeader(cookieHeader, domain) {
   const expires = Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60;
   return cookieHeader
@@ -2319,7 +2560,19 @@ function sendJson(res, status, payload) {
 function normalizeLimit(value, fallback) {
   const parsed = Number(value ?? fallback);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.max(1, Math.min(200, Math.floor(parsed)));
+}
+
+function normalizeFullPageSize(value, fallback) {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isFinite(parsed) || parsed <= 0) return Math.max(1, Math.min(100, Math.floor(fallback || 50)));
   return Math.max(1, Math.min(100, Math.floor(parsed)));
+}
+
+function normalizeFullPageCount(value, fallback) {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isFinite(parsed) || parsed <= 0) return Math.max(1, Math.floor(fallback || 1));
+  return Math.max(1, Math.floor(parsed));
 }
 
 function normalizePositiveInt(value, fallback) {

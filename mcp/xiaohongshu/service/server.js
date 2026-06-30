@@ -264,8 +264,7 @@ const server = createServer(async (req, res) => {
       });
       await persistCookies(cookies, "manual-sync");
       if (!storageExportFailed) {
-        if (storage.length) await persistStorage(storage, "manual-sync");
-        else await ensureStorageFile("manual-sync");
+        await persistStorage(storage, "manual-sync");
       }
       const context = contextPromise ? await contextPromise.catch(() => undefined) : undefined;
       if (context && cookies.length) await context.addCookies(cookies).catch(() => undefined);
@@ -327,22 +326,35 @@ const server = createServer(async (req, res) => {
       const body = await readJson(req);
       const limit = normalizeLimit(body.limit || body.max_comments || body.max_comment_items, 50);
       const index = normalizeCursorIndex(body.index, body.cursor, 0);
-      const comments = await enqueueBrowserTask("feeds:comments", (taskContext) => getFeedComments(body, limit, { index, taskContext }), {
+      const result = await enqueueBrowserTask("feeds:comments", (taskContext) => getFeedCommentsPage(body, limit, { index, cursor: body.cursor, taskContext }), {
         signal: requestSignal
       });
+      const comments = result.comments;
       sendJson(res, 200, {
         success: true,
         data: {
           comments,
           items: comments,
           cursor: {
-            cursor: comments.length ? `offset:${index + 1}` : "",
-            index: index + 1,
+            cursor: result.hasMore ? result.cursor || "" : "",
+            index: result.nextIndex ?? index + 1,
             pageArea: body.pageArea || body.page_area || "UNFOLDED"
           },
-          has_more: comments.length >= limit
+          next_cursor: result.hasMore ? result.cursor || "" : "",
+          platform_cursor: result.hasMore ? result.cursor || "" : "",
+          has_more: Boolean(result.hasMore)
         }
       });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/v1/feeds/comment_replies") {
+      const body = await readJson(req);
+      const limit = normalizeLimit(body.limit || body.max_comments || body.max_comment_items || body.num, 20);
+      const result = await enqueueBrowserTask("feeds:comment_replies", (taskContext) => getFeedCommentReplies(body, limit, { cursor: body.cursor, taskContext }), {
+        signal: requestSignal
+      });
+      sendJson(res, 200, { success: true, data: result });
       return;
     }
 
@@ -369,12 +381,12 @@ const server = createServer(async (req, res) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (error instanceof BrowserTaskCancelledError) {
-      serviceLog("warn", "request", `${req.method || "GET"} ${req.url || "/"} cancelled: ${message}`);
+      serviceLog("info", "request", `${req.method || "GET"} ${req.url || "/"} cancelled: ${message}`);
       sendJson(res, 499, { success: false, error: { code: "CLIENT_CLOSED_REQUEST", message } });
       return;
     }
     if (error instanceof BrowserQueueBusyError) {
-      serviceLog("warn", "request", `${req.method || "GET"} ${req.url || "/"} queue busy: ${message}`);
+      serviceLog("info", "request", `${req.method || "GET"} ${req.url || "/"} queue busy: ${message}`);
       sendJson(res, error.statusCode, { success: false, error: { code: error.code, message, queue: browserQueueSummary() } });
       return;
     }
@@ -513,7 +525,7 @@ function enqueueBrowserTask(label, task, options = {}) {
         browserTaskActive.cancelled = true;
         browserTaskActive.cancelReason = abortReasonMessage(taskContext.signal);
         updateBrowserTaskRecord(id, { status: "cancelling", cancelled: true, cancelReason: browserTaskActive.cancelReason });
-        serviceLog("warn", "queue", `Browser task #${id} cancelled: ${label}.`, {
+        serviceLog("info", "queue", `Browser task #${id} cancelled: ${label}.`, {
           reason: browserTaskActive.cancelReason
         });
       };
@@ -1342,6 +1354,38 @@ async function getFeedDetail(body, taskContext) {
         document.querySelector(`meta[property="${name}"]`)?.getAttribute("content") ||
         document.querySelector(`meta[name="${name}"]`)?.getAttribute("content") ||
         "";
+      const parseCounter = (value) => {
+        const text = String(value || "").replace(/,/g, "").trim();
+        if (!text) return undefined;
+        const match = text.match(/([0-9]+(?:\.[0-9]+)?)\s*([万wWkK]?)/);
+        if (!match) return undefined;
+        const base = Number(match[1]);
+        if (!Number.isFinite(base)) return undefined;
+        const unit = match[2].toLowerCase();
+        if (unit === "万" || unit === "w") return Math.round(base * 10_000);
+        if (unit === "k") return Math.round(base * 1_000);
+        return Math.round(base);
+      };
+      const pickCounter = (labels) => {
+        const candidates = [];
+        const selector =
+          'button, [role="button"], [aria-label], [class*="comment"], [class*="interact"], [class*="count"], [class*="reply"]';
+        for (const node of document.querySelectorAll(selector)) {
+          const text = `${node.textContent || ""} ${node.getAttribute("aria-label") || ""}`.trim();
+          if (!text || !labels.some((label) => text.includes(label))) continue;
+          const value = parseCounter(text);
+          if (value !== undefined) candidates.push(value);
+        }
+        if (candidates.length) return Math.max(...candidates);
+        const bodyText = document.body?.innerText || "";
+        for (const label of labels) {
+          const after = bodyText.match(new RegExp(`${label}\\\\s*([0-9]+(?:\\\\.[0-9]+)?\\\\s*[万wWkK]?)`));
+          const before = bodyText.match(new RegExp(`([0-9]+(?:\\\\.[0-9]+)?\\\\s*[万wWkK]?)\\\\s*${label}`));
+          const value = parseCounter(after?.[1] || before?.[1]);
+          if (value !== undefined) return value;
+        }
+        return undefined;
+      };
       return {
         title: pick(["#detail-title", ".title", "[class*=title]"]) || meta("og:title") || document.title,
         snippet:
@@ -1349,6 +1393,7 @@ async function getFeedDetail(body, taskContext) {
           meta("description") ||
           meta("og:description"),
         author: pick([".author .name", "[class*=author] [class*=name]", "[class*=nickname]"]),
+        commentCount: pickCounter(["评论", "回复"]),
         text: document.body?.innerText?.slice(0, 2000) || ""
       };
     });
@@ -1380,7 +1425,8 @@ async function getFeedDetail(body, taskContext) {
       url,
       title: cleanTitle(detail.title),
       snippet: cleanSnippet(detail.snippet || detail.text),
-      author: detail.author || undefined
+      author: detail.author || undefined,
+      commentCount: toOptionalCount(detail.commentCount)
     };
     rememberPosts([result]);
     return result;
@@ -1572,46 +1618,98 @@ async function scrapePosts(page) {
 }
 
 async function getFeedComments(body, limit, options = {}) {
+  const result = await getFeedCommentsPage(body, limit, options);
+  return result.comments;
+}
+
+async function getFeedCommentsPage(body, limit, options = {}) {
   const taskContext = options.taskContext;
   return withBrowserRecovery("getFeedComments", async () => {
     await applyRequestAuth(body.auth, "feeds:comments");
     const detailInput = normalizeDetailInput(body);
     const index = normalizeCursorIndex(options.index, options.cursor, 0);
+    const platformCursor = normalizePlatformCursor(options.cursor ?? body.cursor);
     serviceLog("info", "comments", "Note comments requested.", {
       id: detailInput.id,
       hasXsecToken: Boolean(detailInput.xsecToken),
       limit,
-      index
+      index,
+      hasPlatformCursor: Boolean(platformCursor)
     });
-    await ensureFeedDetailForComments(body, taskContext);
+    const detail = await ensureFeedDetailForComments(body, taskContext);
+    const expectedCommentCount = toOptionalCount(detail?.commentCount);
     const page = await servicePage(taskContext);
-    let apiComments = [];
+    let apiResult = { comments: [], cursor: "", hasMore: false };
     let apiError = "";
-    try {
-      apiComments = await fetchCommentsByWebApi(page, detailInput, limit, index, taskContext);
-    } catch (error) {
-      apiError = error instanceof Error ? error.message : String(error);
-      serviceLog("warn", "comments", `XHS comments web API failed, fallback to DOM scrape: ${apiError}`, {
-        id: detailInput.id,
-        index
-      });
+    const usesSyntheticCursor = Boolean(options.cursor ?? body.cursor) && !platformCursor;
+    if (!usesSyntheticCursor) {
+      try {
+        apiResult = await fetchCommentsByWebApi(page, detailInput, limit, { cursor: platformCursor, index }, taskContext);
+      } catch (error) {
+        apiError = error instanceof Error ? error.message : String(error);
+        serviceLog("warn", "comments", `XHS comments web API failed, fallback to DOM scrape: ${apiError}`, {
+          id: detailInput.id,
+          index
+        });
+      }
     }
-    if (apiComments.length) {
-      const comments = uniqueComments(apiComments, limit, 0);
+    if (apiResult.comments.length) {
+      let source = "web_api";
+      let mergedComments = apiResult.comments;
+      let domCount = 0;
+      if (!apiResult.hasMore || !apiResult.cursor) {
+        await humanDelay("comments:api-partial-dom-check", 700, 1_500, { signal: taskContext?.signal });
+        await autoScrollUntilComments(page, Math.min(Math.max(limit, apiResult.comments.length + 1), expectedCommentCount || limit), taskContext, {
+          minSteps: Math.max(4, index + 4),
+          maxSteps: expectedCommentCount && expectedCommentCount > apiResult.comments.length ? 18 : 8
+        });
+        const scraped = await scrapeComments(page);
+        domCount = scraped.length;
+        if (scraped.length > apiResult.comments.length) {
+          mergedComments = [...apiResult.comments, ...scraped];
+          source = "web_api+dom";
+        }
+      }
+      const comments = uniqueComments(mergedComments, limit, index * limit);
+      const hasExpectedMore =
+        expectedCommentCount != null &&
+        expectedCommentCount > index * limit + comments.length &&
+        (comments.length > 0 || apiResult.hasMore);
+      const nextCursor = apiResult.hasMore && apiResult.cursor
+        ? apiResult.cursor
+        : (comments.length >= limit || hasExpectedMore) ? `offset:${index + 1}` : "";
       serviceLog("info", "comments", "Note comments completed.", {
         id: detailInput.id,
         index,
-        scraped: apiComments.length,
+        scraped: apiResult.comments.length,
         returned: comments.length,
-        source: "web_api"
+        domScraped: domCount,
+        source,
+        hasMore: apiResult.hasMore,
+        hasCursor: Boolean(apiResult.cursor),
+        expectedCommentCount
       });
-      return comments;
+      return {
+        comments,
+        cursor: nextCursor,
+        nextIndex: index + 1,
+        hasMore: Boolean(nextCursor),
+        source
+      };
     }
     await humanDelay("comments:before-scroll", 700, 1_800, { signal: taskContext?.signal });
-    await autoScroll(page, Math.max(3, index + 3), taskContext);
+    await autoScrollUntilComments(page, (index + 1) * limit, taskContext, {
+      minSteps: Math.max(4, index + 4),
+      maxSteps: expectedCommentCount && expectedCommentCount > index * limit ? 24 : 10
+    });
     taskContext?.throwIfCancelled?.();
     const scraped = await scrapeComments(page);
     const comments = uniqueComments(scraped, limit, index * limit);
+    const hasExpectedMore =
+      expectedCommentCount != null &&
+      expectedCommentCount > index * limit + comments.length &&
+      comments.length > 0;
+    const nextCursor = comments.length >= limit || hasExpectedMore ? `offset:${index + 1}` : "";
     serviceLog("info", "comments", "Note comments completed.", {
       id: detailInput.id,
       index,
@@ -1619,12 +1717,28 @@ async function getFeedComments(body, limit, options = {}) {
       returned: comments.length,
       currentUrl: safeLogUrl(page.url()),
       source: "dom",
-      apiError
+      apiError,
+      expectedCommentCount
     });
     if (!comments.length && isXhsAuthOrChallengeError(apiError)) {
       throw new Error(`XHS challenge required: ${apiError}`);
     }
-    return comments;
+    if (
+      !comments.length &&
+      expectedCommentCount != null &&
+      expectedCommentCount > index * limit
+    ) {
+      throw new Error(
+        `XHS comments pagination interrupted: platform_count=${expectedCommentCount}; page=${index + 1}; visible_comments=${scraped.length}; saved_page_comments=0; 平台未继续暴露评论，可能账号存在异常/风控或评论折叠。`
+      );
+    }
+    return {
+      comments,
+      cursor: nextCursor,
+      nextIndex: index + 1,
+      hasMore: Boolean(nextCursor),
+      source: "dom"
+    };
   }, taskContext);
 }
 
@@ -1648,16 +1762,18 @@ async function ensureFeedDetailForComments(body, taskContext) {
   throw lastError;
 }
 
-async function fetchCommentsByWebApi(page, detailInput, limit, index, taskContext) {
+async function fetchCommentsByWebApi(page, detailInput, limit, pageState, taskContext) {
   const noteId = String(detailInput.id || "").trim();
-  if (!noteId) return [];
+  if (!noteId) return { comments: [], cursor: "", hasMore: false };
   taskContext?.throwIfCancelled?.();
+  const cursor = String(pageState?.cursor || "");
+  const index = normalizeCursorIndex(pageState?.index, "", 0);
   const payload = await page.evaluate(
-    async ({ noteId, xsecToken, limit, index }) => {
+    async ({ noteId, xsecToken, limit, cursor, index }) => {
       const path = "/api/sns/web/v2/comment/page";
       const params = new URLSearchParams({
         note_id: noteId,
-        cursor: index > 0 ? String(index * limit) : "",
+        cursor: cursor || "",
         top_comment_id: "",
         image_formats: "jpg,webp,avif"
       });
@@ -1682,7 +1798,7 @@ async function fetchCommentsByWebApi(page, detailInput, limit, index, taskContex
       }
       return { ok: response.ok, status: response.status, text, json };
     },
-    { noteId, xsecToken: detailInput.xsecToken || "", limit, index }
+    { noteId, xsecToken: detailInput.xsecToken || "", limit, cursor, index }
   );
   if (!payload?.ok) {
     throw new Error(`XHS comments web API HTTP ${payload?.status || "unknown"} ${String(payload?.text || "").slice(0, 200)}`);
@@ -1690,7 +1806,107 @@ async function fetchCommentsByWebApi(page, detailInput, limit, index, taskContex
   if (payload.json?.success === false || (payload.json?.code != null && Number(payload.json.code) !== 0)) {
     throw new Error(`XHS comments web API failed: ${payload.json?.msg || payload.json?.message || payload.text || "unknown error"}`);
   }
-  return commentsFromWebPayload(payload.json);
+  return {
+    comments: commentsFromWebPayload(payload.json),
+    cursor: stringValue(payload.json?.data?.cursor ?? payload.json?.cursor ?? payload.json?.next_cursor ?? ""),
+    hasMore: payload.json?.data?.has_more === true || payload.json?.data?.has_more === 1 || payload.json?.has_more === true || payload.json?.has_more === 1
+  };
+}
+
+async function getFeedCommentReplies(body, limit, options = {}) {
+  const taskContext = options.taskContext;
+  return withBrowserRecovery("getFeedCommentReplies", async () => {
+    await applyRequestAuth(body.auth, "feeds:comment_replies");
+    const detailInput = normalizeDetailInput(body);
+    const noteId = String(detailInput.id || "").trim();
+    const rootCommentId = firstText(body.comment_id, body.commentId, body.parent_comment_id, body.parent_id, body.root_comment_id, body.rootCommentId);
+    if (!noteId || !rootCommentId) return { comments: [], items: [], cursor: "", has_more: false };
+    await ensureFeedDetailForComments(body, taskContext);
+    const page = await servicePage(taskContext);
+    let result = { comments: [], cursor: "", hasMore: false };
+    let apiError = "";
+    try {
+      result = await fetchSubCommentsByWebApi(page, { noteId, rootCommentId, xsecToken: detailInput.xsecToken || "", limit, cursor: normalizePlatformCursor(options.cursor ?? body.cursor) }, taskContext);
+    } catch (error) {
+      apiError = error instanceof Error ? error.message : String(error);
+      serviceLog("warn", "comments", `XHS sub comments web API failed, fallback to DOM scrape: ${apiError}`, {
+        id: noteId,
+        rootCommentId
+      });
+    }
+    if (!result.comments.length && apiError) {
+      await humanDelay("comment-replies:before-scroll", 500, 1_200, { signal: taskContext?.signal });
+      await autoScroll(page, 4, taskContext);
+      const normalizedRootId = normalizePlatformCommentId(rootCommentId);
+      const scraped = uniqueComments(await scrapeComments(page), limit * 3, 0);
+      const filtered = scraped.filter((comment) => normalizePlatformCommentId(comment.parent_id || comment.parent_comment_id) === normalizedRootId);
+      result = { comments: filtered, cursor: "", hasMore: false };
+    }
+    const comments = uniqueComments(result.comments, limit, 0).map((comment) => ({
+      ...comment,
+      parent_id: comment.parent_id || rootCommentId,
+      parent_comment_id: comment.parent_comment_id || rootCommentId
+    }));
+    return {
+      comments,
+      items: comments,
+      cursor: result.cursor,
+      next_cursor: result.cursor,
+      platform_cursor: result.cursor,
+      has_more: result.hasMore || Boolean(result.cursor),
+      source: result.cursor || !apiError ? "web_api" : "dom",
+      api_error: apiError
+    };
+  }, taskContext);
+}
+
+async function fetchSubCommentsByWebApi(page, { noteId, rootCommentId, xsecToken, limit, cursor }, taskContext) {
+  taskContext?.throwIfCancelled?.();
+  const payload = await page.evaluate(
+    async ({ noteId, rootCommentId, xsecToken, limit, cursor }) => {
+      const path = "/api/sns/web/v2/comment/sub/page";
+      const params = new URLSearchParams({
+        note_id: noteId,
+        root_comment_id: rootCommentId,
+        num: String(limit),
+        cursor: cursor || "",
+        image_formats: "jpg,webp,avif",
+        top_comment_id: ""
+      });
+      if (xsecToken) params.set("xsec_token", xsecToken);
+      const pathWithQuery = `${path}?${params.toString()}`;
+      const signHeaders =
+        typeof window._webmsxyw === "function" ? window._webmsxyw(pathWithQuery, null) : {};
+      const response = await fetch(`https://edith.xiaohongshu.com${pathWithQuery}`, {
+        method: "GET",
+        credentials: "include",
+        headers: {
+          Accept: "application/json, text/plain, */*",
+          ...signHeaders
+        }
+      });
+      const text = await response.text();
+      let json = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {
+        json = null;
+      }
+      return { ok: response.ok, status: response.status, text, json };
+    },
+    { noteId, rootCommentId, xsecToken, limit, cursor }
+  );
+  if (!payload?.ok) {
+    throw new Error(`XHS sub comments web API HTTP ${payload?.status || "unknown"} ${String(payload?.text || "").slice(0, 200)}`);
+  }
+  if (payload.json?.success === false || (payload.json?.code != null && Number(payload.json.code) !== 0)) {
+    throw new Error(`XHS sub comments web API failed: ${payload.json?.msg || payload.json?.message || payload.text || "unknown error"}`);
+  }
+  return {
+    comments: commentsFromWebPayload(payload.json).map((comment) => ({ ...comment, parent_id: comment.parent_id || rootCommentId, parent_comment_id: comment.parent_comment_id || rootCommentId })),
+    cursor: stringValue(payload.json?.data?.cursor ?? payload.json?.cursor ?? payload.json?.next_cursor ?? ""),
+    hasMore: payload.json?.data?.has_more === true || payload.json?.data?.has_more === 1 || payload.json?.has_more === true || payload.json?.has_more === 1
+  };
 }
 
 function commentsFromWebPayload(payload) {
@@ -2098,8 +2314,8 @@ function normalizeComment(comment, id, content) {
       text: content,
       author: comment.author || undefined,
       author_name: comment.author_name || comment.author || undefined,
-      parent_id: comment.parent_id || undefined,
-      parent_comment_id: comment.parent_id || undefined,
+      parent_id: comment.parent_id || comment.parent_comment_id || undefined,
+      parent_comment_id: comment.parent_comment_id || comment.parent_id || undefined,
       create_time: comment.create_time || comment.createTime || comment.published_at || comment.publishedAt || undefined,
       published_at: comment.published_at || comment.publishedAt || undefined
   };
@@ -2136,6 +2352,38 @@ async function autoScroll(page, steps, taskContext) {
     await humanDelay("scroll:pre", 180, 620, { signal: taskContext?.signal });
     await page.mouse.wheel(randomBetween(-18, 18), randomBetween(520, 1_180)).catch(() => undefined);
     await humanDelay("scroll:settle", 650, 1_650, { signal: taskContext?.signal });
+  }
+}
+
+async function autoScrollUntilComments(page, targetCount, taskContext, options = {}) {
+  const minSteps = Math.max(1, Number(options.minSteps || 1));
+  const maxSteps = Math.max(minSteps, Number(options.maxSteps || minSteps));
+  const wanted = Math.max(1, Number(targetCount || 1));
+  let stableRounds = 0;
+  let lastCount = 0;
+  for (let i = 0; i < maxSteps; i += 1) {
+    taskContext?.throwIfCancelled?.();
+    await autoScroll(page, 1, taskContext);
+    const currentCount = await page
+      .evaluate(() => {
+        const selectors = [
+          "[class*=comment-item]",
+          "[class*=CommentItem]",
+          "[class*=parent-comment]",
+          "[class*=commentItem]",
+          "[data-comment-id]"
+        ];
+        return document.querySelectorAll(selectors.join(",")).length;
+      })
+      .catch(() => 0);
+    if (currentCount >= wanted && i + 1 >= minSteps) break;
+    if (currentCount <= lastCount) {
+      stableRounds += 1;
+    } else {
+      stableRounds = 0;
+      lastCount = currentCount;
+    }
+    if (i + 1 >= minSteps && stableRounds >= 4) break;
   }
 }
 
@@ -2596,6 +2844,18 @@ function normalizeCursorIndex(indexValue, cursorValue, fallback) {
   const numberValue = Number(indexValue ?? fallback);
   if (!Number.isFinite(numberValue)) return fallback;
   return Math.max(0, Math.floor(numberValue));
+}
+
+function normalizePlatformCursor(value) {
+  const cursor = String(value || "").trim();
+  if (!cursor || /^offset:\d+$/i.test(cursor)) return "";
+  return cursor;
+}
+
+function normalizePlatformCommentId(value) {
+  const text = String(value || "").trim();
+  const prefixed = /^comment-([0-9a-f]{24})$/i.exec(text);
+  return prefixed ? prefixed[1] : text;
 }
 
 function pagedPayload(key, items, { page, limit }) {
