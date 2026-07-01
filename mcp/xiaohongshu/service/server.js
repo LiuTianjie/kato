@@ -342,7 +342,10 @@ const server = createServer(async (req, res) => {
           },
           next_cursor: result.hasMore ? result.cursor || "" : "",
           platform_cursor: result.hasMore ? result.cursor || "" : "",
-          has_more: Boolean(result.hasMore)
+          has_more: Boolean(result.hasMore),
+          pagination_limited: Boolean(result.paginationLimited),
+          source: result.source || "",
+          api_error: result.apiError || ""
         }
       });
       return;
@@ -1354,38 +1357,6 @@ async function getFeedDetail(body, taskContext) {
         document.querySelector(`meta[property="${name}"]`)?.getAttribute("content") ||
         document.querySelector(`meta[name="${name}"]`)?.getAttribute("content") ||
         "";
-      const parseCounter = (value) => {
-        const text = String(value || "").replace(/,/g, "").trim();
-        if (!text) return undefined;
-        const match = text.match(/([0-9]+(?:\.[0-9]+)?)\s*([万wWkK]?)/);
-        if (!match) return undefined;
-        const base = Number(match[1]);
-        if (!Number.isFinite(base)) return undefined;
-        const unit = match[2].toLowerCase();
-        if (unit === "万" || unit === "w") return Math.round(base * 10_000);
-        if (unit === "k") return Math.round(base * 1_000);
-        return Math.round(base);
-      };
-      const pickCounter = (labels) => {
-        const candidates = [];
-        const selector =
-          'button, [role="button"], [aria-label], [class*="comment"], [class*="interact"], [class*="count"], [class*="reply"]';
-        for (const node of document.querySelectorAll(selector)) {
-          const text = `${node.textContent || ""} ${node.getAttribute("aria-label") || ""}`.trim();
-          if (!text || !labels.some((label) => text.includes(label))) continue;
-          const value = parseCounter(text);
-          if (value !== undefined) candidates.push(value);
-        }
-        if (candidates.length) return Math.max(...candidates);
-        const bodyText = document.body?.innerText || "";
-        for (const label of labels) {
-          const after = bodyText.match(new RegExp(`${label}\\\\s*([0-9]+(?:\\\\.[0-9]+)?\\\\s*[万wWkK]?)`));
-          const before = bodyText.match(new RegExp(`([0-9]+(?:\\\\.[0-9]+)?\\\\s*[万wWkK]?)\\\\s*${label}`));
-          const value = parseCounter(after?.[1] || before?.[1]);
-          if (value !== undefined) return value;
-        }
-        return undefined;
-      };
       return {
         title: pick(["#detail-title", ".title", "[class*=title]"]) || meta("og:title") || document.title,
         snippet:
@@ -1393,7 +1364,6 @@ async function getFeedDetail(body, taskContext) {
           meta("description") ||
           meta("og:description"),
         author: pick([".author .name", "[class*=author] [class*=name]", "[class*=nickname]"]),
-        commentCount: pickCounter(["评论", "回复"]),
         text: document.body?.innerText?.slice(0, 2000) || ""
       };
     });
@@ -1426,7 +1396,8 @@ async function getFeedDetail(body, taskContext) {
       title: cleanTitle(detail.title),
       snippet: cleanSnippet(detail.snippet || detail.text),
       author: detail.author || undefined,
-      commentCount: toOptionalCount(detail.commentCount)
+      commentCount: undefined,
+      commentCountUnknown: true
     };
     rememberPosts([result]);
     return result;
@@ -1518,12 +1489,14 @@ async function callTool(params, taskContext) {
   if (name === "get_feed_comments") {
     const limit = normalizeLimit(args.limit || args.max_comments || args.max_comment_items, 50);
     const index = normalizeCursorIndex(args.index, args.cursor, 0);
-    const comments = await getFeedComments(args, limit, { index, taskContext });
+    const result = await getFeedCommentsPage(args, limit, { index, cursor: args.cursor, taskContext });
     return toolJson({
-      comments,
-      items: comments,
-      cursor: { cursor: comments.length ? `offset:${index + 1}` : "", index: index + 1, pageArea: args.pageArea || "UNFOLDED" },
-      has_more: comments.length >= limit
+      comments: result.comments,
+      items: result.comments,
+      cursor: { cursor: result.cursor || "", index: result.nextIndex || index + 1, pageArea: args.pageArea || "UNFOLDED" },
+      has_more: Boolean(result.hasMore && result.cursor),
+      pagination_limited: Boolean(result.paginationLimited),
+      api_error: result.apiError || ""
     });
   }
   if (name === "post_comment_to_feed") {
@@ -1671,13 +1644,9 @@ async function getFeedCommentsPage(body, limit, options = {}) {
         }
       }
       const comments = uniqueComments(mergedComments, limit, index * limit);
-      const hasExpectedMore =
-        expectedCommentCount != null &&
-        expectedCommentCount > index * limit + comments.length &&
-        (comments.length > 0 || apiResult.hasMore);
       const nextCursor = apiResult.hasMore && apiResult.cursor
         ? apiResult.cursor
-        : (comments.length >= limit || hasExpectedMore) ? `offset:${index + 1}` : "";
+        : "";
       serviceLog("info", "comments", "Note comments completed.", {
         id: detailInput.id,
         index,
@@ -1694,7 +1663,9 @@ async function getFeedCommentsPage(body, limit, options = {}) {
         cursor: nextCursor,
         nextIndex: index + 1,
         hasMore: Boolean(nextCursor),
-        source
+        paginationLimited: comments.length > 0 && !nextCursor,
+        source,
+        apiError
       };
     }
     await humanDelay("comments:before-scroll", 700, 1_800, { signal: taskContext?.signal });
@@ -1705,11 +1676,7 @@ async function getFeedCommentsPage(body, limit, options = {}) {
     taskContext?.throwIfCancelled?.();
     const scraped = await scrapeComments(page);
     const comments = uniqueComments(scraped, limit, index * limit);
-    const hasExpectedMore =
-      expectedCommentCount != null &&
-      expectedCommentCount > index * limit + comments.length &&
-      comments.length > 0;
-    const nextCursor = comments.length >= limit || hasExpectedMore ? `offset:${index + 1}` : "";
+    const nextCursor = "";
     serviceLog("info", "comments", "Note comments completed.", {
       id: detailInput.id,
       index,
@@ -1737,7 +1704,9 @@ async function getFeedCommentsPage(body, limit, options = {}) {
       cursor: nextCursor,
       nextIndex: index + 1,
       hasMore: Boolean(nextCursor),
-      source: "dom"
+      paginationLimited: comments.length > 0,
+      source: "dom",
+      apiError
     };
   }, taskContext);
 }

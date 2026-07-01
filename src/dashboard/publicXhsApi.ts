@@ -364,6 +364,8 @@ async function noteCommentsForServerx(
     next_cursor: nextCursor,
     platform_cursor: hasMore ? String(data.platform_cursor ?? rawNextCursor) : "",
     has_more: hasMore,
+    pagination_limited: data.pagination_limited === true || data.paginationLimited === true,
+    api_error: String(data.api_error ?? data.apiError ?? ""),
     raw_count: comments.length,
     parsed_count: items.length,
     pageArea,
@@ -386,17 +388,17 @@ async function noteCommentsForTikHub(
     pageArea: String(body.pageArea ?? body.page_area ?? "UNFOLDED")
   });
   const items = dedupeXhsComments(comments).map(toServerxComment);
-  const nextIndex = page + 1;
   return {
     data: items,
     items,
     comments: items,
     cursor: {
-      cursor: items.length ? `offset:${nextIndex}` : "",
-      index: nextIndex,
+      cursor: "",
+      index: page + 1,
       pageArea: body.pageArea ?? body.page_area ?? "UNFOLDED"
     },
-    has_more: items.length >= pageSize,
+    has_more: false,
+    pagination_limited: items.length >= pageSize,
     pageArea: body.pageArea ?? body.page_area ?? "UNFOLDED",
     sort_strategy: body.sort_strategy ?? "latest_v2"
   };
@@ -448,16 +450,16 @@ async function noteSubCommentsForTikHub(
   const comments = await noteSubCommentsForServerx(config, { ...body, max_comments: (page + 1) * pageSize }, options);
   const start = page * pageSize;
   const items = comments.slice(start, start + pageSize);
-  const nextIndex = page + 2;
   return {
     data: items,
     items,
     comments: items,
     cursor: {
-      cursor: items.length ? `offset:${nextIndex}` : "",
-      index: nextIndex
+      cursor: "",
+      index: page + 2
     },
-    has_more: comments.length > start + items.length,
+    has_more: false,
+    pagination_limited: comments.length > start + items.length,
     comment_id: body.comment_id ?? body.parent_comment_id ?? body.parent_id ?? ""
   };
 }
@@ -674,7 +676,7 @@ function toServerxPost(post: XhsPost, comments: XhsComment[] = []): Record<strin
   const xsecToken = post.xsecToken || extractXsecToken(url);
   const commentCount = typeof post.commentCount === "number" && post.commentCount > 0
     ? post.commentCount
-    : payloadComments.length;
+    : undefined;
   return {
     id: post.id,
     note_id: post.id,
@@ -711,8 +713,7 @@ function toServerxPost(post: XhsPost, comments: XhsComment[] = []): Record<strin
       url
     },
     like_count: post.likeCount,
-    comment_count: commentCount,
-    commentCount,
+    ...(commentCount != null ? { comment_count: commentCount, commentCount } : { platform_comment_count_unknown: true }),
     publish_time: secondsValue(post.publishedAt),
     create_time: secondsValue(post.publishedAt),
     published_at: post.publishedAt ?? "",
