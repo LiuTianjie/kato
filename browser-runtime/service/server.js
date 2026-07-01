@@ -169,6 +169,13 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/browser/pages") {
+      await ensureRuntimeReady();
+      const pages = await currentBrowserPages();
+      sendJson(res, 200, { success: true, data: { pages, page_urls: pages.map((page) => page.url) } });
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/browser/storage/export") {
       await ensureRuntimeReady();
       const body = await readJson(req);

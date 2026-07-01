@@ -224,7 +224,7 @@ async function searchNotesForServerx(
   const keyword = String(body.keyword ?? body.query ?? "").trim();
   const limit = normalizeLimit(body.limit, 20);
   const posts = await searchFilteredPosts(config, keyword ? [keyword] : normalizeKeywords(body), limit, body, options);
-  const includeComments = parseBooleanFlag(body.include_comments ?? body.includeComments, false);
+  const includeComments = parseBooleanFlag(body.include_comments ?? body.includeComments, true);
   const commentLimit = includeComments ? normalizeOptionalLimit(body.max_comments ?? body.maxComments, 20) : 0;
   return Promise.all(
     posts.slice(0, limit).map(async (post) => {

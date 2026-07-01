@@ -2333,6 +2333,7 @@ async function applyRequestAuth(auth, source) {
   });
   serviceLog("info", "cookies", "Douyin request auth applied.", {
     source,
+    traceId: stringValue(auth.trace_id || auth.traceId || auth.run_id || auth.runId),
     credentialId: stringValue(auth.credential_id || auth.account_id),
     cookies: cookies.length,
     storageOrigins: storage.length

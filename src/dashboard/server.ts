@@ -161,6 +161,14 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     return;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/platforms/current-page") {
+    const body = await readJson(req);
+    const platform = requirePlatformSpec(body.platform);
+    const kind = normalizeRuntimeKind(body.kind ?? body.runtimeKind);
+    sendJson(res, 200, { success: true, data: await getPlatformCurrentPage(platform.id, kind) });
+    return;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/v1/collection/jobs") {
     const body = await readJson(req);
     const platform = requirePlatformSpec(body.platform);
@@ -628,6 +636,25 @@ async function exportPlatformAuth(platform: PlatformId, kind: RuntimeKind = "vie
   };
 }
 
+async function getPlatformCurrentPage(platform: PlatformId, kind: RuntimeKind = "worker"): Promise<Record<string, unknown>> {
+  const spec = getPlatformSpec(platform);
+  if (!spec.implemented) {
+    return { platform: spec.id, label: spec.label, kind, pages: [], page_urls: [], current_url: "", viewer_url: "" };
+  }
+  const payload = await postRuntimeJson(runtimeUrlForKind(spec, kind), "/browser/pages", {}, 10_000);
+  const data = unwrapMcpData(payload) as Record<string, unknown>;
+  const pageUrls = collectRuntimePageUrls(data);
+  return {
+    platform: spec.id,
+    label: spec.label,
+    kind,
+    pages: Array.isArray(data.pages) ? data.pages : [],
+    page_urls: pageUrls,
+    current_url: firstUsefulPageUrl(pageUrls),
+    viewer_url: noVncViewerUrl(platform, kind)
+  };
+}
+
 function isPersistedPlatformAuth(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && "cookie_count" in value && "storage_origin_count" in value);
 }
@@ -741,6 +768,10 @@ function collectRuntimePageUrls(...items: Record<string, unknown>[]): string[] {
     }
   }
   return [...new Set(urls)];
+}
+
+function firstUsefulPageUrl(urls: string[]): string {
+  return urls.find((value) => /^https?:\/\//i.test(value)) || urls.find(Boolean) || "";
 }
 
 function assertViewerOnPlatformPage(
