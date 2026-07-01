@@ -52,36 +52,40 @@ async function routePublicBilibiliApi(
 ): Promise<unknown> {
   const path = url.pathname;
 
-  if (req.method === "GET" && path === "/api/bilibili/web/search_videos") {
-    return fetchServiceJson(`/api/v1/videos/search${queryString(body, {
+  if ((req.method === "GET" || req.method === "POST") && path === "/api/bilibili/web/search_videos") {
+    return postServiceJson("/api/v1/videos/search", {
       keyword: body.keyword ?? body.query,
       pn: body.pn ?? body.page,
       ps: body.ps ?? body.page_size ?? body.limit,
-      order: body.order ?? orderFromSortLabel(body.sort_label, "totalrank")
-    })}`, {}, options.signal);
+      order: body.order ?? orderFromSortLabel(body.sort_label, "totalrank"),
+      auth: body.auth
+    }, options.signal);
   }
 
-  if (req.method === "GET" && path === "/api/bilibili/web/fetch_one_video") {
-    return fetchServiceJson(`/api/v1/videos/detail${queryString(body, normalizeBilibiliVideoRequest(body))}`, {}, options.signal);
+  if ((req.method === "GET" || req.method === "POST") && path === "/api/bilibili/web/fetch_one_video") {
+    return postServiceJson("/api/v1/videos/detail", { ...normalizeBilibiliVideoRequest(body), auth: body.auth }, options.signal);
   }
 
-  if (req.method === "GET" && path === "/api/bilibili/web/fetch_video_comments") {
-    return fetchServiceJson(`/api/v1/videos/comments${queryString(body, {
+  if ((req.method === "GET" || req.method === "POST") && path === "/api/bilibili/web/fetch_video_comments") {
+    return postServiceJson("/api/v1/videos/comments", {
       ...normalizeBilibiliVideoRequest(body),
       pn: body.pn ?? body.page ?? body.num,
       ps: body.ps ?? body.page_size ?? body.limit ?? body.size,
-      order: body.order ?? orderFromSortLabel(body.sort_label, "hot")
-    })}`, {}, options.signal);
+      order: body.order ?? orderFromSortLabel(body.sort_label, "hot"),
+      cursor: body.cursor,
+      auth: body.auth
+    }, options.signal);
   }
 
-  if (req.method === "GET" && path === "/api/bilibili/web/fetch_comment_reply") {
-    return fetchServiceJson(`/api/v1/videos/comment_replies${queryString(body, {
+  if ((req.method === "GET" || req.method === "POST") && path === "/api/bilibili/web/fetch_comment_reply") {
+    return postServiceJson("/api/v1/videos/comment_replies", {
       ...normalizeBilibiliVideoRequest(body),
       root: body.root ?? body.root_id ?? body.rpid ?? body.comment_id,
       pn: body.pn ?? body.page ?? body.num,
       ps: body.ps ?? body.page_size ?? body.limit ?? body.size,
-      order: body.order ?? orderFromSortLabel(body.sort_label, "hot")
-    })}`, {}, options.signal);
+      order: body.order ?? orderFromSortLabel(body.sort_label, "hot"),
+      auth: body.auth
+    }, options.signal);
   }
 
   if (req.method === "POST" && path === "/api/bilibili/web/update_cookie") {

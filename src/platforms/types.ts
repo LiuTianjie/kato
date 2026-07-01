@@ -2,6 +2,7 @@ export type PlatformId = "xhs" | "bilibili" | "douyin";
 
 export interface PlatformRequestOptions {
   signal?: AbortSignal;
+  auth?: unknown;
   cursor?: string;
   index?: number;
   pageArea?: string;
@@ -78,6 +79,7 @@ export interface PlatformSpec {
   homeUrl: string;
   loginUrl?: string;
   cookieDomains: string[];
+  storageOrigins?: string[];
   defaultDataDir: string;
   defaultServicePort?: number;
   viewerRuntimeUrl?: string;

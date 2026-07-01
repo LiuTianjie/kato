@@ -201,6 +201,8 @@ test("serverx-compatible Douyin API exposes video endpoints and cookie update", 
       });
     }
     if (requestUrl.includes("/api/v1/posts/comments")) {
+      const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      assert.equal(body.limit, 200);
       return jsonResponse({
         success: true,
         data: {
@@ -246,7 +248,7 @@ test("serverx-compatible Douyin API exposes video endpoints and cookie update", 
 
     const comments = await callApi({
       method: "GET",
-      pathname: "/api/douyin/web/fetch_video_comments?aweme_id=738xxx&cursor=0&count=20",
+      pathname: "/api/douyin/web/fetch_video_comments?aweme_id=738xxx&cursor=0&count=250",
       token: "secret-token"
     });
     assert.equal(comments.payload.data.comments[0].cid, "comment_1");

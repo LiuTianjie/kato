@@ -264,8 +264,7 @@ const server = createServer(async (req, res) => {
       });
       await persistCookies(cookies, "manual-sync");
       if (!storageExportFailed) {
-        if (storage.length) await persistStorage(storage, "manual-sync");
-        else await ensureStorageFile("manual-sync");
+        await persistStorage(storage, "manual-sync");
       }
       const context = contextPromise ? await contextPromise.catch(() => undefined) : undefined;
       if (context && cookies.length) await context.addCookies(cookies).catch(() => undefined);
@@ -311,7 +310,7 @@ const server = createServer(async (req, res) => {
       const keyword = String(body.keyword || body.query || "");
       const limit = normalizeLimit(body.limit ?? body.page_size ?? body.pageSize, 20);
       const page = normalizePositiveInt(body.page, 1);
-      const feeds = await enqueueBrowserTask("feeds:search", (taskContext) => searchFeeds(keyword, limit, { ...searchFilterOptions(body), page, taskContext }), { signal: requestSignal });
+      const feeds = await enqueueBrowserTask("feeds:search", (taskContext) => searchFeeds(keyword, limit, { ...searchFilterOptions(body), auth: body.auth, page, taskContext }), { signal: requestSignal });
       sendJson(res, 200, { success: true, data: pagedPayload("feeds", feeds, { page, limit }) });
       return;
     }
@@ -327,22 +326,38 @@ const server = createServer(async (req, res) => {
       const body = await readJson(req);
       const limit = normalizeLimit(body.limit || body.max_comments || body.max_comment_items, 50);
       const index = normalizeCursorIndex(body.index, body.cursor, 0);
-      const comments = await enqueueBrowserTask("feeds:comments", (taskContext) => getFeedComments(body, limit, { index, taskContext }), {
+      const result = await enqueueBrowserTask("feeds:comments", (taskContext) => getFeedCommentsPage(body, limit, { index, cursor: body.cursor, taskContext }), {
         signal: requestSignal
       });
+      const comments = result.comments;
       sendJson(res, 200, {
         success: true,
         data: {
           comments,
           items: comments,
           cursor: {
-            cursor: comments.length ? `offset:${index + 1}` : "",
-            index: index + 1,
+            cursor: result.hasMore ? result.cursor || "" : "",
+            index: result.nextIndex ?? index + 1,
             pageArea: body.pageArea || body.page_area || "UNFOLDED"
           },
-          has_more: comments.length >= limit
+          next_cursor: result.hasMore ? result.cursor || "" : "",
+          platform_cursor: result.hasMore ? result.cursor || "" : "",
+          has_more: Boolean(result.hasMore),
+          pagination_limited: Boolean(result.paginationLimited),
+          source: result.source || "",
+          api_error: result.apiError || ""
         }
       });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/v1/feeds/comment_replies") {
+      const body = await readJson(req);
+      const limit = normalizeLimit(body.limit || body.max_comments || body.max_comment_items || body.num, 20);
+      const result = await enqueueBrowserTask("feeds:comment_replies", (taskContext) => getFeedCommentReplies(body, limit, { cursor: body.cursor, taskContext }), {
+        signal: requestSignal
+      });
+      sendJson(res, 200, { success: true, data: result });
       return;
     }
 
@@ -369,12 +384,12 @@ const server = createServer(async (req, res) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (error instanceof BrowserTaskCancelledError) {
-      serviceLog("warn", "request", `${req.method || "GET"} ${req.url || "/"} cancelled: ${message}`);
+      serviceLog("info", "request", `${req.method || "GET"} ${req.url || "/"} cancelled: ${message}`);
       sendJson(res, 499, { success: false, error: { code: "CLIENT_CLOSED_REQUEST", message } });
       return;
     }
     if (error instanceof BrowserQueueBusyError) {
-      serviceLog("warn", "request", `${req.method || "GET"} ${req.url || "/"} queue busy: ${message}`);
+      serviceLog("info", "request", `${req.method || "GET"} ${req.url || "/"} queue busy: ${message}`);
       sendJson(res, error.statusCode, { success: false, error: { code: error.code, message, queue: browserQueueSummary() } });
       return;
     }
@@ -513,7 +528,7 @@ function enqueueBrowserTask(label, task, options = {}) {
         browserTaskActive.cancelled = true;
         browserTaskActive.cancelReason = abortReasonMessage(taskContext.signal);
         updateBrowserTaskRecord(id, { status: "cancelling", cancelled: true, cancelReason: browserTaskActive.cancelReason });
-        serviceLog("warn", "queue", `Browser task #${id} cancelled: ${label}.`, {
+        serviceLog("info", "queue", `Browser task #${id} cancelled: ${label}.`, {
           reason: browserTaskActive.cancelReason
         });
       };
@@ -1094,6 +1109,7 @@ async function currentUserSummary(taskContext) {
 async function searchFeeds(keyword, limit, options = {}) {
   const taskContext = options.taskContext;
   return withBrowserRecovery("searchFeeds", async () => {
+    await applyRequestAuth(options.auth, "feeds:search");
     if (!keyword.trim()) return [];
     const pageNumber = normalizePositiveInt(options.page, 1);
     serviceLog("info", "feeds", "Search feeds requested.", {
@@ -1158,6 +1174,9 @@ async function searchFeeds(keyword, limit, options = {}) {
         diagnostics: lastDiagnostics || undefined
       });
       if (result.length || attempt >= 2) {
+        if (!result.length && isSearchLoginOrPermissionBlocked(lastDiagnostics)) {
+          throw new Error("XHS login required: search page requires login or has no permission, please sync cookie.");
+        }
         serviceLog("info", "feeds", "Search feeds completed.", {
           keyword,
           page: pageNumber,
@@ -1172,6 +1191,9 @@ async function searchFeeds(keyword, limit, options = {}) {
       await humanDelay("search:retry", 1_200, 2_400, { signal: taskContext?.signal });
     }
     serviceLog("warn", "feeds", "Search feeds returned empty result.", { keyword, page: pageNumber, diagnostics: lastDiagnostics || undefined });
+    if (isSearchLoginOrPermissionBlocked(lastDiagnostics)) {
+      throw new Error("XHS login required: search page requires login or has no permission, please sync cookie.");
+    }
     return [];
   }, taskContext);
 }
@@ -1298,8 +1320,15 @@ async function searchPageDiagnostics(page) {
   }).catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
 }
 
+function isSearchLoginOrPermissionBlocked(diagnostics) {
+  if (!diagnostics || typeof diagnostics !== "object") return false;
+  const text = `${diagnostics.title || ""} ${diagnostics.bodyPreview || ""}`;
+  return /登录后查看|手机号登录|请登录|没有权限访问|账号没有权限|二维码已过期/i.test(text);
+}
+
 async function getFeedDetail(body, taskContext) {
   return withBrowserRecovery("getFeedDetail", async () => {
+    await applyRequestAuth(body.auth, "feeds:detail");
     const { id, xsecToken, url } = normalizeDetailInput(body);
     if (!url && !id) throw new Error("feed_id or url is required.");
     if (isTokenRequiredForDetailUrl(url) && !xsecToken) {
@@ -1340,23 +1369,35 @@ async function getFeedDetail(body, taskContext) {
     });
     const parsed = postFromUrl(url);
     const finalUrl = page.url();
+    const redirectedToLogin =
+      /xiaohongshu\.com\/login(?:\?|$)/i.test(finalUrl) ||
+      /手机号登录|登录后查看|请登录/i.test(detail.title || detail.text || "");
     const looksBlockedOrMissing =
       /\/404(?:\?|$)/.test(finalUrl) ||
       /当前笔记暂时无法浏览|你访问的页面不见了|扫码查看|error_code=300031/.test(detail.text || "");
-    serviceLog(looksBlockedOrMissing ? "warn" : "info", "detail", "Note detail page loaded.", {
+    serviceLog(looksBlockedOrMissing || redirectedToLogin ? "warn" : "info", "detail", "Note detail page loaded.", {
       id: id || parsed.id,
       status: response?.status?.(),
       finalUrl: safeLogUrl(finalUrl),
       title: cleanTitle(detail.title),
-      blockedOrMissing: looksBlockedOrMissing
+      blockedOrMissing: looksBlockedOrMissing,
+      redirectedToLogin
     });
+    if (redirectedToLogin) {
+      throw new Error("XHS login required: browser redirected to login page, please sync cookie.");
+    }
+    if (looksBlockedOrMissing) {
+      throw new Error("XHS note unavailable or blocked.");
+    }
     const result = {
       id: id || parsed.id,
       xsecToken: xsecToken || parsed.xsecToken,
       url,
       title: cleanTitle(detail.title),
       snippet: cleanSnippet(detail.snippet || detail.text),
-      author: detail.author || undefined
+      author: detail.author || undefined,
+      commentCount: undefined,
+      commentCountUnknown: true
     };
     rememberPosts([result]);
     return result;
@@ -1448,12 +1489,14 @@ async function callTool(params, taskContext) {
   if (name === "get_feed_comments") {
     const limit = normalizeLimit(args.limit || args.max_comments || args.max_comment_items, 50);
     const index = normalizeCursorIndex(args.index, args.cursor, 0);
-    const comments = await getFeedComments(args, limit, { index, taskContext });
+    const result = await getFeedCommentsPage(args, limit, { index, cursor: args.cursor, taskContext });
     return toolJson({
-      comments,
-      items: comments,
-      cursor: { cursor: comments.length ? `offset:${index + 1}` : "", index: index + 1, pageArea: args.pageArea || "UNFOLDED" },
-      has_more: comments.length >= limit
+      comments: result.comments,
+      items: result.comments,
+      cursor: { cursor: result.cursor || "", index: result.nextIndex || index + 1, pageArea: args.pageArea || "UNFOLDED" },
+      has_more: Boolean(result.hasMore && result.cursor),
+      pagination_limited: Boolean(result.paginationLimited),
+      api_error: result.apiError || ""
     });
   }
   if (name === "post_comment_to_feed") {
@@ -1548,32 +1591,354 @@ async function scrapePosts(page) {
 }
 
 async function getFeedComments(body, limit, options = {}) {
+  const result = await getFeedCommentsPage(body, limit, options);
+  return result.comments;
+}
+
+async function getFeedCommentsPage(body, limit, options = {}) {
   const taskContext = options.taskContext;
   return withBrowserRecovery("getFeedComments", async () => {
+    await applyRequestAuth(body.auth, "feeds:comments");
     const detailInput = normalizeDetailInput(body);
     const index = normalizeCursorIndex(options.index, options.cursor, 0);
+    const platformCursor = normalizePlatformCursor(options.cursor ?? body.cursor);
     serviceLog("info", "comments", "Note comments requested.", {
       id: detailInput.id,
       hasXsecToken: Boolean(detailInput.xsecToken),
       limit,
-      index
+      index,
+      hasPlatformCursor: Boolean(platformCursor)
     });
-    await getFeedDetail(body, taskContext);
+    const detail = await ensureFeedDetailForComments(body, taskContext);
+    const expectedCommentCount = toOptionalCount(detail?.commentCount);
     const page = await servicePage(taskContext);
+    let apiResult = { comments: [], cursor: "", hasMore: false };
+    let apiError = "";
+    const usesSyntheticCursor = Boolean(options.cursor ?? body.cursor) && !platformCursor;
+    if (!usesSyntheticCursor) {
+      try {
+        apiResult = await fetchCommentsByWebApi(page, detailInput, limit, { cursor: platformCursor, index }, taskContext);
+      } catch (error) {
+        apiError = error instanceof Error ? error.message : String(error);
+        serviceLog("warn", "comments", `XHS comments web API failed, fallback to DOM scrape: ${apiError}`, {
+          id: detailInput.id,
+          index
+        });
+      }
+    }
+    if (apiResult.comments.length) {
+      let source = "web_api";
+      let mergedComments = apiResult.comments;
+      let domCount = 0;
+      if (!apiResult.hasMore || !apiResult.cursor) {
+        await humanDelay("comments:api-partial-dom-check", 700, 1_500, { signal: taskContext?.signal });
+        await autoScrollUntilComments(page, Math.min(Math.max(limit, apiResult.comments.length + 1), expectedCommentCount || limit), taskContext, {
+          minSteps: Math.max(4, index + 4),
+          maxSteps: expectedCommentCount && expectedCommentCount > apiResult.comments.length ? 18 : 8
+        });
+        const scraped = await scrapeComments(page);
+        domCount = scraped.length;
+        if (scraped.length > apiResult.comments.length) {
+          mergedComments = [...apiResult.comments, ...scraped];
+          source = "web_api+dom";
+        }
+      }
+      const comments = uniqueComments(mergedComments, limit, index * limit);
+      const nextCursor = apiResult.hasMore && apiResult.cursor
+        ? apiResult.cursor
+        : "";
+      serviceLog("info", "comments", "Note comments completed.", {
+        id: detailInput.id,
+        index,
+        scraped: apiResult.comments.length,
+        returned: comments.length,
+        domScraped: domCount,
+        source,
+        hasMore: apiResult.hasMore,
+        hasCursor: Boolean(apiResult.cursor),
+        expectedCommentCount
+      });
+      return {
+        comments,
+        cursor: nextCursor,
+        nextIndex: index + 1,
+        hasMore: Boolean(nextCursor),
+        paginationLimited: comments.length > 0 && !nextCursor,
+        source,
+        apiError
+      };
+    }
     await humanDelay("comments:before-scroll", 700, 1_800, { signal: taskContext?.signal });
-    await autoScroll(page, Math.max(3, index + 3), taskContext);
+    await autoScrollUntilComments(page, (index + 1) * limit, taskContext, {
+      minSteps: Math.max(4, index + 4),
+      maxSteps: expectedCommentCount && expectedCommentCount > index * limit ? 24 : 10
+    });
     taskContext?.throwIfCancelled?.();
     const scraped = await scrapeComments(page);
     const comments = uniqueComments(scraped, limit, index * limit);
+    const nextCursor = "";
     serviceLog("info", "comments", "Note comments completed.", {
       id: detailInput.id,
       index,
       scraped: scraped.length,
       returned: comments.length,
-      currentUrl: safeLogUrl(page.url())
+      currentUrl: safeLogUrl(page.url()),
+      source: "dom",
+      apiError,
+      expectedCommentCount
     });
-    return comments;
+    if (!comments.length && isXhsAuthOrChallengeError(apiError)) {
+      throw new Error(`XHS challenge required: ${apiError}`);
+    }
+    if (
+      !comments.length &&
+      expectedCommentCount != null &&
+      expectedCommentCount > index * limit
+    ) {
+      throw new Error(
+        `XHS comments pagination interrupted: platform_count=${expectedCommentCount}; page=${index + 1}; visible_comments=${scraped.length}; saved_page_comments=0; 平台未继续暴露评论，可能账号存在异常/风控或评论折叠。`
+      );
+    }
+    return {
+      comments,
+      cursor: nextCursor,
+      nextIndex: index + 1,
+      hasMore: Boolean(nextCursor),
+      paginationLimited: comments.length > 0,
+      source: "dom",
+      apiError
+    };
   }, taskContext);
+}
+
+async function ensureFeedDetailForComments(body, taskContext) {
+  let lastError;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      return await getFeedDetail(body, taskContext);
+    } catch (error) {
+      lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      if (!isXhsAuthOrChallengeError(message) || attempt >= 2) break;
+      serviceLog("warn", "comments", "XHS detail login redirect before comments, retrying once.", {
+        attempt,
+        error: message
+      });
+      await humanDelay("comments:detail-retry", 2_000, 4_000, { signal: taskContext?.signal });
+      await applyRequestAuth(body.auth, "feeds:comments:retry");
+    }
+  }
+  throw lastError;
+}
+
+async function fetchCommentsByWebApi(page, detailInput, limit, pageState, taskContext) {
+  const noteId = String(detailInput.id || "").trim();
+  if (!noteId) return { comments: [], cursor: "", hasMore: false };
+  taskContext?.throwIfCancelled?.();
+  const cursor = String(pageState?.cursor || "");
+  const index = normalizeCursorIndex(pageState?.index, "", 0);
+  const payload = await page.evaluate(
+    async ({ noteId, xsecToken, limit, cursor, index }) => {
+      const path = "/api/sns/web/v2/comment/page";
+      const params = new URLSearchParams({
+        note_id: noteId,
+        cursor: cursor || "",
+        top_comment_id: "",
+        image_formats: "jpg,webp,avif"
+      });
+      if (xsecToken) params.set("xsec_token", xsecToken);
+      const pathWithQuery = `${path}?${params.toString()}`;
+      const signHeaders =
+        typeof window._webmsxyw === "function" ? window._webmsxyw(pathWithQuery, null) : {};
+      const response = await fetch(`https://edith.xiaohongshu.com${pathWithQuery}`, {
+        method: "GET",
+        credentials: "include",
+        headers: {
+          Accept: "application/json, text/plain, */*",
+          ...signHeaders
+        }
+      });
+      const text = await response.text();
+      let json = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {
+        json = null;
+      }
+      return { ok: response.ok, status: response.status, text, json };
+    },
+    { noteId, xsecToken: detailInput.xsecToken || "", limit, cursor, index }
+  );
+  if (!payload?.ok) {
+    throw new Error(`XHS comments web API HTTP ${payload?.status || "unknown"} ${String(payload?.text || "").slice(0, 200)}`);
+  }
+  if (payload.json?.success === false || (payload.json?.code != null && Number(payload.json.code) !== 0)) {
+    throw new Error(`XHS comments web API failed: ${payload.json?.msg || payload.json?.message || payload.text || "unknown error"}`);
+  }
+  return {
+    comments: commentsFromWebPayload(payload.json),
+    cursor: stringValue(payload.json?.data?.cursor ?? payload.json?.cursor ?? payload.json?.next_cursor ?? ""),
+    hasMore: payload.json?.data?.has_more === true || payload.json?.data?.has_more === 1 || payload.json?.has_more === true || payload.json?.has_more === 1
+  };
+}
+
+async function getFeedCommentReplies(body, limit, options = {}) {
+  const taskContext = options.taskContext;
+  return withBrowserRecovery("getFeedCommentReplies", async () => {
+    await applyRequestAuth(body.auth, "feeds:comment_replies");
+    const detailInput = normalizeDetailInput(body);
+    const noteId = String(detailInput.id || "").trim();
+    const rootCommentId = firstText(body.comment_id, body.commentId, body.parent_comment_id, body.parent_id, body.root_comment_id, body.rootCommentId);
+    if (!noteId || !rootCommentId) return { comments: [], items: [], cursor: "", has_more: false };
+    await ensureFeedDetailForComments(body, taskContext);
+    const page = await servicePage(taskContext);
+    let result = { comments: [], cursor: "", hasMore: false };
+    let apiError = "";
+    try {
+      result = await fetchSubCommentsByWebApi(page, { noteId, rootCommentId, xsecToken: detailInput.xsecToken || "", limit, cursor: normalizePlatformCursor(options.cursor ?? body.cursor) }, taskContext);
+    } catch (error) {
+      apiError = error instanceof Error ? error.message : String(error);
+      serviceLog("warn", "comments", `XHS sub comments web API failed, fallback to DOM scrape: ${apiError}`, {
+        id: noteId,
+        rootCommentId
+      });
+    }
+    if (!result.comments.length && apiError) {
+      await humanDelay("comment-replies:before-scroll", 500, 1_200, { signal: taskContext?.signal });
+      await autoScroll(page, 4, taskContext);
+      const normalizedRootId = normalizePlatformCommentId(rootCommentId);
+      const scraped = uniqueComments(await scrapeComments(page), limit * 3, 0);
+      const filtered = scraped.filter((comment) => normalizePlatformCommentId(comment.parent_id || comment.parent_comment_id) === normalizedRootId);
+      result = { comments: filtered, cursor: "", hasMore: false };
+    }
+    const comments = uniqueComments(result.comments, limit, 0).map((comment) => ({
+      ...comment,
+      parent_id: comment.parent_id || rootCommentId,
+      parent_comment_id: comment.parent_comment_id || rootCommentId
+    }));
+    return {
+      comments,
+      items: comments,
+      cursor: result.cursor,
+      next_cursor: result.cursor,
+      platform_cursor: result.cursor,
+      has_more: result.hasMore || Boolean(result.cursor),
+      source: result.cursor || !apiError ? "web_api" : "dom",
+      api_error: apiError
+    };
+  }, taskContext);
+}
+
+async function fetchSubCommentsByWebApi(page, { noteId, rootCommentId, xsecToken, limit, cursor }, taskContext) {
+  taskContext?.throwIfCancelled?.();
+  const payload = await page.evaluate(
+    async ({ noteId, rootCommentId, xsecToken, limit, cursor }) => {
+      const path = "/api/sns/web/v2/comment/sub/page";
+      const params = new URLSearchParams({
+        note_id: noteId,
+        root_comment_id: rootCommentId,
+        num: String(limit),
+        cursor: cursor || "",
+        image_formats: "jpg,webp,avif",
+        top_comment_id: ""
+      });
+      if (xsecToken) params.set("xsec_token", xsecToken);
+      const pathWithQuery = `${path}?${params.toString()}`;
+      const signHeaders =
+        typeof window._webmsxyw === "function" ? window._webmsxyw(pathWithQuery, null) : {};
+      const response = await fetch(`https://edith.xiaohongshu.com${pathWithQuery}`, {
+        method: "GET",
+        credentials: "include",
+        headers: {
+          Accept: "application/json, text/plain, */*",
+          ...signHeaders
+        }
+      });
+      const text = await response.text();
+      let json = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {
+        json = null;
+      }
+      return { ok: response.ok, status: response.status, text, json };
+    },
+    { noteId, rootCommentId, xsecToken, limit, cursor }
+  );
+  if (!payload?.ok) {
+    throw new Error(`XHS sub comments web API HTTP ${payload?.status || "unknown"} ${String(payload?.text || "").slice(0, 200)}`);
+  }
+  if (payload.json?.success === false || (payload.json?.code != null && Number(payload.json.code) !== 0)) {
+    throw new Error(`XHS sub comments web API failed: ${payload.json?.msg || payload.json?.message || payload.text || "unknown error"}`);
+  }
+  return {
+    comments: commentsFromWebPayload(payload.json).map((comment) => ({ ...comment, parent_id: comment.parent_id || rootCommentId, parent_comment_id: comment.parent_comment_id || rootCommentId })),
+    cursor: stringValue(payload.json?.data?.cursor ?? payload.json?.cursor ?? payload.json?.next_cursor ?? ""),
+    hasMore: payload.json?.data?.has_more === true || payload.json?.data?.has_more === 1 || payload.json?.has_more === true || payload.json?.has_more === 1
+  };
+}
+
+function commentsFromWebPayload(payload) {
+  const result = [];
+  const seen = new Set();
+  const roots =
+    firstArray(
+      payload?.data?.comments,
+      payload?.data?.comment_list,
+      payload?.comments,
+      payload?.comment_list,
+      payload?.items
+    ) || [];
+  for (const item of roots) {
+    collectCommentPayload(item, "", result, seen);
+  }
+  return result;
+}
+
+function isXhsAuthOrChallengeError(message) {
+  return /登录|请登录|login|required|账号存在异常|切换账号|验证|challenge|风控|risk/i.test(String(message || ""));
+}
+
+function collectCommentPayload(item, parentId, result, seen) {
+  if (!item || typeof item !== "object") return;
+  const id = firstText(item.id, item.comment_id, item.commentId);
+  const content = firstText(
+    item.content,
+    item.text,
+    item.comment_content,
+    item.content_info?.content,
+    item.contentInfo?.content
+  );
+  if (id && content && !seen.has(id)) {
+    seen.add(id);
+    const user = objectValue(item.user_info) || objectValue(item.userInfo) || objectValue(item.user) || {};
+    result.push({
+      id,
+      comment_id: id,
+      content,
+      text: content,
+      author: firstText(user.nickname, user.nick_name, user.name, item.author, item.author_name),
+      author_name: firstText(user.nickname, user.nick_name, user.name, item.author_name, item.author),
+      parent_id: parentId,
+      parent_comment_id: parentId,
+      create_time: item.create_time || item.createTime || item.time || item.create_time_millis,
+      published_at: item.published_at || item.publishedAt || item.create_time || item.createTime
+    });
+  }
+  const children =
+    firstArray(
+      item.sub_comments,
+      item.subComments,
+      item.sub_comment_list,
+      item.subCommentList,
+      item.replies,
+      item.reply_list
+    ) || [];
+  for (const child of children) collectCommentPayload(child, id || parentId, result, seen);
+}
+
+function firstArray(...values) {
+  return values.find((value) => Array.isArray(value));
 }
 
 function startPostResponseCapture(page) {
@@ -1918,8 +2283,8 @@ function normalizeComment(comment, id, content) {
       text: content,
       author: comment.author || undefined,
       author_name: comment.author_name || comment.author || undefined,
-      parent_id: comment.parent_id || undefined,
-      parent_comment_id: comment.parent_id || undefined,
+      parent_id: comment.parent_id || comment.parent_comment_id || undefined,
+      parent_comment_id: comment.parent_comment_id || comment.parent_id || undefined,
       create_time: comment.create_time || comment.createTime || comment.published_at || comment.publishedAt || undefined,
       published_at: comment.published_at || comment.publishedAt || undefined
   };
@@ -1956,6 +2321,38 @@ async function autoScroll(page, steps, taskContext) {
     await humanDelay("scroll:pre", 180, 620, { signal: taskContext?.signal });
     await page.mouse.wheel(randomBetween(-18, 18), randomBetween(520, 1_180)).catch(() => undefined);
     await humanDelay("scroll:settle", 650, 1_650, { signal: taskContext?.signal });
+  }
+}
+
+async function autoScrollUntilComments(page, targetCount, taskContext, options = {}) {
+  const minSteps = Math.max(1, Number(options.minSteps || 1));
+  const maxSteps = Math.max(minSteps, Number(options.maxSteps || minSteps));
+  const wanted = Math.max(1, Number(targetCount || 1));
+  let stableRounds = 0;
+  let lastCount = 0;
+  for (let i = 0; i < maxSteps; i += 1) {
+    taskContext?.throwIfCancelled?.();
+    await autoScroll(page, 1, taskContext);
+    const currentCount = await page
+      .evaluate(() => {
+        const selectors = [
+          "[class*=comment-item]",
+          "[class*=CommentItem]",
+          "[class*=parent-comment]",
+          "[class*=commentItem]",
+          "[data-comment-id]"
+        ];
+        return document.querySelectorAll(selectors.join(",")).length;
+      })
+      .catch(() => 0);
+    if (currentCount >= wanted && i + 1 >= minSteps) break;
+    if (currentCount <= lastCount) {
+      stableRounds += 1;
+    } else {
+      stableRounds = 0;
+      lastCount = currentCount;
+    }
+    if (i + 1 >= minSteps && stableRounds >= 4) break;
   }
 }
 
@@ -2079,6 +2476,71 @@ async function restoreStorage(context, storage) {
   }
   loadedStorageOrigins = restored;
   return restored;
+}
+
+async function applyRequestAuth(auth, source) {
+  if (!auth || typeof auth !== "object") return;
+  const cookies = normalizeRequestAuthCookies(auth);
+  const storage = normalizeRequestAuthStorage(auth);
+  if (!cookies.length && !storage.length) return;
+  const context = await ensureContext();
+  if (cookies.length) await context.addCookies(cookies).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    serviceLog("warn", "cookies", `XHS request cookie restore failed during ${source}: ${message}`);
+  });
+  if (storage.length) await restoreStorage(context, storage).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    serviceLog("warn", "storage", `XHS request storage restore failed during ${source}: ${message}`);
+  });
+  serviceLog("info", "cookies", "XHS request auth applied.", {
+    source,
+    credentialId: String(auth.credential_id || auth.account_id || ""),
+    cookies: cookies.length,
+    storageOrigins: storage.length
+  });
+}
+
+function normalizeRequestAuthCookies(auth) {
+  if (!auth || typeof auth !== "object") return [];
+  if (Array.isArray(auth.cookies)) return filterXhsCookies(auth.cookies);
+  const cookieHeader = String(auth.cookie || auth.cookies || "").trim();
+  if (!cookieHeader) return [];
+  return parseCookieHeader(cookieHeader, ".xiaohongshu.com");
+}
+
+function normalizeRequestAuthStorage(auth) {
+  if (!auth || typeof auth !== "object") return [];
+  const raw = auth.storage_json || auth.storage;
+  if (Array.isArray(raw)) return filterXhsStorageEntries(raw);
+  if (typeof raw !== "string" || !raw.trim()) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return filterXhsStorageEntries(Array.isArray(parsed) ? parsed : []);
+  } catch {
+    return [];
+  }
+}
+
+function parseCookieHeader(cookieHeader, domain) {
+  const expires = Math.floor(Date.now() / 1000) + 365 * 24 * 60 * 60;
+  return cookieHeader
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const separator = part.indexOf("=");
+      if (separator <= 0) return null;
+      const name = part.slice(0, separator).trim();
+      const value = part.slice(separator + 1).trim();
+      if (!name || ["path", "domain", "expires", "max-age", "secure", "httponly", "samesite"].includes(name.toLowerCase())) return null;
+      return { name, value, domain, path: "/", expires, httpOnly: false, secure: true, sameSite: "Lax" };
+    })
+    .filter(Boolean);
+}
+
+function filterXhsCookies(cookies) {
+  if (!Array.isArray(cookies)) return [];
+  return cookies.filter((cookie) => cookie && typeof cookie === "object" && /xiaohongshu|xhs|rednote/i.test(String(cookie.domain || "")));
 }
 
 async function persistContextCookies(context, reason = "auto") {
@@ -2351,6 +2813,18 @@ function normalizeCursorIndex(indexValue, cursorValue, fallback) {
   const numberValue = Number(indexValue ?? fallback);
   if (!Number.isFinite(numberValue)) return fallback;
   return Math.max(0, Math.floor(numberValue));
+}
+
+function normalizePlatformCursor(value) {
+  const cursor = String(value || "").trim();
+  if (!cursor || /^offset:\d+$/i.test(cursor)) return "";
+  return cursor;
+}
+
+function normalizePlatformCommentId(value) {
+  const text = String(value || "").trim();
+  const prefixed = /^comment-([0-9a-f]{24})$/i.exec(text);
+  return prefixed ? prefixed[1] : text;
 }
 
 function pagedPayload(key, items, { page, limit }) {

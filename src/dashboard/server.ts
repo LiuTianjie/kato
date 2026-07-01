@@ -1,6 +1,7 @@
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { createReadStream, existsSync, mkdirSync, statSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { connect as connectTcp } from "node:net";
 import type { Duplex } from "node:stream";
 import path from "node:path";
@@ -153,6 +154,35 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     return;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/platforms/export-auth") {
+    const body = await readJson(req);
+    const platform = requirePlatformSpec(body.platform);
+    sendJson(res, 200, { success: true, data: await exportPlatformAuth(platform.id, normalizeRuntimeKind(body.kind ?? body.runtimeKind)) });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/platforms/current-page") {
+    const body = await readJson(req);
+    const platform = requirePlatformSpec(body.platform);
+    const kind = normalizeRuntimeKind(body.kind ?? body.runtimeKind);
+    sendJson(res, 200, { success: true, data: await getPlatformCurrentPage(platform.id, kind) });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/v1/collection/jobs") {
+    const body = await readJson(req);
+    const platform = requirePlatformSpec(body.platform);
+    sendJson(res, 200, { success: true, data: await postPlatformCollectionJob(platform.id, body) });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname.startsWith("/api/v1/collection/jobs/")) {
+    const platform = requirePlatformSpec(url.searchParams.get("platform") || "bilibili");
+    const jobId = url.pathname.split("/").pop() || "";
+    sendJson(res, 200, { success: true, data: await fetchPlatformCollectionJob(platform.id, jobId) });
+    return;
+  }
+
   if (req.method === "GET" && url.pathname === "/api/platforms/worker-status") {
     sendJson(res, 200, { platforms: await Promise.all(listPlatformSpecs().map((platform) => getPlatformWorkerStatus(platform.id))) });
     return;
@@ -208,6 +238,21 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
       kind,
       viewerUrl: noVncViewerUrl(platform.id, kind),
       loginUrl: targetUrl,
+      homeUrl: platform.homeUrl
+    });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/browser-viewer/url") {
+    const body = await readJson(req);
+    const platform = getPlatformSpec(body.platform);
+    const kind = normalizeRuntimeKind(body.kind ?? body.runtimeKind);
+    await waitForBrowserViewerReady(platform.id, kind, 10_000);
+    sendJson(res, 200, {
+      opened: false,
+      platform: platform.id,
+      kind,
+      viewerUrl: noVncViewerUrl(platform.id, kind),
       homeUrl: platform.homeUrl
     });
     return;
@@ -420,6 +465,21 @@ async function postBilibiliJson(endpoint: string, body: Record<string, unknown>,
   return data;
 }
 
+async function postPlatformCollectionJob(platform: PlatformId, body: Record<string, unknown>): Promise<unknown> {
+  if (platform === "bilibili") {
+    return unwrapMcpData(await postBilibiliJson("/api/v1/collection/jobs", body, 35_000));
+  }
+  throw new Error(`Collection jobs for ${platform} are not implemented yet.`);
+}
+
+async function fetchPlatformCollectionJob(platform: PlatformId, jobId: string): Promise<unknown> {
+  if (!jobId) throw new Error("job_id is required.");
+  if (platform === "bilibili") {
+    return unwrapMcpData(await fetchBilibiliJson(`/api/v1/collection/jobs/${encodeURIComponent(jobId)}`, 20_000));
+  }
+  throw new Error(`Collection jobs for ${platform} are not implemented yet.`);
+}
+
 async function fetchRuntimeJson(baseUrl: string, endpoint: string, timeoutMs = 20_000): Promise<unknown> {
   const response = await fetchWithTimeout(`${baseUrl.replace(/\/$/, "")}${endpoint}`, {}, timeoutMs);
   const text = await response.text();
@@ -507,6 +567,282 @@ async function syncPlatformCookies(platform: PlatformId): Promise<Record<string,
         : await postMcpJson("/api/v1/browser/sync-cookies", {}, 35_000);
   const data = unwrapMcpData(payload) as Record<string, unknown>;
   return { platform: spec.id, label: spec.label, synced: true, ...data };
+}
+
+async function exportPlatformAuth(platform: PlatformId, kind: RuntimeKind = "viewer"): Promise<Record<string, unknown>> {
+  const spec = getPlatformSpec(platform);
+  if (!spec.implemented || !spec.capabilities.login) {
+    return { platform: spec.id, label: spec.label, exported: false, error: "未接入登录能力" };
+  }
+  const runtimeAuth = await Promise.all([
+    postRuntimeJson(
+      runtimeUrlForKind(spec, kind),
+      "/browser/cookies/export",
+      { domains: spec.cookieDomains },
+      35_000
+    ),
+    postRuntimeJson(
+      runtimeUrlForKind(spec, kind),
+      "/browser/storage/export",
+      { domains: spec.cookieDomains, origins: spec.storageOrigins ?? [] },
+      35_000
+    ).catch(() => ({}))
+  ]).catch(async (error) => {
+    const persisted = await exportPersistedPlatformAuth(platform);
+    if (Number(persisted.cookie_count || 0) > 0) return persisted;
+    throw error;
+  });
+  if (isPersistedPlatformAuth(runtimeAuth)) return runtimeAuth;
+  const [cookiesPayload, storagePayload] = runtimeAuth;
+  const cookiesData = unwrapMcpData(cookiesPayload) as Record<string, unknown>;
+  const storageData = unwrapMcpData(storagePayload) as Record<string, unknown>;
+  const pageUrls = collectRuntimePageUrls(cookiesData, storageData);
+  if (kind === "viewer") {
+    try {
+      assertViewerOnPlatformPage(spec, pageUrls);
+    } catch (error) {
+      const persisted = await exportPersistedPlatformAuth(platform);
+      if (Number(persisted.cookie_count || 0) > 0) return persisted;
+      throw error;
+    }
+  }
+  const cookies = Array.isArray(cookiesData.cookies) ? cookiesData.cookies : [];
+  let storage = Array.isArray(storageData.storage) ? storageData.storage : [];
+  let source = "viewer";
+  if (platform === "douyin" && cookies.length && storage.length === 0) {
+    const persisted = await postDouyinJson("/api/v1/browser/export-auth", {}, 35_000)
+      .then((payload) => unwrapMcpData(payload) as Record<string, unknown>)
+      .catch(() => null);
+    const persistedCookies = Array.isArray(persisted?.cookies) ? persisted.cookies : [];
+    const persistedStorage = Array.isArray(persisted?.storage) ? persisted.storage : [];
+    if (persistedStorage.length && loginCookiesMatch(cookies, persistedCookies)) {
+      storage = persistedStorage;
+      source = "viewer+matched-file-storage";
+    }
+  }
+  return {
+    platform: spec.id,
+    label: spec.label,
+    exported: true,
+    runtime_kind: kind,
+    source,
+    cookie: cookiesToHeader(cookies),
+    cookies,
+    storage,
+    storage_json: JSON.stringify(storage),
+    cookie_count: cookies.length,
+    storage_origin_count: storage.length,
+    source_page_urls: pageUrls
+  };
+}
+
+async function getPlatformCurrentPage(platform: PlatformId, kind: RuntimeKind = "worker"): Promise<Record<string, unknown>> {
+  const spec = getPlatformSpec(platform);
+  if (!spec.implemented) {
+    return { platform: spec.id, label: spec.label, kind, pages: [], page_urls: [], current_url: "", viewer_url: "" };
+  }
+  const payload = await postRuntimeJson(runtimeUrlForKind(spec, kind), "/browser/pages", {}, 10_000);
+  const data = unwrapMcpData(payload) as Record<string, unknown>;
+  const pageUrls = collectRuntimePageUrls(data);
+  return {
+    platform: spec.id,
+    label: spec.label,
+    kind,
+    pages: Array.isArray(data.pages) ? data.pages : [],
+    page_urls: pageUrls,
+    current_url: firstUsefulPageUrl(pageUrls),
+    viewer_url: noVncViewerUrl(platform, kind)
+  };
+}
+
+function isPersistedPlatformAuth(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && "cookie_count" in value && "storage_origin_count" in value);
+}
+
+async function exportPersistedDouyinAuth(): Promise<Record<string, unknown>> {
+  const persisted = await postDouyinJson("/api/v1/browser/export-auth", {}, 35_000)
+    .then((payload) => unwrapMcpData(payload) as Record<string, unknown>);
+  const cookies = Array.isArray(persisted.cookies) ? persisted.cookies : [];
+  const storage = Array.isArray(persisted.storage) ? persisted.storage : [];
+  return {
+    platform: "douyin",
+    label: "抖音",
+    exported: true,
+    runtime_kind: "file",
+    source: "persisted-file",
+    cookie: typeof persisted.cookie === "string" ? persisted.cookie : cookiesToHeader(cookies),
+    cookies,
+    storage,
+    storage_json: typeof persisted.storage_json === "string" ? persisted.storage_json : JSON.stringify(storage),
+    cookie_count: Number(persisted.cookie_count || cookies.length),
+    storage_origin_count: Number(persisted.storage_origin_count || storage.length),
+    auth: persisted.auth
+  };
+}
+
+async function exportPersistedPlatformAuth(platform: PlatformId): Promise<Record<string, unknown>> {
+  if (platform === "douyin") return exportPersistedDouyinAuth();
+  const spec = getPlatformSpec(platform);
+  const cookies = await readPersistedPlatformCookies(platform, spec.defaultDataDir);
+  const storage = await readPersistedPlatformStorage(platform, spec.defaultDataDir);
+  return {
+    platform: spec.id,
+    label: spec.label,
+    exported: true,
+    runtime_kind: "file",
+    source: "persisted-file",
+    cookie: cookiesToHeader(cookies),
+    cookies,
+    storage,
+    storage_json: JSON.stringify(storage),
+    cookie_count: cookies.length,
+    storage_origin_count: storage.length
+  };
+}
+
+async function readPersistedPlatformCookies(platform: PlatformId, dataDir: string): Promise<unknown[]> {
+  const candidatePaths = platform === "xhs"
+    ? [path.join(dataDir, "cookies.json"), "/app/data/cookies.json"]
+    : [path.join(dataDir, "cookies.json")];
+  for (const filePath of candidatePaths) {
+    const payload = await readJsonFile(filePath);
+    const cookies = normalizePersistedCookies(payload);
+    if (cookies.length) return cookies;
+  }
+  return [];
+}
+
+async function readPersistedPlatformStorage(platform: PlatformId, dataDir: string): Promise<unknown[]> {
+  const filePath = platform === "xhs" ? "/app/data/platforms/xhs/storage.json" : path.join(dataDir, "storage.json");
+  const payload = await readJsonFile(filePath);
+  return Array.isArray(payload) ? payload : [];
+}
+
+async function readJsonFile(filePath: string): Promise<unknown> {
+  try {
+    const text = await readFile(filePath, "utf8");
+    return text ? JSON.parse(text) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizePersistedCookies(payload: unknown): unknown[] {
+  if (Array.isArray(payload)) return payload;
+  if (payload && typeof payload === "object") {
+    const cookies = (payload as { cookies?: unknown }).cookies;
+    if (Array.isArray(cookies)) return cookies;
+    const cookieHeader = String((payload as { cookie?: unknown }).cookie || "").trim();
+    if (cookieHeader) return cookieHeaderToCookies(cookieHeader);
+  }
+  return [];
+}
+
+function cookieHeaderToCookies(cookieHeader: string): unknown[] {
+  return cookieHeader
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const separator = part.indexOf("=");
+      const name = separator >= 0 ? part.slice(0, separator).trim() : part;
+      const value = separator >= 0 ? part.slice(separator + 1).trim() : "";
+      return { name, value };
+    })
+    .filter((cookie) => cookie.name);
+}
+
+function collectRuntimePageUrls(...items: Record<string, unknown>[]): string[] {
+  const urls: string[] = [];
+  for (const item of items) {
+    const pageUrls = Array.isArray(item.page_urls) ? item.page_urls : [];
+    for (const value of pageUrls) {
+      const url = String(value || "").trim();
+      if (url) urls.push(url);
+    }
+    const pages = Array.isArray(item.pages) ? item.pages : [];
+    for (const page of pages) {
+      if (!page || typeof page !== "object") continue;
+      const url = String((page as { url?: unknown }).url || "").trim();
+      if (url) urls.push(url);
+    }
+  }
+  return [...new Set(urls)];
+}
+
+function firstUsefulPageUrl(urls: string[]): string {
+  return urls.find((value) => /^https?:\/\//i.test(value)) || urls.find(Boolean) || "";
+}
+
+function assertViewerOnPlatformPage(
+  spec: ReturnType<typeof getPlatformSpec>,
+  pageUrls: string[]
+): void {
+  const matched = pageUrls.some((url) => isPlatformPageUrl(url, spec.cookieDomains, spec.storageOrigins ?? []));
+  if (matched) return;
+  const visibleUrls = pageUrls.length ? pageUrls.join(", ") : "无页面";
+  throw new Error(
+    `${spec.label}登录窗口当前未停留在平台页面，已拒绝导出登录态；当前页面：${visibleUrls}。请重新点击平台登录，保持平台页面打开后再同步登录状态。`
+  );
+}
+
+function isPlatformPageUrl(url: string, cookieDomains: string[], storageOrigins: string[]): boolean {
+  if (!/^https?:\/\//i.test(url)) return false;
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    const origin = parsed.origin.toLowerCase();
+    return (
+      cookieDomains.some((domain) => {
+        const normalized = domain.toLowerCase().replace(/^\./, "");
+        return host === normalized || host.endsWith(`.${normalized}`);
+      }) ||
+      storageOrigins.some((item) => origin === item.toLowerCase())
+    );
+  } catch {
+    return false;
+  }
+}
+
+function cookiesToHeader(cookies: unknown[]): string {
+  const pairs: string[] = [];
+  const seen = new Set<string>();
+  for (const item of cookies) {
+    if (!item || typeof item !== "object") continue;
+    const cookie = item as Record<string, unknown>;
+    const name = String(cookie.name || "").trim();
+    const value = String(cookie.value || "").trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    pairs.push(`${name}=${value}`);
+  }
+  return pairs.join("; ");
+}
+
+function loginCookiesMatch(left: unknown[], right: unknown[]): boolean {
+  const names = new Set(["sessionid", "sessionid_ss", "sid_guard", "uid_tt", "uid_tt_ss", "sid_tt", "n_mh"]);
+  const leftMap = loginCookieMap(left, names);
+  const rightMap = loginCookieMap(right, names);
+  let matched = 0;
+  for (const [name, value] of leftMap.entries()) {
+    const other = rightMap.get(name);
+    if (!other) continue;
+    if (other !== value) return false;
+    matched += 1;
+  }
+  return matched > 0;
+}
+
+function loginCookieMap(cookies: unknown[], names: Set<string>): Map<string, string> {
+  const result = new Map<string, string>();
+  for (const item of cookies) {
+    if (!item || typeof item !== "object") continue;
+    const cookie = item as Record<string, unknown>;
+    const name = String(cookie.name || "").trim().toLowerCase();
+    const value = String(cookie.value || "");
+    if (name && value && names.has(name)) result.set(name, value);
+  }
+  return result;
 }
 
 async function getPlatformWorkerStatus(platform: PlatformId): Promise<Record<string, unknown>> {
@@ -701,7 +1037,7 @@ async function waitForBrowserViewerReady(platform: PlatformId, kind: RuntimeKind
   let lastError = "";
   while (Date.now() < deadline) {
     try {
-      const runtime = await fetchRuntimeJson(runtimeUrlForKind(spec, kind), "/health?ensure=1", 3_000);
+      const runtime = await fetchRuntimeJson(runtimeUrlForKind(spec, kind), "/health?ensure=1", 12_000);
       const ready = (runtime as { runtime?: { noVnc?: { ready?: boolean } } }).runtime?.noVnc?.ready === true;
       if (ready) return;
       lastError = "runtime noVNC not ready";

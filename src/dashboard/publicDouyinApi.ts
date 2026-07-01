@@ -4,6 +4,7 @@ import { getRequestApiToken, isValidApiToken } from "./apiAuth.js";
 
 interface RouteOptions {
   signal?: AbortSignal;
+  auth?: unknown;
 }
 
 class PublicApiError extends Error {
@@ -61,14 +62,14 @@ async function routePublicDouyinApi(
 ): Promise<unknown> {
   const path = url.pathname;
 
-  if (req.method === "GET" && path === "/api/douyin/web/search_videos") {
+  if ((req.method === "GET" || req.method === "POST") && path === "/api/douyin/web/search_videos") {
     const keyword = String(body.keyword ?? body.query ?? body.keyword_query ?? "").trim();
     const limit = normalizeLimit(body.count ?? body.limit ?? body.page_size ?? body.ps, 20);
     const page = normalizePositiveInt(body.page ?? body.pn, 1);
     const cursor = normalizeNonNegativeInt(body.cursor, (page - 1) * limit);
     const payload = await postServiceJson(
       "/api/v1/posts/search",
-      { keyword, limit, page, cursor, sort_label: body.sort_label, sort_type: body.sort_type, publish_time: body.publish_time },
+      { keyword, limit, page, cursor, sort_label: body.sort_label, sort_type: body.sort_type, publish_time: body.publish_time, auth: body.auth },
       options.signal
     );
     const posts = sortByCreateTimeDesc(extractList(payload, ["posts", "items", "data"]).map(toServerxDouyinVideo));
@@ -79,24 +80,24 @@ async function routePublicDouyinApi(
     };
   }
 
-  if (req.method === "GET" && path === "/api/douyin/web/get_aweme_id") {
+  if ((req.method === "GET" || req.method === "POST") && path === "/api/douyin/web/get_aweme_id") {
     const input = String(body.url ?? body.share_url ?? body.text ?? body.aweme_id ?? body.id ?? "").trim();
-    const payload = await postServiceJson("/api/v1/links/resolve", { url: input, text: input }, options.signal);
+    const payload = await postServiceJson("/api/v1/links/resolve", { url: input, text: input, auth: body.auth }, options.signal);
     const data = asRecord(payload);
     return data.aweme_id ?? data.awemeId ?? data.id ?? input;
   }
 
-  if (req.method === "GET" && path === "/api/douyin/web/fetch_one_video") {
-    const payload = await postServiceJson("/api/v1/posts/detail", normalizeDouyinVideoRequest(body), options.signal);
+  if ((req.method === "GET" || req.method === "POST") && path === "/api/douyin/web/fetch_one_video") {
+    const payload = await postServiceJson("/api/v1/posts/detail", { ...normalizeDouyinVideoRequest(body), auth: body.auth }, options.signal);
     const post = extractList(payload, ["items", "posts", "data"])[0] ?? asRecord(payload).post ?? asRecord(payload).item ?? payload;
     return { aweme_detail: toServerxDouyinVideo(post) };
   }
 
-  if (req.method === "GET" && path === "/api/douyin/web/fetch_video_comments") {
+  if ((req.method === "GET" || req.method === "POST") && path === "/api/douyin/web/fetch_video_comments") {
     const limit = normalizeLimit(body.count ?? body.limit ?? body.page_size ?? body.ps, 20);
     const payload = await postServiceJson(
       "/api/v1/posts/comments",
-      { ...normalizeDouyinVideoRequest(body), limit, cursor: body.cursor ?? 0, sort_label: body.sort_label },
+      { ...normalizeDouyinVideoRequest(body), limit, cursor: body.cursor ?? 0, sort_label: body.sort_label, sort_type: body.sort_type, auth: body.auth },
       options.signal
     );
     const data = asRecord(payload);
@@ -108,12 +109,29 @@ async function routePublicDouyinApi(
     };
   }
 
-  if (req.method === "GET" && path === "/api/douyin/web/fetch_video_comment_replies") {
+  if ((req.method === "GET" || req.method === "POST") && path === "/api/douyin/web/fetch_video_comments_full") {
+    const payload = await postServiceJson(
+      "/api/v1/posts/comments_full",
+      { ...normalizeDouyinVideoRequest(body), cursor: body.cursor ?? 0, sort_label: body.sort_label, sort_type: body.sort_type, auth: body.auth },
+      options.signal
+    );
+    const data = asRecord(payload);
+    const comments = sortByCreateTimeDesc(extractList(payload, ["comments", "items", "data"]).map((comment) => toServerxDouyinComment(comment)));
+    return {
+      comments,
+      items: comments,
+      cursor: String(data.cursor ?? ""),
+      has_more: Boolean(data.has_more ?? data.hasMore),
+      stats: data.stats ?? {}
+    };
+  }
+
+  if ((req.method === "GET" || req.method === "POST") && path === "/api/douyin/web/fetch_video_comment_replies") {
     const limit = normalizeLimit(body.count ?? body.limit ?? body.page_size ?? body.ps, 20);
     const commentId = String(body.comment_id ?? body.commentId ?? body.cid ?? body.root ?? "").trim();
     const payload = await postServiceJson(
       "/api/v1/posts/comment_replies",
-      { ...normalizeDouyinVideoRequest(body), comment_id: commentId, limit, cursor: body.cursor ?? 0, sort_label: body.sort_label },
+      { ...normalizeDouyinVideoRequest(body), comment_id: commentId, limit, cursor: body.cursor ?? 0, sort_label: body.sort_label, sort_type: body.sort_type, auth: body.auth },
       options.signal
     );
     const data = asRecord(payload);
@@ -150,13 +168,13 @@ async function routePublicDouyinApi(
     const adapter = createDouyinAdapter();
     const keyword = String(body.keyword ?? body.query ?? "").trim();
     const limit = normalizeLimit(body.limit, 20);
-    const posts = await adapter.searchPosts(keyword, limit, options);
+    const posts = await adapter.searchPosts(keyword, limit, withBodyAuth(options, body));
     return { posts, items: posts, count: posts.length };
   }
 
   if (req.method === "POST" && path === "/api/v1/douyin/posts/detail") {
     const adapter = createDouyinAdapter();
-    const post = await adapter.getPost(normalizePostInput(body), options);
+    const post = await adapter.getPost(normalizePostInput(body), withBodyAuth(options, body));
     if (!post) throw new PublicApiError(404, "POST_NOT_FOUND", "Douyin post detail not found.");
     return { post, item: post, items: [post] };
   }
@@ -165,11 +183,19 @@ async function routePublicDouyinApi(
     return postServiceJson("/api/v1/posts/comments", body, options.signal);
   }
 
+  if (req.method === "POST" && path === "/api/v1/douyin/posts/comments_full") {
+    return postServiceJson("/api/v1/posts/comments_full", body, options.signal);
+  }
+
   if (req.method === "POST" && path === "/api/v1/douyin/posts/comment_replies") {
     return postServiceJson("/api/v1/posts/comment_replies", body, options.signal);
   }
 
   throw new PublicApiError(404, "NOT_FOUND", "API endpoint not found.");
+}
+
+function withBodyAuth(options: RouteOptions, body: Record<string, unknown>): RouteOptions {
+  return body.auth ? { ...options, auth: body.auth } : options;
 }
 
 function normalizePostInput(body: Record<string, unknown>): string {
@@ -299,7 +325,7 @@ function normalizeApiError(error: unknown): PublicApiError {
 function normalizeLimit(value: unknown, fallback: number): number {
   const parsed = Number(value ?? fallback);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
-  return Math.max(1, Math.min(100, Math.floor(parsed)));
+  return Math.max(1, Math.min(200, Math.floor(parsed)));
 }
 
 function normalizePositiveInt(value: unknown, fallback: number): number {

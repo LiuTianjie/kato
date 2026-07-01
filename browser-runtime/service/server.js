@@ -159,9 +159,20 @@ const server = createServer(async (req, res) => {
       await ensureRuntimeReady();
       const body = await readJson(req);
       const domains = Array.isArray(body.domains) ? body.domains.map((item) => String(item)).filter(Boolean) : [];
+      const pages = await currentBrowserPages().catch((error) => {
+        serviceLog("warn", "browser", `Browser page list before cookie export failed: ${error instanceof Error ? error.message : String(error)}`);
+        return [];
+      });
       const cookies = await exportCookies(domains);
-      serviceLog("info", "cookies", `Exported ${cookies.length} browser cookies.`, { domains });
-      sendJson(res, 200, { success: true, data: { exportedCookies: cookies.length, cookies } });
+      serviceLog("info", "cookies", `Exported ${cookies.length} browser cookies.`, { domains, pages: pages.map((page) => page.url) });
+      sendJson(res, 200, { success: true, data: { exportedCookies: cookies.length, cookies, pages, page_urls: pages.map((page) => page.url) } });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/browser/pages") {
+      await ensureRuntimeReady();
+      const pages = await currentBrowserPages();
+      sendJson(res, 200, { success: true, data: { pages, page_urls: pages.map((page) => page.url) } });
       return;
     }
 
@@ -170,9 +181,13 @@ const server = createServer(async (req, res) => {
       const body = await readJson(req);
       const domains = Array.isArray(body.domains) ? body.domains.map((item) => String(item)).filter(Boolean) : [];
       const origins = Array.isArray(body.origins) ? body.origins.map((item) => String(item)).filter(Boolean) : [];
+      const pages = await currentBrowserPages().catch((error) => {
+        serviceLog("warn", "browser", `Browser page list before storage export failed: ${error instanceof Error ? error.message : String(error)}`);
+        return [];
+      });
       const storage = await exportBrowserStorage({ domains, origins });
-      serviceLog("info", "storage", `Exported ${storage.length} browser storage origins.`, { domains, origins });
-      sendJson(res, 200, { success: true, data: { exportedOrigins: storage.length, storage } });
+      serviceLog("info", "storage", `Exported ${storage.length} browser storage origins.`, { domains, origins, pages: pages.map((page) => page.url) });
+      sendJson(res, 200, { success: true, data: { exportedOrigins: storage.length, storage, pages, page_urls: pages.map((page) => page.url) } });
       return;
     }
 
@@ -218,6 +233,7 @@ process.on("SIGTERM", shutdown);
 
 async function startDisplayRuntime() {
   await ensureRuntimeDirs();
+  await clearStaleDisplayLock();
   if (!xvfbProcess) {
     xvfbProcess = spawn("Xvfb", [DISPLAY, "-screen", "0", DISPLAY_SIZE, "-ac", "+extension", "RANDR"], {
       stdio: ["ignore", "pipe", "pipe"]
@@ -524,12 +540,14 @@ async function navigateViewerUrl(url) {
   if (!url) return;
   try {
     await navigateWithCdp(url);
+    await waitForViewerNavigation(url, 8_000);
     return;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     serviceLog("warn", "browser", `CDP viewer navigation failed; falling back to keyboard navigation: ${message}`, { url });
   }
   await navigateWithXdotool(url);
+  await waitForViewerNavigation(url, 10_000);
 }
 
 async function navigateWithCdp(url) {
@@ -544,6 +562,35 @@ async function navigateWithCdp(url) {
   await sendCdpCommand(page.webSocketDebuggerUrl, "Page.bringToFront", {}).catch(() => undefined);
   await sendCdpCommand(page.webSocketDebuggerUrl, "Page.navigate", { url });
   serviceLog("info", "browser", "Navigated viewer page via internal CDP.", { url });
+}
+
+async function waitForViewerNavigation(targetUrl, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let lastUrls = [];
+  while (Date.now() < deadline) {
+    const pages = await currentBrowserPages().catch(() => []);
+    lastUrls = pages.map((page) => page.url).filter(Boolean);
+    const matched = pages.find((page) => urlMatchesTarget(page.url, targetUrl));
+    if (matched) {
+      serviceLog("info", "browser", "Viewer navigation confirmed.", {
+        targetUrl,
+        currentUrl: matched.url
+      });
+      return;
+    }
+    await delay(300);
+  }
+  throw new Error(`Viewer did not navigate to ${targetUrl}; current pages: ${lastUrls.join(", ") || "none"}`);
+}
+
+function urlMatchesTarget(currentUrl, targetUrl) {
+  try {
+    const current = new URL(String(currentUrl || ""));
+    const target = new URL(String(targetUrl || ""));
+    return current.hostname === target.hostname || current.hostname.endsWith(`.${target.hostname}`);
+  } catch {
+    return false;
+  }
 }
 
 function pickViewerPageTarget(pages) {
@@ -758,6 +805,18 @@ async function exportCookies(domains = []) {
   return cookies.filter((cookie) => filters.some((filter) => String(cookie.domain || "").toLowerCase().includes(filter)));
 }
 
+async function currentBrowserPages() {
+  const targets = await fetchJson(`http://127.0.0.1:${CDP_PORT}/json/list`);
+  if (!Array.isArray(targets)) return [];
+  return targets
+    .filter((item) => item?.type === "page")
+    .map((item) => ({
+      id: String(item.id || ""),
+      title: String(item.title || ""),
+      url: String(item.url || "")
+    }));
+}
+
 async function fetchCookiesFromCdp() {
   const version = await fetchJson(`http://127.0.0.1:${CDP_PORT}/json/version`);
   if (version?.webSocketDebuggerUrl) {
@@ -881,6 +940,33 @@ async function clearStaleProfileLocks() {
       rm(path.join(PROFILE_DIR, name), { force: true, recursive: true }).catch(() => undefined)
     )
   );
+}
+
+async function clearStaleDisplayLock() {
+  const displayNumber = String(DISPLAY || "").replace(/^:/, "").split(".")[0];
+  if (!/^\d+$/.test(displayNumber)) return;
+  const socketPath = `/tmp/.X11-unix/X${displayNumber}`;
+  const lockPath = `/tmp/.X${displayNumber}-lock`;
+  const displayReady = await isUnixSocketReady(socketPath, 300);
+  if (displayReady) return;
+  await Promise.all([
+    rm(lockPath, { force: true }).catch(() => undefined),
+    rm(socketPath, { force: true }).catch(() => undefined)
+  ]);
+}
+
+function isUnixSocketReady(socketPath, timeoutMs) {
+  return new Promise((resolve) => {
+    const socket = connectTcp(socketPath);
+    const done = (ready) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(ready);
+    };
+    socket.setTimeout(timeoutMs, () => done(false));
+    socket.on("connect", () => done(true));
+    socket.on("error", () => done(false));
+  });
 }
 
 async function ensureChromeManagedPolicy() {
