@@ -1,7 +1,7 @@
 name: kato
 image: ghcr.io/liutianjie/kato:latest
 region: home
-node: lab
+node: blg
 exposure: tailscale-relay
 domain: kato.itool.tech
 port: 4173
