@@ -59,7 +59,7 @@ mkdir -p \
   /app/data/platforms/xhs /app/data/platforms/douyin /app/data/platforms/bilibili \
   /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images
 
-if id "$CHROME_USER" >/dev/null 2>&1; then
+if [[ "${KATO_FIX_OWNERSHIP:-0}" == "1" ]] && id "$CHROME_USER" >/dev/null 2>&1; then
   chown -R "$CHROME_USER:$CHROME_USER" /app/data /app/mcp/xiaohongshu/data /app/mcp/xiaohongshu/images /home/"$CHROME_USER" 2>/dev/null || true
 fi
 
@@ -87,7 +87,7 @@ start_runtime() {
   local mirror_paths="${11:-}"
 
   mkdir -p "$profile_dir" "$(dirname "$cookies_path")"
-  if id "$CHROME_USER" >/dev/null 2>&1; then
+  if [[ "${KATO_FIX_OWNERSHIP:-0}" == "1" ]] && id "$CHROME_USER" >/dev/null 2>&1; then
     chown -R "$CHROME_USER:$CHROME_USER" "$profile_dir" "$(dirname "$cookies_path")" 2>/dev/null || true
   fi
 
@@ -123,7 +123,11 @@ start_runtime bilibili worker "$BILIBILI_WORKER_RUNTIME_PORT" "${BILIBILI_WORKER
 start_process xhs-service env PORT="${XHS_SERVICE_PORT:-18060}" node mcp/xiaohongshu/service/server.js
 start_process douyin-service env PORT="${DOUYIN_SERVICE_PORT:-18070}" node mcp/douyin/service/server.js
 start_process bilibili-service env PORT="${BILIBILI_SERVICE_PORT:-18080}" node mcp/bilibili/service/server.js
-start_process dashboard env PORT="${PORT:-4173}" node dist/dashboard/server.js
+if [[ "${KATO_DEV_HOT_RELOAD:-0}" == "1" ]]; then
+  start_process dashboard env PORT="${PORT:-4173}" ./node_modules/.bin/tsx src/dashboard/server.ts
+else
+  start_process dashboard env PORT="${PORT:-4173}" node dist/dashboard/server.js
+fi
 
 set +e
 wait -n "${PIDS[@]}"

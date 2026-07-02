@@ -88,6 +88,15 @@ const XHS_HOME_URL = "https://www.xiaohongshu.com/explore";
 const XHS_CREATOR_URL = "https://creator.xiaohongshu.com";
 const XHS_COOKIE_DOMAINS = [".xiaohongshu.com", "xiaohongshu.com", ".xhslink.com", "xhslink.com", ".xhscdn.com"];
 const XHS_STORAGE_DOMAINS = ["xiaohongshu.com", "xhslink.com", "xhscdn.com"];
+const XHS_SITE_DATA_ORIGINS = [
+  "https://www.xiaohongshu.com",
+  "https://edith.xiaohongshu.com",
+  "https://creator.xiaohongshu.com",
+  "https://xhslink.com",
+  "https://www.xhslink.com",
+  "https://xhscdn.com",
+  "https://www.xhscdn.com"
+];
 
 let contextPromise;
 let servicePagePromise;
@@ -286,6 +295,16 @@ const server = createServer(async (req, res) => {
           exportedStorageOrigins: storage.length
         }
       });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/v1/browser/clear-auth") {
+      const context = contextPromise ? await contextPromise.catch(() => undefined) : undefined;
+      const clearedContext = context ? await clearContextAuth(context, "manual-clear") : false;
+      const clearedSiteData = await clearPlatformSiteData("manual-clear");
+      await clearPersistedAuth("manual-clear");
+      serviceLog("warn", "cookies", "XHS browser auth cleared manually.", { clearedContext, clearedSiteData });
+      sendJson(res, 200, { success: true, data: { cookiesPath: COOKIES_PATH, storagePath: STORAGE_PATH, clearedContext, clearedSiteData } });
       return;
     }
 
@@ -2567,6 +2586,45 @@ async function persistCookies(cookies, reason = "manual") {
   serviceLog("info", "cookies", `Persisted ${cookies.length} XHS cookies.`, { reason, cookiesPath: COOKIES_PATH });
 }
 
+async function clearPersistedAuth(reason = "manual") {
+  const data = JSON.stringify([], null, 2);
+  await Promise.all(
+    COOKIE_FALLBACK_PATHS.map(async (cookiesPath) => {
+      try {
+        await mkdir(path.dirname(cookiesPath), { recursive: true });
+        await writeFile(cookiesPath, data, "utf8");
+      } catch {
+        // best-effort compatibility mirror
+      }
+    })
+  );
+  await persistStorage([], reason);
+  serviceLog("info", "cookies", "Cleared XHS persisted cookies.", { reason, cookiesPath: COOKIES_PATH });
+}
+
+async function clearContextAuth(context, reason = "manual") {
+  await context.clearCookies().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    serviceLog("warn", "cookies", `XHS context cookies clear failed: ${message}`, { reason });
+  });
+  for (const page of context.pages()) {
+    if (page.isClosed()) continue;
+    await page
+      .evaluate(() => {
+        try {
+          localStorage.clear();
+        } catch {}
+        try {
+          sessionStorage.clear();
+        } catch {}
+      })
+      .catch(() => undefined);
+  }
+  loadedStorageOrigins = 0;
+  serviceLog("info", "storage", "Cleared XHS context storage.", { reason });
+  return true;
+}
+
 async function persistContextStorage(context, reason = "auto") {
   const storage = await exportContextStorage(context);
   if (!storage.length) return 0;
@@ -2935,6 +2993,42 @@ async function exportViewerStorage(domains) {
   );
   const data = payload?.data || payload;
   return filterXhsStorageEntries(Array.isArray(data?.storage) ? data.storage : []);
+}
+
+async function clearPlatformSiteData(reason = "manual") {
+  const body = JSON.stringify({
+    origins: XHS_SITE_DATA_ORIGINS,
+    storageTypes: "cookies,local_storage,indexeddb,cache_storage,service_workers"
+  });
+  const [worker, viewer] = await Promise.all([
+    clearRuntimeSiteData(BROWSER_RUNTIME_URL, "worker", body, reason),
+    clearRuntimeSiteData(VIEWER_RUNTIME_URL, "viewer", body, reason)
+  ]);
+  return { worker, viewer };
+}
+
+async function clearRuntimeSiteData(baseUrl, kind, body, reason) {
+  try {
+    const response = await fetchWithAbort(
+      `${baseUrl.replace(/\/$/, "")}/browser/site-data/clear`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body
+      },
+      BROWSER_RUNTIME_TIMEOUT_MS
+    );
+    const text = await response.text();
+    const payload = text ? JSON.parse(text) : {};
+    if (!response.ok || payload?.success === false) {
+      throw new Error(payload?.error?.message || payload?.message || `HTTP ${response.status}`);
+    }
+    return { ok: true, kind, data: payload?.data || payload };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    serviceLog("warn", "storage", `XHS ${kind} site data clear failed: ${message}`, { reason });
+    return { ok: false, kind, error: message };
+  }
 }
 
 async function fetchRuntimeJson(endpoint, init = {}, timeoutMs = BROWSER_RUNTIME_TIMEOUT_MS) {

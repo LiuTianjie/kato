@@ -83,6 +83,12 @@ const WINDOWS_UA_METADATA = {
   wow64: false
 };
 const DOUYIN_COOKIE_DOMAINS = [".douyin.com", "douyin.com", ".iesdouyin.com", "iesdouyin.com", ".amemv.com", "amemv.com", "bytedance"];
+const DOUYIN_SITE_DATA_ORIGINS = [
+  "https://www.douyin.com",
+  "https://creator.douyin.com",
+  "https://www.iesdouyin.com",
+  "https://www.amemv.com"
+];
 const DOUYIN_LOGIN_COOKIE_NAMES = new Set([
   "sessionid",
   "sessionid_ss",
@@ -230,6 +236,16 @@ const server = createServer(async (req, res) => {
         success: true,
         data: { cookiesPath: COOKIES_PATH, storagePath: STORAGE_PATH, exportedCookies, exportedStorageOrigins: storage.length, auth }
       });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/v1/browser/clear-auth") {
+      const context = contextPromise ? await contextPromise.catch(() => undefined) : undefined;
+      const clearedContext = context ? await clearContextAuth(context, "manual-clear") : false;
+      const clearedSiteData = await clearPlatformSiteData("manual-clear");
+      await clearPersistedAuth("manual-clear");
+      serviceLog("warn", "cookies", "Douyin browser auth cleared manually.", { clearedContext, clearedSiteData });
+      sendJson(res, 200, { success: true, data: { cookiesPath: COOKIES_PATH, storagePath: STORAGE_PATH, clearedContext, clearedSiteData } });
       return;
     }
 
@@ -2092,6 +2108,42 @@ async function exportViewerStorage(domains, origins = []) {
   return Array.isArray(data?.storage) ? data.storage : [];
 }
 
+async function clearPlatformSiteData(source = "manual") {
+  const body = JSON.stringify({
+    origins: DOUYIN_SITE_DATA_ORIGINS,
+    storageTypes: "cookies,local_storage,indexeddb,cache_storage,service_workers"
+  });
+  const [worker, viewer] = await Promise.all([
+    clearRuntimeSiteData(BROWSER_RUNTIME_URL, "worker", body, source),
+    clearRuntimeSiteData(VIEWER_RUNTIME_URL, "viewer", body, source)
+  ]);
+  return { worker, viewer };
+}
+
+async function clearRuntimeSiteData(baseUrl, kind, body, source) {
+  try {
+    const response = await fetchWithTimeout(
+      `${baseUrl.replace(/\/$/, "")}/browser/site-data/clear`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body
+      },
+      BROWSER_RUNTIME_TIMEOUT_MS
+    );
+    const text = await response.text();
+    const data = text ? JSON.parse(text) : {};
+    if (!response.ok || data?.success === false) {
+      throw new Error(data?.error?.message || data?.message || `HTTP ${response.status}`);
+    }
+    return { ok: true, kind, data: data?.data || data };
+  } catch (error) {
+    const message = errorMessage(error);
+    serviceLog("warn", "storage", `Douyin ${kind} site data clear failed: ${message}`, { source });
+    return { ok: false, kind, error: message };
+  }
+}
+
 async function waitForCdpHttp() {
   const deadline = Date.now() + CDP_CONNECT_TIMEOUT_MS;
   let lastError = "";
@@ -2384,6 +2436,32 @@ async function persistCookies(cookies, source) {
   await mkdir(path.dirname(COOKIES_PATH), { recursive: true });
   await writeFile(COOKIES_PATH, JSON.stringify(cookies, null, 2));
   serviceLog("info", "cookies", `Persisted ${cookies.length} Douyin cookies.`, { source, cookiesPath: COOKIES_PATH });
+}
+
+async function clearPersistedAuth(source) {
+  await persistCookies([], source);
+  await persistStorage([], source);
+}
+
+async function clearContextAuth(context, source) {
+  await context.clearCookies().catch((error) => {
+    serviceLog("warn", "cookies", `Douyin context cookies clear failed: ${errorMessage(error)}`, { source });
+  });
+  for (const page of context.pages()) {
+    if (page.isClosed()) continue;
+    await page
+      .evaluate(() => {
+        try {
+          localStorage.clear();
+        } catch {}
+        try {
+          sessionStorage.clear();
+        } catch {}
+      })
+      .catch(() => undefined);
+  }
+  serviceLog("info", "storage", "Cleared Douyin context storage.", { source });
+  return true;
 }
 
 async function persistStorage(storage, source) {

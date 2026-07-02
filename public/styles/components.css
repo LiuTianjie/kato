@@ -573,6 +573,42 @@
   animation: spin 0.75s linear infinite;
 }
 
+.platform-maintenance {
+  display: grid;
+  gap: 7px;
+  margin: 10px 0 12px;
+  padding: 9px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.platform-maintenance-title {
+  color: rgba(235, 241, 249, 0.72);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.platform-maintenance-row {
+  display: grid;
+  grid-template-columns: minmax(48px, 1fr) auto auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.platform-maintenance-row span {
+  color: var(--rail-ink);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.platform-maintenance-row .secondary.small {
+  min-height: 30px;
+  padding: 6px 8px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .cdp-viewer-card {
   min-height: calc(100vh - 170px);
   padding: 0;
