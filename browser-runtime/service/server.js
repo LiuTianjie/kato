@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { connect as connectTcp } from "node:net";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { execFileSync, spawn } from "node:child_process";
 import path from "node:path";
 
@@ -146,6 +146,19 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/browser/profile/reset") {
+      const body = await readJson(req);
+      const reason = String(body.reason || "manual profile reset");
+      assertLeaseAccess(body.leaseId, "profile reset");
+      const data = await resetBrowserProfile({
+        reason,
+        archiveProfile: body.archiveProfile !== false,
+        clearCookieFiles: body.clearCookieFiles === true
+      });
+      sendJson(res, 200, { success: true, data });
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/browser/action") {
       const body = await readJson(req);
       assertLeaseAccess(body.leaseId, "browser action");
@@ -188,6 +201,19 @@ const server = createServer(async (req, res) => {
       const storage = await exportBrowserStorage({ domains, origins });
       serviceLog("info", "storage", `Exported ${storage.length} browser storage origins.`, { domains, origins, pages: pages.map((page) => page.url) });
       sendJson(res, 200, { success: true, data: { exportedOrigins: storage.length, storage, pages, page_urls: pages.map((page) => page.url) } });
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/browser/site-data/clear") {
+      await ensureRuntimeReady();
+      const body = await readJson(req);
+      const origins = Array.isArray(body.origins) ? body.origins.map((item) => String(item)).filter(Boolean) : [];
+      const storageTypes = String(
+        body.storageTypes ||
+          "cookies,local_storage,indexeddb,cache_storage,service_workers"
+      );
+      const data = await clearBrowserSiteData({ origins, storageTypes });
+      sendJson(res, 200, { success: true, data });
       return;
     }
 
@@ -513,6 +539,85 @@ async function restartBrowser(reason = "manual") {
     restartPromise = undefined;
   });
   return restartPromise;
+}
+
+async function resetBrowserProfile({ reason = "manual profile reset", archiveProfile = true, clearCookieFiles = false } = {}) {
+  if (restartPromise) return restartPromise;
+  restartPromise = withTimeout((async () => {
+    serviceLog("warn", "profile", `Resetting Chrome profile: ${reason}`, {
+      profileDir: PROFILE_DIR,
+      archiveProfile,
+      clearCookieFiles
+    });
+    const oldProcess = chromeProcess;
+    chromeProcess = undefined;
+    stopFingerprintSupervisor();
+    fingerprintedTargets = new Set();
+    if (oldProcess) {
+      terminateProcess(oldProcess, reason);
+      await waitForProcessExit(oldProcess, PROCESS_EXIT_GRACE_MS + 500).catch(() => undefined);
+    }
+    await waitForCdpClosed(3_000).catch(() => undefined);
+    const profile = await resetProfileDirectory({ archiveProfile });
+    if (clearCookieFiles) {
+      await persistCookies([]);
+    }
+    await delay(800);
+    await ensureBrowser();
+    return {
+      reset: true,
+      reason,
+      profile,
+      clearCookieFiles,
+      runtime: await runtimeStatus()
+    };
+  })(), RESTART_TIMEOUT_MS, "Browser profile reset timed out.").finally(() => {
+    restartPromise = undefined;
+  });
+  return restartPromise;
+}
+
+async function resetProfileDirectory({ archiveProfile = true } = {}) {
+  const profileDir = path.resolve(PROFILE_DIR);
+  if (!isSafeProfileResetPath(profileDir)) {
+    throw new Error(`Refusing to reset unsafe browser profile path: ${profileDir}`);
+  }
+  const parentDir = path.dirname(profileDir);
+  await mkdir(parentDir, { recursive: true });
+
+  let archivedTo = "";
+  if (archiveProfile) {
+    archivedTo = path.join(parentDir, `${path.basename(profileDir)}.archived.${timestampForPath()}`);
+    try {
+      await rename(profileDir, archivedTo);
+      serviceLog("warn", "profile", "Chrome profile archived before reset.", { profileDir, archivedTo });
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      archivedTo = "";
+    }
+  } else {
+    await rm(profileDir, { recursive: true, force: true });
+    serviceLog("warn", "profile", "Chrome profile removed before reset.", { profileDir });
+  }
+
+  await mkdir(profileDir, { recursive: true });
+  return {
+    profileDir,
+    archivedTo,
+    archiveProfile
+  };
+}
+
+function isSafeProfileResetPath(profileDir) {
+  if (!profileDir || profileDir === path.parse(profileDir).root) return false;
+  const normalized = profileDir.replace(/\/+$/, "");
+  const denied = new Set(["/app", "/app/data", "/app/mcp", "/home", "/tmp", "/var", "/private", "/Users"]);
+  if (denied.has(normalized)) return false;
+  return normalized.includes("/profile") || normalized.includes("profile");
+}
+
+function timestampForPath() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
 async function runBrowserAction(body) {
@@ -873,6 +978,131 @@ async function exportBrowserStorage({ domains = [], origins = [] } = {}) {
     }
   }
   return [...byOrigin.values()];
+}
+
+async function clearBrowserSiteData({ origins = [], storageTypes = "" } = {}) {
+  const normalizedOrigins = uniqueOrigins(origins);
+  if (!normalizedOrigins.length) {
+    throw httpError(400, "origins is required.");
+  }
+  const version = await fetchJson(`http://127.0.0.1:${CDP_PORT}/json/version`);
+  if (!version?.webSocketDebuggerUrl) {
+    throw new Error("CDP browser websocket is unavailable.");
+  }
+  const results = [];
+  for (const origin of normalizedOrigins) {
+    const result = { origin, cleared: false, cdp: false, pageFallback: false, error: "" };
+    try {
+      await sendCdpCommand(version.webSocketDebuggerUrl, "Storage.clearDataForOrigin", {
+        origin,
+        storageTypes
+      });
+      result.cdp = true;
+      result.cleared = true;
+    } catch (error) {
+      result.error = error instanceof Error ? error.message : String(error);
+      serviceLog("warn", "storage", `CDP site data clear failed for ${origin}: ${result.error}`);
+    }
+
+    try {
+      await clearOriginStorageViaPage(origin);
+      result.pageFallback = true;
+      result.cleared = true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      result.error = result.error ? `${result.error}; fallback: ${message}` : message;
+      serviceLog("warn", "storage", `Page site data clear fallback failed for ${origin}: ${message}`);
+    }
+    results.push(result);
+  }
+  serviceLog("warn", "storage", "Browser site data cleared.", {
+    origins: normalizedOrigins,
+    storageTypes
+  });
+  return {
+    profileDir: PROFILE_DIR,
+    origins: results,
+    clearedOrigins: results.filter((item) => item.cleared).length,
+    storageTypes
+  };
+}
+
+async function clearOriginStorageViaPage(origin) {
+  const target = await createBlankPageTarget();
+  if (!target?.webSocketDebuggerUrl) throw new Error("Unable to create CDP page target.");
+  try {
+    await sendCdpCommand(target.webSocketDebuggerUrl, "Page.enable", {}).catch(() => undefined);
+    await sendCdpCommand(target.webSocketDebuggerUrl, "Runtime.enable", {}).catch(() => undefined);
+    await sendCdpCommand(target.webSocketDebuggerUrl, "Page.navigate", { url: origin });
+    await delay(600);
+    await sendCdpCommand(target.webSocketDebuggerUrl, "Runtime.evaluate", {
+      awaitPromise: true,
+      returnByValue: true,
+      expression: `[
+        (async () => {
+          try { localStorage.clear(); } catch {}
+          try { sessionStorage.clear(); } catch {}
+          try {
+            if (indexedDB.databases) {
+              const dbs = await indexedDB.databases();
+              await Promise.all((dbs || []).map((db) => db && db.name ? new Promise((resolve) => {
+                const req = indexedDB.deleteDatabase(db.name);
+                req.onsuccess = req.onerror = req.onblocked = () => resolve();
+              }) : undefined));
+            }
+          } catch {}
+          try {
+            if (self.caches) {
+              const keys = await caches.keys();
+              await Promise.all(keys.map((key) => caches.delete(key)));
+            }
+          } catch {}
+          try {
+            if (navigator.serviceWorker) {
+              const regs = await navigator.serviceWorker.getRegistrations();
+              await Promise.all(regs.map((reg) => reg.unregister()));
+            }
+          } catch {}
+          return true;
+        })()
+      ][0]`
+    });
+  } finally {
+    await closePageTarget(target.id).catch(() => undefined);
+  }
+}
+
+async function createBlankPageTarget() {
+  const response = await fetch(`http://127.0.0.1:${CDP_PORT}/json/new?about:blank`, { method: "PUT" });
+  if (!response.ok) throw new Error(`CDP create target failed: HTTP ${response.status}`);
+  const payload = await response.json();
+  if (payload?.webSocketDebuggerUrl) return payload;
+  const targets = await fetchJson(`http://127.0.0.1:${CDP_PORT}/json/list`);
+  return Array.isArray(targets) ? targets.find((item) => item?.id === payload?.id) : undefined;
+}
+
+async function closePageTarget(targetId) {
+  if (!targetId) return;
+  await fetch(`http://127.0.0.1:${CDP_PORT}/json/close/${encodeURIComponent(targetId)}`).catch(() => undefined);
+}
+
+function uniqueOrigins(origins) {
+  const result = [];
+  const seen = new Set();
+  for (const value of origins) {
+    try {
+      const url = new URL(String(value));
+      if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+      const origin = url.origin;
+      if (!seen.has(origin)) {
+        seen.add(origin);
+        result.push(origin);
+      }
+    } catch {
+      // Ignore invalid origins.
+    }
+  }
+  return result;
 }
 
 function sendCdpCommand(webSocketUrl, method, params = {}) {

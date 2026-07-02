@@ -161,6 +161,28 @@ async function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): P
     return;
   }
 
+  if (req.method === "POST" && url.pathname === "/api/platforms/clear-auth") {
+    const body = await readJson(req);
+    const platform = requirePlatformSpec(body.platform);
+    sendJson(res, 200, { success: true, data: await clearPlatformAuth(platform.id) });
+    return;
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/platforms/profile-reset") {
+    const body = await readJson(req);
+    const platform = requirePlatformSpec(body.platform);
+    sendJson(res, 200, {
+      success: true,
+      data: await resetPlatformBrowserProfile(platform.id, {
+        runtimeKind: normalizeRuntimeKindScope(body.kind ?? body.runtimeKind ?? "both"),
+        reason: String(body.reason || "dashboard platform profile reset"),
+        archiveProfile: body.archiveProfile !== false,
+        clearCookieFiles: body.clearCookieFiles === true
+      })
+    });
+    return;
+  }
+
   if (req.method === "POST" && url.pathname === "/api/platforms/current-page") {
     const body = await readJson(req);
     const platform = requirePlatformSpec(body.platform);
@@ -567,6 +589,68 @@ async function syncPlatformCookies(platform: PlatformId): Promise<Record<string,
         : await postMcpJson("/api/v1/browser/sync-cookies", {}, 35_000);
   const data = unwrapMcpData(payload) as Record<string, unknown>;
   return { platform: spec.id, label: spec.label, synced: true, ...data };
+}
+
+async function clearPlatformAuth(platform: PlatformId): Promise<Record<string, unknown>> {
+  const spec = getPlatformSpec(platform);
+  if (!spec.implemented || !spec.capabilities.login) {
+    return { platform: spec.id, label: spec.label, cleared: false, error: "未接入登录能力" };
+  }
+  const payload =
+    platform === "douyin"
+      ? await postDouyinJson("/api/v1/browser/clear-auth", {}, 35_000)
+      : platform === "bilibili"
+        ? await postBilibiliJson("/api/v1/browser/clear-auth", {}, 35_000)
+        : await postMcpJson("/api/v1/browser/clear-auth", {}, 35_000);
+  const data = unwrapMcpData(payload) as Record<string, unknown>;
+  return { platform: spec.id, label: spec.label, cleared: true, ...data };
+}
+
+async function resetPlatformBrowserProfile(
+  platform: PlatformId,
+  options: {
+    runtimeKind: RuntimeKind | "both";
+    reason: string;
+    archiveProfile: boolean;
+    clearCookieFiles: boolean;
+  }
+): Promise<Record<string, unknown>> {
+  const spec = getPlatformSpec(platform);
+  if (!spec.implemented) {
+    return { platform: spec.id, label: spec.label, reset: false, error: "未接入平台服务" };
+  }
+  const targets = runtimeTargetsForKind(spec, options.runtimeKind);
+  if (!targets.length) {
+    return { platform: spec.id, label: spec.label, reset: false, error: "未配置浏览器实例" };
+  }
+  const results = await Promise.all(
+    targets.map(async (target) => {
+      try {
+        const payload = await postRuntimeJson(
+          target.baseUrl,
+          "/browser/profile/reset",
+          {
+            reason: options.reason,
+            archiveProfile: options.archiveProfile,
+            clearCookieFiles: options.clearCookieFiles
+          },
+          150_000
+        );
+        return { kind: target.kind, ok: true, data: unwrapMcpData(payload) };
+      } catch (error) {
+        return { kind: target.kind, ok: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    })
+  );
+  return {
+    platform: spec.id,
+    label: spec.label,
+    reset: results.some((result) => result.ok),
+    runtime_kind: options.runtimeKind,
+    archiveProfile: options.archiveProfile,
+    clearCookieFiles: options.clearCookieFiles,
+    results
+  };
 }
 
 async function exportPlatformAuth(platform: PlatformId, kind: RuntimeKind = "viewer"): Promise<Record<string, unknown>> {
@@ -1193,6 +1277,26 @@ function noVncPortForPlatform(platform: PlatformId, kind: RuntimeKind): number {
 
 function normalizeRuntimeKind(value: unknown): RuntimeKind {
   return String(value || "").trim().toLowerCase() === "worker" ? "worker" : "viewer";
+}
+
+function normalizeRuntimeKindScope(value: unknown): RuntimeKind | "both" {
+  const kind = String(value || "").trim().toLowerCase();
+  if (kind === "viewer" || kind === "worker") return kind;
+  return "both";
+}
+
+function runtimeTargetsForKind(
+  platform: ReturnType<typeof getPlatformSpec>,
+  kind: RuntimeKind | "both"
+): Array<{ kind: RuntimeKind; baseUrl: string }> {
+  const targets: Array<{ kind: RuntimeKind; baseUrl: string }> = [];
+  if (kind !== "worker" && platform.viewerRuntimeUrl) {
+    targets.push({ kind: "viewer", baseUrl: platform.viewerRuntimeUrl });
+  }
+  if (kind !== "viewer" && platform.workerRuntimeUrl) {
+    targets.push({ kind: "worker", baseUrl: platform.workerRuntimeUrl });
+  }
+  return targets;
 }
 
 function runtimeUrlForKind(platform: ReturnType<typeof getPlatformSpec>, kind: RuntimeKind): string {

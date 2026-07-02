@@ -86,6 +86,12 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/api/v1/browser/clear-auth") {
+      await clearPersistedAuth("manual-clear");
+      sendJson(res, 200, { success: true, data: { cookiesPath: COOKIES_PATH, storagePath: STORAGE_PATH, cleared: true } });
+      return;
+    }
+
     if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/v1/videos/search") {
       const body = req.method === "POST" ? await readJson(req) : Object.fromEntries(url.searchParams.entries());
       const keyword = String(body.keyword || body.query || "").trim();
@@ -572,6 +578,11 @@ async function persistCookieHeader(cookie) {
   await mkdir(path.dirname(COOKIES_PATH), { recursive: true });
   await writeFile(COOKIES_PATH, JSON.stringify({ cookie, updatedAt: new Date().toISOString() }, null, 2));
   serviceLog("info", "cookies", "Persisted Bilibili cookie.", { cookiesPath: COOKIES_PATH });
+}
+
+async function clearPersistedAuth(source) {
+  await persistCookieHeader("");
+  await persistStorage([], source);
 }
 
 async function persistStorage(storage, source) {

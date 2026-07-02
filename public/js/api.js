@@ -50,5 +50,7 @@ export const dashboardApi = {
   openBrowserViewer: (body = {}) => api("/api/browser-viewer/open", { method: "POST", body }),
   sendBrowserViewerAction: (body = {}) => api("/api/browser-viewer/action", { method: "POST", body }),
   syncPlatformCookies: (platform) => api("/api/platforms/sync-cookies", { method: "POST", body: { platform } }),
+  clearPlatformAuth: (platform) => api("/api/platforms/clear-auth", { method: "POST", body: { platform } }),
+  resetPlatformProfile: (body = {}) => api("/api/platforms/profile-reset", { method: "POST", body }),
   recoverPlatformWorker: (platform) => api("/api/platforms/worker/recover", { method: "POST", body: { platform } }),
 };

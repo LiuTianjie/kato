@@ -113,6 +113,48 @@ export async function syncPlatformCookies(platform, button) {
   });
 }
 
+export async function clearPlatformAuth(platform, button) {
+  const label = platformLabel(platform);
+  if (!window.confirm(`确认清理${label}在 Kato 浏览器中的登录态和站点数据？`)) return;
+  appendClientLog(`开始 · 清理${label}平台登录态`);
+  return withButtonLoading(button, "清理中", async () => {
+    try {
+      const result = await dashboardApi.clearPlatformAuth(platform);
+      setChallengeFlowStatus(`${label}登录态已清理，请重新登录并同步状态`);
+      appendClientLog(`成功 · ${label}平台登录态已清理：${JSON.stringify(result.data || result).slice(0, 240)}`);
+      await refreshPlatformLoginList();
+      await refreshWorkerQueues();
+    } catch (error) {
+      setChallengeFlowStatus(`${label}登录态清理失败`);
+      appendClientLog(`失败 · 清理${label}登录态：${errorMessage(error)}`);
+    }
+  });
+}
+
+export async function resetPlatformProfile(platform, button) {
+  const label = platformLabel(platform);
+  if (!window.confirm(`确认重建${label} viewer/worker 浏览器 Profile？旧 Profile 会归档，通常只在重度风控或环境污染时使用。`)) return;
+  appendClientLog(`开始 · 重建${label}浏览器 Profile`);
+  return withButtonLoading(button, "重建中", async () => {
+    try {
+      const result = await dashboardApi.resetPlatformProfile({
+        platform,
+        runtimeKind: "both",
+        archiveProfile: true,
+        clearCookieFiles: true,
+        reason: "kato dashboard platform profile reset"
+      });
+      setChallengeFlowStatus(`${label}浏览器 Profile 已重建，请重新打开登录并同步状态`);
+      appendClientLog(`成功 · ${label}浏览器 Profile 已重建：${JSON.stringify(result.data || result).slice(0, 240)}`);
+      await refreshPlatformLoginList();
+      await refreshWorkerQueues();
+    } catch (error) {
+      setChallengeFlowStatus(`${label}浏览器 Profile 重建失败`);
+      appendClientLog(`失败 · 重建${label}浏览器 Profile：${errorMessage(error)}`);
+    }
+  });
+}
+
 export async function refreshWorkerQueues(button) {
   const list = $("workerQueueList");
   if (!list) return;
@@ -156,6 +198,12 @@ export function bindPlatformLoginActions() {
   });
   $$("[data-sync-platform-cookies]").forEach((button) => {
     button.addEventListener("click", () => syncPlatformCookies(button.dataset.syncPlatformCookies, button));
+  });
+  $$("[data-clear-platform-auth]").forEach((button) => {
+    button.addEventListener("click", () => clearPlatformAuth(button.dataset.clearPlatformAuth, button));
+  });
+  $$("[data-reset-platform-profile]").forEach((button) => {
+    button.addEventListener("click", () => resetPlatformProfile(button.dataset.resetPlatformProfile, button));
   });
   $$("[data-recover-platform-worker]").forEach((button) => {
     button.addEventListener("click", () => recoverPlatformWorker(button.dataset.recoverPlatformWorker, button));
